@@ -1,0 +1,487 @@
+name: Build Landa Artifacts
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish release artifacts.
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Analyze and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux Tauri check dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Run Rust workspace tests
+        run: cargo test --workspace
+
+      - name: Run Rust clippy
+        run: |
+          cargo clippy --workspace -- -D warnings
+          cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+  resolve_release:
+    name: Resolve stable release version
+    runs-on: ubuntu-latest
+    needs: quality
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == true && github.ref == 'refs/heads/main')
+    outputs:
+      release_version: ${{ steps.resolve.outputs.release_version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      android_version_code: ${{ steps.resolve.outputs.android_version_code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release version
+        id: resolve
+        shell: bash
+        run: bash .github/scripts/resolve_release_version.sh
+
+  build_android_ci:
+    name: Build Android APK (CI)
+    runs-on: ubuntu-latest
+    needs:
+      - quality
+    if: >
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release != true)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-37 build-tools;35.0.0 ndk;27.0.12077973"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Android APK (debug, arm64)
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+        run: npm run tauri android build -- --apk --debug --ci --target aarch64
+
+  build_android_release:
+    name: Build Android APK (release)
+    runs-on: ubuntu-latest
+    needs:
+      - quality
+      - resolve_release
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == true && github.ref == 'refs/heads/main')
+    env:
+      RELEASE_VERSION: ${{ needs.resolve_release.outputs.release_version }}
+      RELEASE_VERSION_CODE: ${{ needs.resolve_release.outputs.android_version_code }}
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-37 build-tools;35.0.0 ndk;27.0.12077973"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Apply release version
+        shell: bash
+        run: |
+          bash .github/scripts/apply_release_version.sh \
+            --version "${RELEASE_VERSION}" \
+            --version-code "${RELEASE_VERSION_CODE}"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Prepare Android release signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${ANDROID_KEYSTORE_BASE64}" && -n "${ANDROID_KEYSTORE_PASSWORD}" && -n "${ANDROID_KEY_ALIAS}" && -n "${ANDROID_KEY_PASSWORD}" ]]; then
+            echo "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > src-tauri/gen/android/release-keystore.jks
+            cat > src-tauri/gen/android/key.properties <<EOF
+          storeFile=release-keystore.jks
+          storePassword=${ANDROID_KEYSTORE_PASSWORD}
+          keyAlias=${ANDROID_KEY_ALIAS}
+          keyPassword=${ANDROID_KEY_PASSWORD}
+          EOF
+          else
+            echo "::warning::Android release signing secrets are not configured; building unsigned release APK."
+          fi
+
+      - name: Build Android APKs (release, split per ABI)
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+        run: npm run tauri android build -- --apk --ci --split-per-abi --target aarch64 armv7 x86_64
+
+      - name: Collect Android APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-android
+          find src-tauri/gen/android/app/build/outputs/apk -type f -name "*.apk" -exec cp {} dist-android/ \;
+          ls -la dist-android
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-release
+          path: dist-android/*.apk
+          if-no-files-found: error
+
+  build_linux:
+    name: Build Linux bundle and AppImage
+    runs-on: ubuntu-24.04
+    needs:
+      - quality
+      - resolve_release
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == true && github.ref == 'refs/heads/main')
+    env:
+      RELEASE_VERSION: ${{ needs.resolve_release.outputs.release_version }}
+      RELEASE_VERSION_CODE: ${{ needs.resolve_release.outputs.android_version_code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux Tauri dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            patchelf \
+            pkg-config \
+            file \
+            zip
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Apply release version
+        shell: bash
+        run: |
+          bash .github/scripts/apply_release_version.sh \
+            --version "${RELEASE_VERSION}" \
+            --version-code "${RELEASE_VERSION_CODE}"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Linux (release)
+        run: npm run tauri build -- --bundles appimage,deb --ci
+
+      - name: Collect Linux artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-linux
+          find src-tauri/target/release/bundle/appimage -maxdepth 1 -type f -name "*.AppImage" -exec cp {} "dist-linux/landa-v${RELEASE_VERSION}-linux-x86_64.AppImage" \;
+          find src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name "*.deb" -exec cp {} "dist-linux/landa-v${RELEASE_VERSION}-linux-amd64.deb" \;
+          mkdir -p "dist-linux/landa-v${RELEASE_VERSION}-linux-x64"
+          cp src-tauri/target/release/landa-app "dist-linux/landa-v${RELEASE_VERSION}-linux-x64/landa"
+          (cd dist-linux && zip -r "landa-v${RELEASE_VERSION}-linux-x64.zip" "landa-v${RELEASE_VERSION}-linux-x64")
+          rm -rf "dist-linux/landa-v${RELEASE_VERSION}-linux-x64"
+          ls -la dist-linux
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: dist-linux/*
+          if-no-files-found: error
+
+  build_windows:
+    name: Build Windows bundle
+    runs-on: windows-latest
+    needs:
+      - quality
+      - resolve_release
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == true && github.ref == 'refs/heads/main')
+    env:
+      RELEASE_VERSION: ${{ needs.resolve_release.outputs.release_version }}
+      RELEASE_VERSION_CODE: ${{ needs.resolve_release.outputs.android_version_code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Apply release version
+        shell: bash
+        run: |
+          bash .github/scripts/apply_release_version.sh \
+            --version "${RELEASE_VERSION}" \
+            --version-code "${RELEASE_VERSION_CODE}"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Windows (release)
+        run: npm run tauri build -- --bundles nsis --ci
+
+      - name: Collect Windows artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-windows | Out-Null
+          $ver = $env:RELEASE_VERSION
+          $nsis = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" | Select-Object -First 1
+          if ($nsis) {
+            Copy-Item $nsis.FullName "dist-windows/landa-v$ver-windows-x64-setup.exe"
+          }
+          $zipDir = "dist-windows/landa-v$ver-windows-x64"
+          New-Item -ItemType Directory -Force -Path $zipDir | Out-Null
+          Copy-Item "src-tauri/target/release/landa-app.exe" "$zipDir/Landa.exe"
+          Compress-Archive -Path $zipDir -DestinationPath "dist-windows/landa-v$ver-windows-x64.zip" -Force
+          Remove-Item -Recurse -Force $zipDir
+          Get-ChildItem dist-windows
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: dist-windows/*
+          if-no-files-found: error
+
+  create_release_tag:
+    name: Create stable release tag
+    runs-on: ubuntu-latest
+    needs:
+      - build_android_release
+      - build_linux
+      - build_windows
+      - resolve_release
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == true && github.ref == 'refs/heads/main')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create and push tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.resolve_release.outputs.release_tag }}"
+
+          git fetch --tags --force
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Stable tag ${TAG} already exists on origin."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" "${GITHUB_SHA}" -m "Release ${TAG}" || true
+          git push origin "${TAG}" || {
+            echo "Warning: git push tag failed. Ensure GitHub Actions has Read and Write permissions in repository settings."
+            exit 0
+          }
+
+  publish_release:
+    name: Publish GitHub Release Assets
+    runs-on: ubuntu-latest
+    needs:
+      - build_android_release
+      - build_linux
+      - build_windows
+      - create_release_tag
+      - resolve_release
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == true && github.ref == 'refs/heads/main')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+
+      - name: Prepare release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.resolve_release.outputs.release_version }}"
+          mkdir -p release_final
+
+          # Android APKs
+          for abi in arm64-v8a armeabi-v7a x86_64 universal; do
+            found="$(find release_assets/android-apk-release -type f -name "*${abi}*.apk" | head -n 1 || true)"
+            if [[ -n "${found}" ]]; then
+              cp "${found}" "release_final/landa-v${VERSION}-android-${abi}.apk"
+            fi
+          done
+          if ! ls release_final/*.apk >/dev/null 2>&1; then
+            first_apk="$(find release_assets/android-apk-release -type f -name "*.apk" | head -n 1 || true)"
+            if [[ -n "${first_apk}" ]]; then
+              cp "${first_apk}" "release_final/landa-v${VERSION}-android-universal.apk"
+            fi
+          fi
+
+          # Linux & Windows
+          cp release_assets/linux-release/* release_final/
+          cp release_assets/windows-release/* release_final/
+          ls -la release_final
+
+      - name: Generate release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "${GITHUB_WORKSPACE}/.github/scripts/generate_release_manifest.sh" \
+            --assets-dir "release_final" \
+            --version "${{ needs.resolve_release.outputs.release_version }}" \
+            --tag "${{ needs.resolve_release.outputs.release_tag }}" \
+            --repository "${{ github.repository }}"
+
+      - name: Generate release changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.resolve_release.outputs.release_tag }}"
+
+          git fetch --tags --force
+          if PREVIOUS_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null)"; then
+            git log "${PREVIOUS_TAG}..HEAD" --oneline --no-merges > release_body.md
+          else
+            git log HEAD --oneline --no-merges > release_body.md
+          fi
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ needs.resolve_release.outputs.release_tag }}
+          tag_name: ${{ needs.resolve_release.outputs.release_tag }}
+          prerelease: false
+          body_path: release_body.md
+          files: release_final/*

@@ -1,0 +1,17 @@
+[package]
+name = "landa-mod-shares"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+landa-core = { path = "../landa-core" }
+landa-proto = { path = "../landa-proto" }
+postcard.workspace = true
+quinn.workspace = true
+serde.workspace = true
+tokio.workspace = true
+uuid.workspace = true
