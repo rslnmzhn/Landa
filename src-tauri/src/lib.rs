@@ -53,10 +53,12 @@ pub fn run() {
                 .unwrap_or_else(|_| app_data_dir.join("Downloads"));
 
             let default_device_name = resolve_default_device_name();
-            let engine = LandaEngine::new(LandaConfig {
-                app_data_dir,
-                default_download_dir,
-                default_device_name,
+            let engine = tauri::async_runtime::block_on(async move {
+                LandaEngine::new(LandaConfig {
+                    app_data_dir,
+                    default_download_dir,
+                    default_device_name,
+                })
             })
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
