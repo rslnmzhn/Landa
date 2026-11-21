@@ -34,7 +34,8 @@ impl PeerId {
             return Err(ProtoError::InvalidCrypto);
         }
         let mut bytes = [0u8; 16];
-        for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+        let (chunks, _) = s.as_bytes().as_chunks::<2>();
+        for (i, chunk) in chunks.iter().enumerate() {
             let hex_str = std::str::from_utf8(chunk).map_err(|_| ProtoError::InvalidCrypto)?;
             bytes[i] = u8::from_str_radix(hex_str, 16).map_err(|_| ProtoError::InvalidCrypto)?;
         }

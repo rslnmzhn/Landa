@@ -33,5 +33,4 @@ tokio = { version = "1.41", features = ["rt-multi-thread", "net", "io-util", "sy
 tokio-util = "0.7"
 tracing = "0.1"
 uuid = { version = "1.11", features = ["v4"] }
-walkdir = "2.5"
 x509-parser = "0.16"
