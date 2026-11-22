@@ -6,6 +6,8 @@ import android.app.DownloadManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -128,6 +130,16 @@ class FriendRequestNotifArgs {
 @InvokeArg
 class CancelFriendRequestNotifArgs {
     lateinit var peerId: String
+}
+
+@InvokeArg
+class WriteClipboardTextArgs {
+    lateinit var text: String
+}
+
+@InvokeArg
+class WriteClipboardImageArgs {
+    lateinit var imagePath: String
 }
 
 @TauriPlugin
@@ -683,6 +695,158 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         val res = JSObject()
         res.put("focus", focus)
         invoke.resolve(res)
+    }
+
+    @Command
+    fun readSystemClipboard(invoke: Invoke) {
+        activity.runOnUiThread {
+            try {
+                val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                val clip = cm?.primaryClip
+                if (clip == null || clip.itemCount == 0) {
+                    val res = JSObject()
+                    res.put("kind", "empty")
+                    invoke.resolve(res)
+                    return@runOnUiThread
+                }
+
+                val item = clip.getItemAt(0)
+                val uri = item.uri
+                val mime = uri?.let { activity.contentResolver.getType(it) }
+                val isImage = uri != null && (
+                    mime?.startsWith("image/") == true ||
+                        clip.description.hasMimeType("image/*")
+                    )
+
+                if (isImage && uri != null) {
+                    Thread {
+                        try {
+                            val tmpDir = File(activity.cacheDir, "clipboard_tmp").apply { mkdirs() }
+                            val tmpFile = File(tmpDir, "${UUID.randomUUID()}.img")
+                            val maxBytes = 10L * 1024L * 1024L
+                            var total = 0L
+                            activity.contentResolver.openInputStream(uri)?.use { input ->
+                                FileOutputStream(tmpFile).use { out ->
+                                    val buf = ByteArray(64 * 1024)
+                                    while (true) {
+                                        val n = input.read(buf)
+                                        if (n <= 0) break
+                                        total += n
+                                        if (total > maxBytes) {
+                                            tmpFile.delete()
+                                            invoke.reject("Clipboard image exceeds 10 MB limit")
+                                            return@Thread
+                                        }
+                                        out.write(buf, 0, n)
+                                    }
+                                }
+                            } ?: run {
+                                invoke.reject("Unable to read clipboard image URI")
+                                return@Thread
+                            }
+                            val res = JSObject()
+                            res.put("kind", "image")
+                            res.put("tempPath", tmpFile.absolutePath)
+                            invoke.resolve(res)
+                        } catch (ex: Exception) {
+                            invoke.reject(ex.message ?: "Failed to read clipboard image")
+                        }
+                    }.start()
+                    return@runOnUiThread
+                }
+
+                val text = item.coerceToText(activity)?.toString()
+                if (!text.isNullOrBlank()) {
+                    val res = JSObject()
+                    res.put("kind", "text")
+                    res.put("text", text)
+                    invoke.resolve(res)
+                } else {
+                    val res = JSObject()
+                    res.put("kind", "empty")
+                    invoke.resolve(res)
+                }
+            } catch (ex: Exception) {
+                invoke.reject(ex.message ?: "Failed to read system clipboard")
+            }
+        }
+    }
+
+    @Command
+    fun writeSystemClipboardText(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(WriteClipboardTextArgs::class.java)
+            activity.runOnUiThread {
+                try {
+                    val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    if (cm == null) {
+                        invoke.reject("ClipboardManager unavailable")
+                        return@runOnUiThread
+                    }
+                    cm.setPrimaryClip(ClipData.newPlainText("Landa", args.text))
+                    invoke.resolve()
+                } catch (ex: Exception) {
+                    invoke.reject(ex.message ?: "Failed to write clipboard text")
+                }
+            }
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Invalid clipboard text args")
+        }
+    }
+
+    @Command
+    fun writeSystemClipboardImage(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(WriteClipboardImageArgs::class.java)
+            val source = File(args.imagePath).canonicalFile
+            val dataRoot = activity.dataDir.canonicalFile
+            val cacheRoot = activity.cacheDir.canonicalFile
+            val filesRoot = activity.filesDir.canonicalFile
+            val allowed = source.path.startsWith(dataRoot.path + File.separator) ||
+                source.path.startsWith(cacheRoot.path + File.separator) ||
+                source.path.startsWith(filesRoot.path + File.separator)
+            if (!allowed || !source.exists() || !source.isFile) {
+                invoke.reject("Invalid clipboard image path")
+                return
+            }
+
+            val shareDir = File(activity.cacheDir, "clipboard_share").apply { mkdirs() }
+            val cutoff = System.currentTimeMillis() - 60L * 60L * 1000L
+            shareDir.listFiles()?.forEach { f ->
+                if (f.isFile && f.lastModified() < cutoff) {
+                    f.delete()
+                }
+            }
+
+            val target = File(shareDir, "landa_${UUID.randomUUID().toString().take(8)}.png")
+            FileInputStream(source).use { input ->
+                FileOutputStream(target).use { out ->
+                    input.copyTo(out, 64 * 1024)
+                }
+            }
+
+            val uri = FileProvider.getUriForFile(
+                activity,
+                "${activity.packageName}.fileprovider",
+                target
+            )
+
+            activity.runOnUiThread {
+                try {
+                    val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    if (cm == null) {
+                        invoke.reject("ClipboardManager unavailable")
+                        return@runOnUiThread
+                    }
+                    cm.setPrimaryClip(ClipData.newUri(activity.contentResolver, "Landa Image", uri))
+                    invoke.resolve()
+                } catch (ex: Exception) {
+                    invoke.reject(ex.message ?: "Failed to write clipboard image")
+                }
+            }
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to copy image to clipboard")
+        }
     }
 
     @Command

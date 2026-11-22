@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppSettings,
   ClipboardItem,
+  ClipboardPasteResult,
   CoreEvent,
   FriendRequestInfo,
   LocalIdentityInfo,
@@ -105,12 +106,28 @@ export const api = {
   clipboardListLocal: () => invoke<ClipboardItem[]>("clipboard_list_local"),
   clipboardPushLocalText: (text: string) =>
     invoke<ClipboardItem>("clipboard_push_local_text", { text }),
+  clipboardPushLocalImageBytes: (bytes: number[]) =>
+    invoke<ClipboardItem>("clipboard_push_local_image_bytes", { bytes }),
   clipboardDeleteLocal: (id: string) =>
     invoke<void>("clipboard_delete_local", { id }),
   clipboardSendToPeer: (peerId: string, text: string) =>
     invoke<void>("clipboard_send_to_peer", { peerId, text }),
+  clipboardSendImageToPeer: (peerId: string, itemId: string) =>
+    invoke<void>("clipboard_send_image_to_peer", { peerId, itemId }),
   clipboardFetchRemote: (peerId: string) =>
     invoke<ClipboardItem[]>("clipboard_fetch_remote", { peerId }),
+  clipboardPasteFromSystem: () =>
+    invoke<ClipboardPasteResult>("clipboard_paste_from_system"),
+  clipboardCopyToSystem: (
+    itemId: string,
+    peerId: string | null = null,
+    text: string | null = null
+  ) => invoke<void>("clipboard_copy_to_system", { itemId, peerId, text }),
+  clipboardGetImagePreview: (itemId: string, peerId: string | null = null) =>
+    invoke<PreviewDescriptor>("clipboard_get_image_preview", {
+      itemId,
+      peerId,
+    }),
 
   // Platform / Android bridge
   takePendingSharedFiles: () => invoke<string[]>("take_pending_shared_files"),

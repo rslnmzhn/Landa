@@ -37,6 +37,7 @@ pub struct LocalIdentityInfo {
 }
 
 pub struct LandaEngine {
+    app_data_dir: PathBuf,
     identity: Arc<DeviceIdentity>,
     storage: Arc<Storage>,
     modules: Arc<ModuleRegistry>,
@@ -91,6 +92,7 @@ impl LandaEngine {
         ));
 
         Ok(Arc::new(Self {
+            app_data_dir: config.app_data_dir,
             identity,
             storage,
             modules: Arc::new(ModuleRegistry::new()),
@@ -147,6 +149,10 @@ impl LandaEngine {
 
     pub fn shutdown(&self) {
         self.cancel.cancel();
+    }
+
+    pub fn app_data_dir(&self) -> &std::path::Path {
+        &self.app_data_dir
     }
 
     pub fn storage(&self) -> &Arc<Storage> {

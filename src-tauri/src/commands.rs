@@ -1,12 +1,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use std::sync::Mutex;
 
 use landa_core::{
     AppSettings, FriendRequestInfo, LandaEngine, LocalIdentityInfo, ManualTarget, ModuleStatus,
     PeerInfo, TransferHistoryRecord,
 };
 #[cfg(feature = "mod-clipboard")]
-use landa_mod_clipboard::{ClipboardItem, ClipboardModule};
+use landa_mod_clipboard::{ClipboardContentKind, ClipboardItem, ClipboardModule};
 #[cfg(feature = "mod-shares")]
 use landa_mod_shares::{LocalShareRoot, ShareEntry, ShareRootInfo, ShareThumbnail, SharesModule};
 use tauri::State;
@@ -17,6 +19,8 @@ pub struct AppState {
     pub shares: Arc<SharesModule>,
     #[cfg(feature = "mod-clipboard")]
     pub clipboard: Arc<ClipboardModule>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub desktop_clipboard: Mutex<Option<arboard::Clipboard>>,
 }
 
 #[tauri::command]
@@ -504,6 +508,319 @@ pub async fn clipboard_fetch_remote(
 #[tauri::command]
 pub async fn clipboard_fetch_remote(_peer_id: String) -> Result<Vec<serde_json::Value>, String> {
     Err("clipboard module is not compiled".into())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ClipboardPasteResult {
+    Empty,
+    Text {
+        text: String,
+    },
+    #[cfg(feature = "mod-clipboard")]
+    Image {
+        item: ClipboardItem,
+    },
+}
+
+#[cfg(feature = "mod-clipboard")]
+#[tauri::command]
+pub fn clipboard_push_local_image_bytes(
+    state: State<'_, AppState>,
+    bytes: Vec<u8>,
+) -> Result<ClipboardItem, String> {
+    state
+        .clipboard
+        .push_local_image(&bytes, None, None)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "mod-clipboard"))]
+#[tauri::command]
+pub fn clipboard_push_local_image_bytes(_bytes: Vec<u8>) -> Result<serde_json::Value, String> {
+    Err("clipboard module is not compiled".into())
+}
+
+#[cfg(feature = "mod-clipboard")]
+#[tauri::command]
+pub async fn clipboard_send_image_to_peer(
+    state: State<'_, AppState>,
+    peer_id: String,
+    item_id: String,
+) -> Result<(), String> {
+    state
+        .clipboard
+        .send_local_image_to_peer(&state.engine, &peer_id, &item_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "mod-clipboard"))]
+#[tauri::command]
+pub async fn clipboard_send_image_to_peer(
+    _peer_id: String,
+    _item_id: String,
+) -> Result<(), String> {
+    Err("clipboard module is not compiled".into())
+}
+
+#[cfg(feature = "mod-clipboard")]
+#[tauri::command]
+pub async fn clipboard_paste_from_system(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ClipboardPasteResult, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        let bridge = app
+            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+            .ok_or_else(|| "Android bridge unavailable".to_string())?;
+        let res = bridge.read_system_clipboard_async().await?;
+        match res.kind.as_str() {
+            "image" => {
+                let temp_path = res
+                    .temp_path
+                    .ok_or_else(|| "Missing clipboard temp image path".to_string())?;
+                let bytes = tokio::fs::read(&temp_path)
+                    .await
+                    .map_err(|e| format!("Failed to read clipboard image: {e}"))?;
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                let item = state
+                    .clipboard
+                    .push_local_image(&bytes, None, None)
+                    .map_err(|e| e.to_string())?;
+                Ok(ClipboardPasteResult::Image { item })
+            }
+            "text" => {
+                let text = res.text.unwrap_or_default();
+                if text.trim().is_empty() {
+                    Ok(ClipboardPasteResult::Empty)
+                } else {
+                    Ok(ClipboardPasteResult::Text { text })
+                }
+            }
+            _ => Ok(ClipboardPasteResult::Empty),
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = app;
+        let mut guard = state
+            .desktop_clipboard
+            .lock()
+            .map_err(|_| "Clipboard lock poisoned".to_string())?;
+        if guard.is_none() {
+            *guard = arboard::Clipboard::new().ok();
+        }
+        let Some(cb) = guard.as_mut() else {
+            return Err("System clipboard unavailable".into());
+        };
+
+        if let Ok(img) = cb.get_image() {
+            let width = u32::try_from(img.width)
+                .map_err(|_| "Clipboard image width overflow".to_string())?;
+            let height = u32::try_from(img.height)
+                .map_err(|_| "Clipboard image height overflow".to_string())?;
+            let item = state
+                .clipboard
+                .push_local_rgba_image(width, height, img.bytes.as_ref())
+                .map_err(|e| e.to_string())?;
+            return Ok(ClipboardPasteResult::Image { item });
+        }
+
+        if let Ok(text) = cb.get_text() {
+            if !text.trim().is_empty() {
+                return Ok(ClipboardPasteResult::Text { text });
+            }
+        }
+
+        Ok(ClipboardPasteResult::Empty)
+    }
+}
+
+#[cfg(not(feature = "mod-clipboard"))]
+#[tauri::command]
+pub async fn clipboard_paste_from_system() -> Result<ClipboardPasteResult, String> {
+    Err("clipboard module is not compiled".into())
+}
+
+#[cfg(feature = "mod-clipboard")]
+#[tauri::command]
+pub async fn clipboard_copy_to_system(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    item_id: String,
+    peer_id: Option<String>,
+    text: Option<String>,
+) -> Result<(), String> {
+    let (is_image, text_val, image_path) = if let Some(ref pid) = peer_id {
+        if let Some(t) = text.filter(|s| !s.is_empty()) {
+            (false, Some(t), None)
+        } else {
+            let cached = ensure_remote_clipboard_image_cached(&app, &state, pid, &item_id).await?;
+            (true, None, Some(cached))
+        }
+    } else {
+        let item = state
+            .clipboard
+            .get_local_item(&item_id)
+            .ok_or_else(|| format!("Clipboard item {item_id} not found"))?;
+        match item.kind {
+            ClipboardContentKind::Text => (false, Some(item.text), None),
+            ClipboardContentKind::Image => (true, None, item.image_path),
+        }
+    };
+
+    if !is_image {
+        let text_to_copy = text_val.unwrap_or_default();
+        #[cfg(target_os = "android")]
+        {
+            use tauri::Manager;
+            let bridge = app
+                .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+                .ok_or_else(|| "Android bridge unavailable".to_string())?;
+            return bridge.write_system_clipboard_text_async(&text_to_copy).await;
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let _ = app;
+            let mut guard = state
+                .desktop_clipboard
+                .lock()
+                .map_err(|_| "Clipboard lock poisoned".to_string())?;
+            if guard.is_none() {
+                *guard = arboard::Clipboard::new().ok();
+            }
+            let cb = guard
+                .as_mut()
+                .ok_or_else(|| "System clipboard unavailable".to_string())?;
+            return cb
+                .set_text(text_to_copy)
+                .map_err(|e| format!("Failed to copy text: {e}"));
+        }
+    }
+
+    let path = image_path.ok_or_else(|| "Clipboard image path missing".to_string())?;
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        let bridge = app
+            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+            .ok_or_else(|| "Android bridge unavailable".to_string())?;
+        bridge.write_system_clipboard_image_async(&path).await
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = app;
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| format!("Failed to read clipboard image: {e}"))?;
+        let rgba = tokio::task::spawn_blocking(move || {
+            let img = image::load_from_memory(&bytes)
+                .map_err(|e| format!("Failed to decode clipboard image: {e}"))?;
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            Ok::<_, String>((w as usize, h as usize, rgba.into_raw()))
+        })
+        .await
+        .map_err(|e| format!("Image decode task failed: {e}"))??;
+
+        let mut guard = state
+            .desktop_clipboard
+            .lock()
+            .map_err(|_| "Clipboard lock poisoned".to_string())?;
+        if guard.is_none() {
+            *guard = arboard::Clipboard::new().ok();
+        }
+        let cb = guard
+            .as_mut()
+            .ok_or_else(|| "System clipboard unavailable".to_string())?;
+        cb.set_image(arboard::ImageData {
+            width: rgba.0,
+            height: rgba.1,
+            bytes: std::borrow::Cow::Owned(rgba.2),
+        })
+        .map_err(|e| format!("Failed to copy image: {e}"))
+    }
+}
+
+#[cfg(not(feature = "mod-clipboard"))]
+#[tauri::command]
+pub async fn clipboard_copy_to_system(
+    _item_id: String,
+    _peer_id: Option<String>,
+    _text: Option<String>,
+) -> Result<(), String> {
+    Err("clipboard module is not compiled".into())
+}
+
+#[cfg(feature = "mod-clipboard")]
+#[tauri::command]
+pub async fn clipboard_get_image_preview(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    server: State<'_, Arc<crate::preview::PreviewServer>>,
+    item_id: String,
+    peer_id: Option<String>,
+) -> Result<crate::preview::PreviewDescriptor, String> {
+    let path = if let Some(pid) = peer_id {
+        ensure_remote_clipboard_image_cached(&app, &state, &pid, &item_id).await?
+    } else {
+        let item = state
+            .clipboard
+            .get_local_item(&item_id)
+            .ok_or_else(|| format!("Clipboard item {item_id} not found"))?;
+        item.image_path
+            .ok_or_else(|| "Clipboard item has no image".to_string())?
+    };
+    crate::preview::prepare_file_preview(&app, &state, &server, &path).await
+}
+
+#[cfg(not(feature = "mod-clipboard"))]
+#[tauri::command]
+pub async fn clipboard_get_image_preview(
+    _item_id: String,
+    _peer_id: Option<String>,
+) -> Result<crate::preview::PreviewDescriptor, String> {
+    Err("clipboard module is not compiled".into())
+}
+
+#[cfg(feature = "mod-clipboard")]
+async fn ensure_remote_clipboard_image_cached(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    peer_id: &str,
+    item_id: &str,
+) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let cache_dir = crate::preview::resolve_preview_cache_dir(app)?;
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|e| format!("Failed to create preview cache dir: {e}"))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(peer_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(item_id.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let cached_path = cache_dir.join(format!("clip_{hex}.png"));
+
+    if tokio::fs::try_exists(&cached_path).await.unwrap_or(false) {
+        return Ok(cached_path.to_string_lossy().to_string());
+    }
+
+    let bytes = state
+        .clipboard
+        .fetch_remote_image(&state.engine, peer_id, item_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::fs::write(&cached_path, &bytes)
+        .await
+        .map_err(|e| format!("Failed to cache remote clipboard image: {e}"))?;
+    Ok(cached_path.to_string_lossy().to_string())
 }
 
 // --- Platform / Android Bridge ---

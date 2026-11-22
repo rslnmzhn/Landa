@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use landa_core::{LandaConfig, LandaEngine};
-use landa_mod_clipboard::ClipboardModule;
+use landa_mod_clipboard::{ClipboardContentKind, ClipboardModule, MAX_IMAGE_BYTES};
 use landa_proto::{DeviceCategory, DeviceOs, PeerId};
 use uuid::Uuid;
 
@@ -39,8 +39,16 @@ async fn clipboard_requires_trust_and_syncs_between_friends() {
     })
     .unwrap();
 
-    let clip_a = ClipboardModule::new(Arc::clone(engine_a.storage()), engine_a.events().clone());
-    let clip_b = ClipboardModule::new(Arc::clone(engine_b.storage()), engine_b.events().clone());
+    let clip_a = ClipboardModule::new(
+        Arc::clone(engine_a.storage()),
+        engine_a.events().clone(),
+        engine_a.app_data_dir().join("clipboard_images"),
+    );
+    let clip_b = ClipboardModule::new(
+        Arc::clone(engine_b.storage()),
+        engine_b.events().clone(),
+        engine_b.app_data_dir().join("clipboard_images"),
+    );
     engine_a.register_module(clip_a.clone());
     engine_b.register_module(clip_b.clone());
 
@@ -97,6 +105,44 @@ async fn clipboard_requires_trust_and_syncs_between_friends() {
     let remote_items = clip_a.fetch_remote_items(&engine_a, &info_b.peer_id).await.unwrap();
     assert_eq!(remote_items.len(), 1);
     assert_eq!(remote_items[0].text, "https://landa.dev");
+
+    // Push PNG image over QUIC and fetch it back
+    let png_1x1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    clip_a
+        .send_image_bytes_to_peer(&engine_a, &info_b.peer_id, png_1x1)
+        .await
+        .unwrap();
+
+    let remote_after_img = clip_a.fetch_remote_items(&engine_a, &info_b.peer_id).await.unwrap();
+    assert_eq!(remote_after_img.len(), 2);
+    let img_item = &remote_after_img[0];
+    assert_eq!(img_item.kind, ClipboardContentKind::Image);
+    assert_eq!(img_item.image_width, Some(1));
+    assert_eq!(img_item.image_height, Some(1));
+    assert!(img_item.image_path.is_none()); // local path must not leak over network
+
+    let fetched_png = clip_a
+        .fetch_remote_image(&engine_a, &info_b.peer_id, &img_item.id)
+        .await
+        .unwrap();
+    assert_eq!(fetched_png, png_1x1);
+
+    // Local image file exists on B and is deleted when item is deleted
+    let b_local_img = clip_b.get_local_item(&img_item.id).unwrap();
+    let b_img_path = std::path::PathBuf::from(b_local_img.image_path.unwrap());
+    assert!(b_img_path.is_file());
+    clip_b.delete_local_item(&img_item.id);
+    assert!(!b_img_path.exists());
+
+    // Oversized image is rejected
+    let oversized = vec![0u8; MAX_IMAGE_BYTES + 1];
+    assert!(clip_a.push_local_image(&oversized, None, None).is_err());
 
     // Disabling module blocks incoming requests
     engine_b.set_module_enabled("clipboard", false).unwrap();

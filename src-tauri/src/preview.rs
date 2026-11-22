@@ -334,6 +334,13 @@ fn authorize_preview_target(
         }
     }
 
+    #[cfg(feature = "mod-clipboard")]
+    if let Ok(clip_canon) = state.clipboard.images_dir().canonicalize() {
+        if canonical.starts_with(&clip_canon) {
+            return Ok(());
+        }
+    }
+
     Err("File is outside allowed preview directories".into())
 }
 

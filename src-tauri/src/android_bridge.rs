@@ -183,6 +183,26 @@ struct CancelFriendRequestNotifArgs {
     peer_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemClipboardReadResponse {
+    pub kind: String,
+    pub text: Option<String>,
+    pub temp_path: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteClipboardTextArgs {
+    text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteClipboardImageArgs {
+    image_path: String,
+}
+
 pub struct AndroidBridge<R: Runtime> {
     handle: PluginHandle<R>,
 }
@@ -341,6 +361,39 @@ impl<R: Runtime> AndroidBridge<R> {
         self.handle
             .run_mobile_plugin::<PendingFocusResponse>("takePendingFocusTarget", ())
             .map(|r| r.focus)
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn read_system_clipboard_async(&self) -> Result<SystemClipboardReadResponse, String> {
+        self.handle
+            .run_mobile_plugin_async::<SystemClipboardReadResponse>("readSystemClipboard", ())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn write_system_clipboard_text_async(&self, text: &str) -> Result<(), String> {
+        self.handle
+            .run_mobile_plugin_async::<serde_json::Value>(
+                "writeSystemClipboardText",
+                WriteClipboardTextArgs {
+                    text: text.to_string(),
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn write_system_clipboard_image_async(&self, image_path: &str) -> Result<(), String> {
+        self.handle
+            .run_mobile_plugin_async::<serde_json::Value>(
+                "writeSystemClipboardImage",
+                WriteClipboardImageArgs {
+                    image_path: image_path.to_string(),
+                },
+            )
+            .await
+            .map(|_| ())
             .map_err(|e| e.to_string())
     }
 

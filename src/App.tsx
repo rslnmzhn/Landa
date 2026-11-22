@@ -411,6 +411,7 @@ export function App() {
               peers={peers}
               enabled={clipboardEnabled}
               refreshTick={clipboardTick}
+              onPreviewDescriptor={(desc) => setPreviewData(desc)}
               onError={(m) => showToast("error", m)}
               onNotice={(m) => showToast("notice", m)}
             />

@@ -79,6 +79,7 @@ pub fn run() {
                 let m = ClipboardModule::new(
                     Arc::clone(engine.storage()),
                     engine.events().clone(),
+                    engine.app_data_dir().join("clipboard_images"),
                 );
                 engine.register_module(m.clone());
                 m
@@ -328,6 +329,8 @@ pub fn run() {
                 shares,
                 #[cfg(feature = "mod-clipboard")]
                 clipboard,
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                desktop_clipboard: std::sync::Mutex::new(None),
             });
 
             Ok(())
@@ -364,9 +367,14 @@ pub fn run() {
             commands::shares_get_remote_thumbnail,
             commands::clipboard_list_local,
             commands::clipboard_push_local_text,
+            commands::clipboard_push_local_image_bytes,
             commands::clipboard_delete_local,
             commands::clipboard_send_to_peer,
+            commands::clipboard_send_image_to_peer,
             commands::clipboard_fetch_remote,
+            commands::clipboard_paste_from_system,
+            commands::clipboard_copy_to_system,
+            commands::clipboard_get_image_preview,
             commands::take_pending_shared_files,
             commands::take_pending_focus_target,
             commands::has_all_files_access,

@@ -686,6 +686,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "chrono",
+ "image",
  "landa-core",
  "landa-proto",
  "postcard",

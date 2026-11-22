@@ -129,14 +129,26 @@ export interface ShareThumbnail {
   dataUrl: string;
 }
 
+export type ClipboardContentKind = "text" | "image";
+
 export interface ClipboardItem {
   id: string;
+  kind: ClipboardContentKind;
   text: string;
+  imagePath: string | null;
+  imageWidth: number | null;
+  imageHeight: number | null;
+  sizeBytes: number;
   contentHash: string;
   sourcePeerId: string | null;
   sourcePeerName: string | null;
   createdAt: number;
 }
+
+export type ClipboardPasteResult =
+  | { kind: "empty" }
+  | { kind: "text"; text: string }
+  | { kind: "image"; item: ClipboardItem };
 
 export interface UpdateAssetInfo {
   platform: string;
