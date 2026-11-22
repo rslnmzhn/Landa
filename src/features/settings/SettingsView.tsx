@@ -1,8 +1,13 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, Plus, Trash2 } from "lucide-react";
+import { Copy, FileText, FolderOpen, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "../../core/api";
-import type { AppSettings, ManualTarget, ModuleStatus } from "../../core/types";
+import type {
+  AppSettings,
+  LanInterfaceInfo,
+  ManualTarget,
+  ModuleStatus,
+} from "../../core/types";
 import type { TranslationDict } from "../../i18n/translations";
 import {
   GlassButton,
@@ -33,6 +38,7 @@ export function SettingsView({
 }: SettingsViewProps) {
   const [draft, setDraft] = useState<AppSettings>(settings);
   const [targets, setTargets] = useState<ManualTarget[]>([]);
+  const [lanInterfaces, setLanInterfaces] = useState<LanInterfaceInfo[]>([]);
   const [newIp, setNewIp] = useState("");
 
   useEffect(() => {
@@ -47,8 +53,17 @@ export function SettingsView({
     }
   };
 
+  const loadLanInterfaces = async () => {
+    try {
+      setLanInterfaces(await api.listLanInterfaces());
+    } catch (e) {
+      onError(String(e));
+    }
+  };
+
   useEffect(() => {
     loadTargets();
+    loadLanInterfaces();
   }, []);
 
   const save = async (next: AppSettings, notify = false) => {
@@ -101,6 +116,39 @@ export function SettingsView({
       onError(String(e));
     }
   };
+
+  const handleToggleSubnet = async (subnetCidr: string, enabled: boolean) => {
+    const current = draft.excludedSubnets ?? [];
+    const nextExcluded = enabled
+      ? current.filter((c) => c !== subnetCidr)
+      : current.includes(subnetCidr)
+      ? current
+      : [...current, subnetCidr];
+    await save({ ...draft, excludedSubnets: nextExcluded });
+    await loadLanInterfaces();
+  };
+
+  const handleOpenLogs = async () => {
+    try {
+      await api.openLogs();
+    } catch (e) {
+      onError(String(e));
+    }
+  };
+
+  const handleCopyDiagnostics = async () => {
+    try {
+      await api.copyDiagnostics();
+      onNotice(t.settings.diagnosticsCopied);
+    } catch (e) {
+      onError(String(e));
+    }
+  };
+
+  const activeCidrs = new Set(lanInterfaces.map((i) => i.subnetCidr));
+  const offlineExcludedSubnets = (draft.excludedSubnets ?? []).filter(
+    (cidr) => !activeCidrs.has(cidr)
+  );
 
   return (
     <div className="space-y-5">
@@ -265,6 +313,88 @@ export function SettingsView({
             ))}
           </div>
         )}
+      </GlassCard>
+
+      {/* LAN Interfaces / Subnets */}
+      <GlassCard className="p-5 space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
+              {t.settings.lanInterfaces}
+            </h2>
+            <p className="mt-0.5 text-xs text-slate-700/60 dark:text-white/45">
+              {t.settings.lanInterfacesHint}
+            </p>
+          </div>
+          <GlassButton
+            size="sm"
+            variant="ghost"
+            onClick={loadLanInterfaces}
+            title={t.settings.refreshInterfaces}
+          >
+            <RefreshCw className="h-4 w-4" />
+          </GlassButton>
+        </div>
+
+        {lanInterfaces.length === 0 ? (
+          <p className="text-xs text-slate-700/60 dark:text-white/45">
+            {t.settings.noLanInterfaces}
+          </p>
+        ) : (
+          <div className="divide-y divide-white/15 dark:divide-white/10">
+            {lanInterfaces.map((iface) => (
+              <GlassToggle
+                key={`${iface.name}-${iface.ip}`}
+                checked={iface.enabled}
+                onChange={(v) => handleToggleSubnet(iface.subnetCidr, v)}
+                label={iface.name}
+                description={`${iface.ip} · ${iface.subnetCidr}`}
+              />
+            ))}
+          </div>
+        )}
+
+        {offlineExcludedSubnets.length > 0 && (
+          <div className="space-y-2 pt-1">
+            <div className="text-xs font-medium text-slate-700/65 dark:text-white/50">
+              {t.settings.excludedSubnetsLabel}
+            </div>
+            {offlineExcludedSubnets.map((cidr) => (
+              <div
+                key={cidr}
+                className="flex items-center justify-between rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2"
+              >
+                <span className="font-mono text-sm text-slate-900/90 dark:text-white/90">
+                  {cidr}
+                </span>
+                <GlassButton
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => handleToggleSubnet(cidr, true)}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </GlassButton>
+              </div>
+            ))}
+          </div>
+        )}
+      </GlassCard>
+
+      {/* Diagnostics & Logs */}
+      <GlassCard className="p-5 space-y-3">
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
+          {t.settings.diagnostics}
+        </h2>
+        <div className="flex flex-wrap gap-2.5">
+          <GlassButton onClick={handleOpenLogs}>
+            <FileText className="h-4 w-4" />
+            <span>{t.settings.openLogs}</span>
+          </GlassButton>
+          <GlassButton variant="primary" onClick={handleCopyDiagnostics}>
+            <Copy className="h-4 w-4" />
+            <span>{t.settings.copyDiagnostics}</span>
+          </GlassButton>
+        </div>
       </GlassCard>
     </div>
   );

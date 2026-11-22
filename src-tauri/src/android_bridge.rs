@@ -32,12 +32,6 @@ struct SharedFilesResponse {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AccessResponse {
-    granted: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct DeviceNameResponse {
     name: String,
 }
@@ -82,8 +76,58 @@ struct TransferFailedNotifArgs {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct InstallApkArgs {
+struct SaveUpdateApkArgs {
     apk_path: String,
+    file_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveUpdateApkResponse {
+    pub display_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PickShareResponse {
+    cancelled: bool,
+    uri: Option<String>,
+    name: Option<String>,
+    #[serde(default)]
+    is_dir: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SafShareArgs {
+    root_uri: String,
+    is_dir: bool,
+    rel_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SafShareEntryDto {
+    name: String,
+    rel_path: String,
+    is_dir: bool,
+    size_bytes: u64,
+    modified_ms: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListSafShareDirResponse {
+    entries: Vec<SafShareEntryDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenSafShareFileResponse {
+    fd: i32,
+    file_name: String,
+    size_bytes: u64,
+    modified_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -453,28 +497,136 @@ impl<R: Runtime> AndroidBridge<R> {
             .map_err(|e| e.to_string())
     }
 
-    pub fn has_all_files_access(&self) -> Result<bool, String> {
-        self.handle
-            .run_mobile_plugin::<AccessResponse>("hasAllFilesAccess", ())
-            .map(|r| r.granted)
-            .map_err(|e| e.to_string())
+    pub async fn pick_share_folder_async(&self) -> Result<Option<(String, String, bool)>, String> {
+        let res = self
+            .handle
+            .run_mobile_plugin_async::<PickShareResponse>("pickShareFolder", ())
+            .await
+            .map_err(|e| e.to_string())?;
+        if res.cancelled {
+            return Ok(None);
+        }
+        let uri = res
+            .uri
+            .filter(|u| !u.trim().is_empty())
+            .ok_or_else(|| "Missing folder URI".to_string())?;
+        let name = res
+            .name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "Folder".to_string());
+        Ok(Some((uri, name, true)))
     }
 
-    pub fn request_all_files_access(&self) -> Result<(), String> {
-        self.handle
-            .run_mobile_plugin::<serde_json::Value>("requestAllFilesAccess", ())
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+    pub async fn pick_share_file_async(&self) -> Result<Option<(String, String, bool)>, String> {
+        let res = self
+            .handle
+            .run_mobile_plugin_async::<PickShareResponse>("pickShareFile", ())
+            .await
+            .map_err(|e| e.to_string())?;
+        if res.cancelled {
+            return Ok(None);
+        }
+        let uri = res
+            .uri
+            .filter(|u| !u.trim().is_empty())
+            .ok_or_else(|| "Missing file URI".to_string())?;
+        let name = res
+            .name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "File".to_string());
+        Ok(Some((uri, name, res.is_dir)))
     }
 
-    pub async fn install_apk_update_async(&self, apk_path: &str) -> Result<(), String> {
-        self.handle
-            .run_mobile_plugin_async::<serde_json::Value>(
-                "installApkUpdate",
-                InstallApkArgs {
-                    apk_path: apk_path.to_string(),
+    #[cfg(feature = "mod-shares")]
+    fn list_saf_share_dir(
+        &self,
+        root_uri: &str,
+        is_dir: bool,
+        rel_path: &str,
+    ) -> Result<Vec<landa_mod_shares::ShareEntry>, String> {
+        let res = self
+            .handle
+            .run_mobile_plugin::<ListSafShareDirResponse>(
+                "listSafShareDir",
+                SafShareArgs {
+                    root_uri: root_uri.to_string(),
+                    is_dir,
+                    rel_path: rel_path.to_string(),
                 },
             )
+            .map_err(|e| e.to_string())?;
+        Ok(res
+            .entries
+            .into_iter()
+            .map(|e| landa_mod_shares::ShareEntry {
+                name: e.name,
+                rel_path: e.rel_path,
+                is_dir: e.is_dir,
+                size_bytes: e.size_bytes,
+                modified_ms: e.modified_ms,
+            })
+            .collect())
+    }
+
+    #[cfg(feature = "mod-shares")]
+    fn open_saf_share_file(
+        &self,
+        root_uri: &str,
+        is_dir: bool,
+        rel_path: &str,
+    ) -> Result<landa_mod_shares::ShareOpenedFile, String> {
+        let res = self
+            .handle
+            .run_mobile_plugin::<OpenSafShareFileResponse>(
+                "openSafShareFile",
+                SafShareArgs {
+                    root_uri: root_uri.to_string(),
+                    is_dir,
+                    rel_path: rel_path.to_string(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        if res.fd < 0 {
+            return Err("Invalid file descriptor".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            // SAFETY: `detachFd()` in Kotlin transfers ownership of a valid open fd to Rust.
+            let file = unsafe { std::fs::File::from_raw_fd(res.fd) };
+            Ok(landa_mod_shares::ShareOpenedFile {
+                file,
+                file_name: res.file_name,
+                size_bytes: res.size_bytes,
+                modified_ms: res.modified_ms,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Err("SAF file descriptors are only supported on Unix/Android".into())
+        }
+    }
+
+    pub async fn save_update_apk_to_downloads_async(
+        &self,
+        apk_path: &str,
+        file_name: &str,
+    ) -> Result<SaveUpdateApkResponse, String> {
+        self.handle
+            .run_mobile_plugin_async::<SaveUpdateApkResponse>(
+                "saveUpdateApkToDownloads",
+                SaveUpdateApkArgs {
+                    apk_path: apk_path.to_string(),
+                    file_name: file_name.to_string(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn open_downloads_folder_async(&self) -> Result<(), String> {
+        self.handle
+            .run_mobile_plugin_async::<serde_json::Value>("openDownloadsFolder", ())
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -621,4 +773,49 @@ pub fn make_open_source_hook<R: Runtime>(app: tauri::AppHandle<R>) -> OpenSource
         app.try_state::<AndroidBridge<R>>()
             .and_then(|bridge| bridge.open_content_uri_file(uri))
     })
+}
+
+#[cfg(feature = "mod-shares")]
+struct AndroidShareContentProvider<R: Runtime> {
+    app: tauri::AppHandle<R>,
+}
+
+#[cfg(feature = "mod-shares")]
+impl<R: Runtime> landa_mod_shares::ShareContentProvider for AndroidShareContentProvider<R> {
+    fn list_dir(
+        &self,
+        root_uri: &str,
+        is_dir: bool,
+        rel_path: &str,
+    ) -> Result<Vec<landa_mod_shares::ShareEntry>, landa_core::CoreError> {
+        let bridge = self
+            .app
+            .try_state::<AndroidBridge<R>>()
+            .ok_or_else(|| landa_core::CoreError::InvalidInput("Android bridge unavailable".into()))?;
+        bridge
+            .list_saf_share_dir(root_uri, is_dir, rel_path)
+            .map_err(landa_core::CoreError::InvalidInput)
+    }
+
+    fn open_file(
+        &self,
+        root_uri: &str,
+        is_dir: bool,
+        rel_path: &str,
+    ) -> Result<landa_mod_shares::ShareOpenedFile, landa_core::CoreError> {
+        let bridge = self
+            .app
+            .try_state::<AndroidBridge<R>>()
+            .ok_or_else(|| landa_core::CoreError::InvalidInput("Android bridge unavailable".into()))?;
+        bridge
+            .open_saf_share_file(root_uri, is_dir, rel_path)
+            .map_err(landa_core::CoreError::InvalidInput)
+    }
+}
+
+#[cfg(feature = "mod-shares")]
+pub fn make_share_content_provider<R: Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Arc<dyn landa_mod_shares::ShareContentProvider> {
+    Arc::new(AndroidShareContentProvider { app })
 }

@@ -3,6 +3,7 @@ mod android_bridge;
 mod commands;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod desktop;
+mod logging;
 mod preview;
 mod updater;
 
@@ -23,12 +24,7 @@ use tauri_plugin_notification::NotificationExt;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    logging::init_tracing();
 
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -53,6 +49,9 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| std::env::temp_dir().join("landa"));
+            if let Err(err) = logging::attach_log_dir(&app_data_dir) {
+                tracing::warn!("failed to attach rotating log file: {err}");
+            }
             let default_download_dir = app
                 .path()
                 .download_dir()
@@ -72,6 +71,10 @@ pub fn run() {
             #[cfg(feature = "mod-shares")]
             let shares = {
                 let m = SharesModule::new(Arc::clone(engine.storage()));
+                #[cfg(target_os = "android")]
+                m.set_content_provider(android_bridge::make_share_content_provider(
+                    app.handle().clone(),
+                ));
                 engine.register_module(m.clone());
                 m
             };
@@ -372,8 +375,13 @@ pub fn run() {
             commands::list_manual_targets,
             commands::add_manual_target,
             commands::remove_manual_target,
+            commands::list_lan_interfaces,
+            commands::open_logs,
+            commands::copy_diagnostics,
             commands::shares_list_local,
             commands::shares_add_local,
+            commands::shares_pick_folder_android,
+            commands::shares_pick_file_android,
             commands::shares_remove_local,
             commands::shares_browse_remote_roots,
             commands::shares_browse_remote_dir,
@@ -392,8 +400,6 @@ pub fn run() {
             commands::clipboard_get_image_preview,
             commands::take_pending_shared_files,
             commands::take_pending_focus_target,
-            commands::has_all_files_access,
-            commands::request_all_files_access,
             commands::ensure_startup_permissions,
             commands::check_for_updates,
             commands::download_update,

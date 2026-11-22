@@ -73,6 +73,7 @@ impl LandaEngine {
             config.default_download_dir,
         );
         let settings_val = storage.load_settings(defaults)?;
+        crate::network::set_excluded_subnets(&settings_val.excluded_subnets);
         let interval = settings_val.discovery_interval_secs;
         let device_name = settings_val.device_name.clone();
 
@@ -374,8 +375,14 @@ impl LandaEngine {
             .clone()
     }
 
-    pub fn update_settings(&self, next: AppSettings) -> Result<AppSettings, CoreError> {
+    pub fn update_settings(&self, mut next: AppSettings) -> Result<AppSettings, CoreError> {
+        next.excluded_subnets = crate::network::normalize_excluded_subnets(&next.excluded_subnets);
+        let subnets_changed = {
+            let current = self.settings.read().expect("settings lock poisoned");
+            current.excluded_subnets != next.excluded_subnets
+        };
         self.storage.save_settings(&next)?;
+        crate::network::set_excluded_subnets(&next.excluded_subnets);
         self.discovery.set_device_name(next.device_name.clone());
         *self
             .discovery_interval_secs
@@ -385,7 +392,14 @@ impl LandaEngine {
             self.modules.set_enabled(id, *enabled);
         }
         *self.settings.write().expect("settings lock poisoned") = next.clone();
+        if subnets_changed {
+            self.trigger_scan();
+        }
         Ok(next)
+    }
+
+    pub fn list_lan_interfaces(&self) -> Vec<crate::network::LanInterfaceStatus> {
+        crate::network::list_lan_interface_statuses()
     }
 
     pub fn list_modules(&self) -> Vec<ModuleStatus> {

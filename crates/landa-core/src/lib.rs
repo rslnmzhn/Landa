@@ -17,7 +17,8 @@ pub use events::{
 };
 pub use module::{LandaModule, ModuleRegistry, ModuleStatus, PeerContext};
 pub use network::{
-    set_lan_interface_hook, set_socket_bind_hook, LanInterface, LanInterfaceHook, SocketBindHook,
+    set_lan_interface_hook, set_socket_bind_hook, LanInterface, LanInterfaceHook,
+    LanInterfaceStatus, SocketBindHook,
 };
 pub use qr::{build_qr_connect_uri, parse_qr_connect_uri, pick_primary_lan_ip, QrConnectPayload};
 pub use storage::{AppSettings, Storage};

@@ -86,8 +86,23 @@ class TransferFailedNotifArgs {
 }
 
 @InvokeArg
-class InstallApkArgs {
+class SaveUpdateApkArgs {
     lateinit var apkPath: String
+    lateinit var fileName: String
+}
+
+@InvokeArg
+class ListSafShareDirArgs {
+    lateinit var rootUri: String
+    var isDir: Boolean = true
+    var relPath: String = ""
+}
+
+@InvokeArg
+class OpenSafShareFileArgs {
+    lateinit var rootUri: String
+    var isDir: Boolean = true
+    var relPath: String = ""
 }
 
 @InvokeArg
@@ -1064,7 +1079,8 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                     file
                 )
                 val ext = file.extension.lowercase()
-                val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+                val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                    ?: if (ext == "log" || ext == "txt") "text/plain" else "*/*"
                 Intent(Intent.ACTION_VIEW).apply {
                     setDataAndType(uri, mime)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -1170,55 +1186,395 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
-    fun hasAllFilesAccess(invoke: Invoke) {
-        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Environment.isExternalStorageManager()
-        } else {
-            ContextCompat.checkSelfPermission(
-                activity,
-                Manifest.permission.READ_EXTERNAL_STORAGE
-            ) == PackageManager.PERMISSION_GRANTED
+    fun pickShareFolder(invoke: Invoke) {
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+                )
+            }
+            startActivityForResult(invoke, intent, "pickShareFolderResult")
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to open folder picker")
         }
+    }
+
+    @ActivityCallback
+    fun pickShareFolderResult(invoke: Invoke, result: ActivityResult) {
+        if (result.resultCode == Activity.RESULT_CANCELED) {
+            val res = JSObject()
+            res.put("cancelled", true)
+            invoke.resolve(res)
+            return
+        }
+        if (result.resultCode != Activity.RESULT_OK) {
+            invoke.reject("Folder picker failed")
+            return
+        }
+        val treeUri = result.data?.data
+        if (treeUri == null) {
+            val res = JSObject()
+            res.put("cancelled", true)
+            invoke.resolve(res)
+            return
+        }
+
+        try {
+            activity.contentResolver.takePersistableUriPermission(
+                treeUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to persist folder permission")
+            return
+        }
+
+        val rootDocUri = DocumentsContract.buildDocumentUriUsingTree(
+            treeUri,
+            DocumentsContract.getTreeDocumentId(treeUri)
+        )
+        val name = queryDisplayName(rootDocUri)?.trim()?.ifEmpty { null } ?: "Folder"
         val res = JSObject()
-        res.put("granted", granted)
+        res.put("cancelled", false)
+        res.put("uri", treeUri.toString())
+        res.put("name", name)
+        res.put("isDir", true)
         invoke.resolve(res)
     }
 
     @Command
-    fun requestAllFilesAccess(invoke: Invoke) {
+    fun pickShareFile(invoke: Invoke) {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                if (!Environment.isExternalStorageManager()) {
-                    val intent = try {
-                        Intent(
-                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                            Uri.parse("package:${activity.packageName}")
-                        )
-                    } catch (_: Exception) {
-                        Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                    }
-                    activity.startActivity(intent)
-                }
-            } else {
-                ActivityCompat.requestPermissions(
-                    activity,
-                    arrayOf(
-                        Manifest.permission.READ_EXTERNAL_STORAGE,
-                        Manifest.permission.WRITE_EXTERNAL_STORAGE
-                    ),
-                    1001
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
                 )
             }
-            invoke.resolve()
+            startActivityForResult(invoke, intent, "pickShareFileResult")
         } catch (ex: Exception) {
-            invoke.reject(ex.message ?: "Failed to request storage permission")
+            invoke.reject(ex.message ?: "Failed to open file picker")
+        }
+    }
+
+    @ActivityCallback
+    fun pickShareFileResult(invoke: Invoke, result: ActivityResult) {
+        if (result.resultCode == Activity.RESULT_CANCELED) {
+            val res = JSObject()
+            res.put("cancelled", true)
+            invoke.resolve(res)
+            return
+        }
+        if (result.resultCode != Activity.RESULT_OK) {
+            invoke.reject("File picker failed")
+            return
+        }
+        val fileUri = result.data?.data
+        if (fileUri == null) {
+            val res = JSObject()
+            res.put("cancelled", true)
+            invoke.resolve(res)
+            return
+        }
+
+        try {
+            activity.contentResolver.takePersistableUriPermission(
+                fileUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to persist file permission")
+            return
+        }
+
+        val name = queryDisplayName(fileUri)?.trim()?.ifEmpty { null } ?: "File"
+        val res = JSObject()
+        res.put("cancelled", false)
+        res.put("uri", fileUri.toString())
+        res.put("name", name)
+        res.put("isDir", false)
+        invoke.resolve(res)
+    }
+
+    @Command
+    fun listSafShareDir(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(ListSafShareDirArgs::class.java)
+            if (!args.rootUri.startsWith("content://")) {
+                invoke.reject("Only content:// URIs are supported")
+                return
+            }
+            val rootUri = Uri.parse(args.rootUri)
+            val segments = parseSafeRelSegments(args.relPath)
+
+            if (!args.isDir) {
+                if (segments.isNotEmpty()) {
+                    invoke.reject("cannot traverse into file share")
+                    return
+                }
+                val meta = queryDocumentMeta(rootUri)
+                val arr = JSArray()
+                val obj = JSObject()
+                obj.put("name", meta.name)
+                obj.put("relPath", "")
+                obj.put("isDir", false)
+                obj.put("sizeBytes", meta.sizeBytes)
+                obj.put("modifiedMs", meta.modifiedMs)
+                arr.put(obj)
+                val res = JSObject()
+                res.put("entries", arr)
+                invoke.resolve(res)
+                return
+            }
+
+            val targetDocId = resolveSafTreeDocId(rootUri, segments, expectDir = true)
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(rootUri, targetDocId)
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+                DocumentsContract.Document.COLUMN_FLAGS
+            )
+
+            data class EntryRow(
+                val name: String,
+                val relPath: String,
+                val isDir: Boolean,
+                val sizeBytes: Long,
+                val modifiedMs: Long
+            )
+
+            val rows = mutableListOf<EntryRow>()
+            val prefix = segments.joinToString("/")
+            activity.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val modIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                val flagsIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
+
+                while (cursor.moveToNext() && rows.size < 5000) {
+                    val rawName = if (nameIdx >= 0) cursor.getString(nameIdx) else null
+                    val name = rawName?.trim().orEmpty()
+                    if (name.isEmpty() || name == "." || name == ".." ||
+                        name.contains('/') || name.contains('\\') || name.contains('\u0000')
+                    ) {
+                        continue
+                    }
+                    val flags = if (flagsIdx >= 0 && !cursor.isNull(flagsIdx)) cursor.getInt(flagsIdx) else 0
+                    if ((flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) != 0) {
+                        continue
+                    }
+                    val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else null
+                    val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
+                    val sizeBytes = if (!isDir && sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                        cursor.getLong(sizeIdx).coerceAtLeast(0L)
+                    } else {
+                        0L
+                    }
+                    val modifiedMs = if (modIdx >= 0 && !cursor.isNull(modIdx)) {
+                        cursor.getLong(modIdx).coerceAtLeast(0L)
+                    } else {
+                        0L
+                    }
+                    val nextRel = if (prefix.isEmpty()) name else "$prefix/$name"
+                    rows.add(EntryRow(name, nextRel, isDir, sizeBytes, modifiedMs))
+                }
+            }
+
+            rows.sortWith(compareByDescending<EntryRow> { it.isDir }.thenBy { it.name })
+            val arr = JSArray()
+            for (row in rows) {
+                val obj = JSObject()
+                obj.put("name", row.name)
+                obj.put("relPath", row.relPath)
+                obj.put("isDir", row.isDir)
+                obj.put("sizeBytes", row.sizeBytes)
+                obj.put("modifiedMs", row.modifiedMs)
+                arr.put(obj)
+            }
+            val res = JSObject()
+            res.put("entries", arr)
+            invoke.resolve(res)
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to list shared folder")
         }
     }
 
     @Command
-    fun installApkUpdate(invoke: Invoke) {
+    fun openSafShareFile(invoke: Invoke) {
         try {
-            val args = invoke.parseArgs(InstallApkArgs::class.java)
+            val args = invoke.parseArgs(OpenSafShareFileArgs::class.java)
+            if (!args.rootUri.startsWith("content://")) {
+                invoke.reject("Only content:// URIs are supported")
+                return
+            }
+            val rootUri = Uri.parse(args.rootUri)
+            val segments = parseSafeRelSegments(args.relPath)
+
+            val targetUri = if (!args.isDir) {
+                if (segments.isNotEmpty()) {
+                    invoke.reject("cannot traverse into file share")
+                    return
+                }
+                rootUri
+            } else {
+                if (segments.isEmpty()) {
+                    invoke.reject("target is not a file")
+                    return
+                }
+                val docId = resolveSafTreeDocId(rootUri, segments, expectDir = false)
+                DocumentsContract.buildDocumentUriUsingTree(rootUri, docId)
+            }
+
+            val meta = queryDocumentMeta(targetUri)
+            val pfd = activity.contentResolver.openFileDescriptor(targetUri, "r")
+            if (pfd == null) {
+                invoke.reject("Unable to open shared file")
+                return
+            }
+            val statSize = runCatching { pfd.statSize }.getOrDefault(-1L)
+            val sizeBytes = if (meta.sizeBytes > 0L) meta.sizeBytes else statSize.coerceAtLeast(0L)
+            val fd = pfd.detachFd()
+
+            val res = JSObject()
+            res.put("fd", fd)
+            res.put("fileName", meta.name)
+            res.put("sizeBytes", sizeBytes)
+            res.put("modifiedMs", meta.modifiedMs)
+            invoke.resolve(res)
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to open shared file")
+        }
+    }
+
+    private data class SafDocMeta(
+        val name: String,
+        val sizeBytes: Long,
+        val modifiedMs: Long
+    )
+
+    private fun parseSafeRelSegments(relPath: String): List<String> {
+        val trimmed = relPath.trim()
+        if (trimmed.isEmpty() || trimmed == "." || trimmed == "/") {
+            return emptyList()
+        }
+        if (trimmed.contains('\\') || trimmed.contains('\u0000')) {
+            throw IllegalArgumentException("Invalid relative path")
+        }
+        val parts = trimmed.split('/').filter { it.isNotEmpty() }
+        for (part in parts) {
+            if (part == "." || part == "..") {
+                throw IllegalArgumentException("Path traversal is not allowed")
+            }
+        }
+        return parts
+    }
+
+    private fun resolveSafTreeDocId(
+        treeUri: Uri,
+        segments: List<String>,
+        expectDir: Boolean
+    ): String {
+        var currentDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_FLAGS
+        )
+
+        for ((idx, seg) in segments.withIndex()) {
+            val isLast = idx == segments.lastIndex
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, currentDocId)
+            var matchedDocId: String? = null
+            var matchedIsDir = false
+
+            activity.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val flagsIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
+
+                while (cursor.moveToNext()) {
+                    if (idIdx < 0 || nameIdx < 0) continue
+                    val flags = if (flagsIdx >= 0 && !cursor.isNull(flagsIdx)) cursor.getInt(flagsIdx) else 0
+                    if ((flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) != 0) {
+                        continue
+                    }
+                    val name = cursor.getString(nameIdx)?.trim() ?: continue
+                    if (name == seg) {
+                        matchedDocId = cursor.getString(idIdx)
+                        val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else null
+                        matchedIsDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
+                        break
+                    }
+                }
+            }
+
+            val nextId = matchedDocId ?: throw IllegalArgumentException("Path not found in share")
+            if (!isLast && !matchedIsDir) {
+                throw IllegalArgumentException("Intermediate path segment is not a directory")
+            }
+            if (isLast) {
+                if (expectDir && !matchedIsDir) {
+                    throw IllegalArgumentException("Target is not a directory")
+                }
+                if (!expectDir && matchedIsDir) {
+                    throw IllegalArgumentException("target is not a file")
+                }
+            }
+            currentDocId = nextId
+        }
+
+        return currentDocId
+    }
+
+    private fun queryDocumentMeta(uri: Uri): SafDocMeta {
+        var name: String? = null
+        var sizeBytes = 0L
+        var modifiedMs = 0L
+        activity.contentResolver.query(
+            uri,
+            arrayOf(
+                OpenableColumns.DISPLAY_NAME,
+                OpenableColumns.SIZE,
+                DocumentsContract.Document.COLUMN_LAST_MODIFIED
+            ),
+            null,
+            null,
+            null
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                val modIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                if (nameIdx >= 0) name = cursor.getString(nameIdx)
+                if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                    sizeBytes = cursor.getLong(sizeIdx).coerceAtLeast(0L)
+                }
+                if (modIdx >= 0 && !cursor.isNull(modIdx)) {
+                    modifiedMs = cursor.getLong(modIdx).coerceAtLeast(0L)
+                }
+            }
+        }
+        return SafDocMeta(
+            name = name?.trim()?.ifEmpty { null } ?: "file.bin",
+            sizeBytes = sizeBytes,
+            modifiedMs = modifiedMs
+        )
+    }
+
+    @Command
+    fun saveUpdateApkToDownloads(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(SaveUpdateApkArgs::class.java)
             val apkFile = File(args.apkPath).canonicalFile
             val cacheRoot = activity.cacheDir.canonicalFile
             val filesRoot = activity.filesDir.canonicalFile
@@ -1229,33 +1585,35 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                 return
             }
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-                !activity.packageManager.canRequestPackageInstalls()
-            ) {
-                val settingsIntent = Intent(
-                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                    Uri.parse("package:${activity.packageName}")
-                ).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                activity.startActivity(settingsIntent)
-                invoke.reject("INSTALL_PERMISSION_REQUIRED")
-                return
+            val cleanName = sanitizeRelativePath(args.fileName)
+                .substringAfterLast('/')
+                .ifEmpty { "landa-update.apk" }
+            val published = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                publishViaMediaStore(apkFile, cleanName)
+            } else {
+                publishLegacyDownloads(apkFile, cleanName)
             }
+            apkFile.delete()
 
-            val uri = FileProvider.getUriForFile(
-                activity,
-                "${activity.packageName}.fileprovider",
-                apkFile
-            )
-            val installIntent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            val res = JSObject()
+            res.put("publishedPath", published.publishedPath)
+            res.put("displayPath", published.displayPath)
+            invoke.resolve(res)
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to save APK update to Downloads")
+        }
+    }
+
+    @Command
+    fun openDownloadsFolder(invoke: Invoke) {
+        try {
+            val intent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            activity.startActivity(installIntent)
+            activity.startActivity(intent)
             invoke.resolve()
         } catch (ex: Exception) {
-            invoke.reject(ex.message ?: "Failed to launch APK installer")
+            invoke.reject(ex.message ?: "Failed to open Downloads")
         }
     }
 
@@ -1270,7 +1628,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             }
 
             val cleanRel = sanitizeRelativePath(args.relativePath)
-            val publishedPath = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val published = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 publishViaMediaStore(sourceFile, cleanRel)
             } else {
                 publishLegacyDownloads(sourceFile, cleanRel)
@@ -1279,14 +1637,14 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             sourceFile.delete()
 
             val res = JSObject()
-            res.put("publishedPath", publishedPath)
+            res.put("publishedPath", published.publishedPath)
             invoke.resolve(res)
         } catch (ex: Exception) {
             invoke.reject(ex.message ?: "Failed to publish file to Downloads")
         }
     }
 
-    private fun publishViaMediaStore(sourceFile: File, cleanRel: String): String {
+    private fun publishViaMediaStore(sourceFile: File, cleanRel: String): PublishedDownload {
         val parts = cleanRel.split('/').filter { it.isNotEmpty() }
         val fileName = parts.lastOrNull() ?: sourceFile.name
         val subDir = if (parts.size > 1) {
@@ -1323,23 +1681,37 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             resolver.update(uri, doneValues, null, null)
 
             var resolvedPath: String? = null
+            var actualDisplayName: String? = null
             resolver.query(
                 uri,
-                arrayOf(MediaStore.MediaColumns.DATA),
+                arrayOf(MediaStore.MediaColumns.DATA, MediaStore.MediaColumns.DISPLAY_NAME),
                 null,
                 null,
                 null
             )?.use { cursor ->
                 if (cursor.moveToFirst()) {
-                    val idx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-                    if (idx >= 0) {
-                        resolvedPath = cursor.getString(idx)
+                    val dataIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                    if (dataIdx >= 0 && !cursor.isNull(dataIdx)) {
+                        resolvedPath = cursor.getString(dataIdx)
+                    }
+                    val nameIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                    if (nameIdx >= 0 && !cursor.isNull(nameIdx)) {
+                        actualDisplayName = cursor.getString(nameIdx)
                     }
                 }
             }
             val key = resolvedPath ?: uri.toString()
             publishedUris[key] = Pair(uri, mimeType)
-            return key
+            val displayPath = DownloadsPublisher.formatMediaStoreDisplayPath(
+                parts = parts,
+                actualDisplayName = actualDisplayName,
+                resolvedPath = resolvedPath,
+                fallbackFileName = fileName,
+            )
+            return PublishedDownload(
+                publishedPath = key,
+                displayPath = displayPath,
+            )
         } catch (ex: Exception) {
             resolver.delete(uri, null, null)
             throw ex
@@ -1347,34 +1719,19 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Suppress("DEPRECATION")
-    private fun publishLegacyDownloads(sourceFile: File, cleanRel: String): String {
+    private fun publishLegacyDownloads(sourceFile: File, cleanRel: String): PublishedDownload {
         val downloadsRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val targetBase = File(downloadsRoot, "Landa")
-        var target = File(targetBase, cleanRel)
-        target.parentFile?.mkdirs()
-        if (target.exists()) {
-            val parent = target.parentFile ?: targetBase
-            val name = target.name
-            val dot = name.lastIndexOf('.')
-            val stem = if (dot > 0) name.substring(0, dot) else name
-            val ext = if (dot > 0) name.substring(dot) else ""
-            var idx = 1
-            while (target.exists()) {
-                target = File(parent, "$stem ($idx)$ext")
-                idx++
-            }
-        }
-        FileInputStream(sourceFile).use { input ->
-            FileOutputStream(target).use { out ->
-                input.copyTo(out, 64 * 1024)
-            }
-        }
+        val target = DownloadsPublisher.publishLegacyFile(targetBase, sourceFile, cleanRel)
         val ext = target.extension.lowercase()
         val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
             ?: "application/octet-stream"
         val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", target)
         publishedUris[target.absolutePath] = Pair(uri, mimeType)
-        return target.absolutePath
+        return PublishedDownload(
+            publishedPath = target.absolutePath,
+            displayPath = DownloadsPublisher.formatLegacyDisplayPath(targetBase, target),
+        )
     }
 
     private fun buildOpenDownloadedIntent(savedPaths: List<String>): Intent {

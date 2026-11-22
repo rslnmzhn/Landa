@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use landa_core::{
-    AppSettings, FriendRequestInfo, LandaEngine, LocalIdentityInfo, ManualTarget, ModuleStatus,
-    PeerInfo, TransferHistoryRecord,
+    AppSettings, FriendRequestInfo, LanInterfaceStatus, LandaEngine, LocalIdentityInfo,
+    ManualTarget, ModuleStatus, PeerInfo, TransferHistoryRecord,
 };
 #[cfg(feature = "mod-clipboard")]
 use landa_mod_clipboard::{ClipboardContentKind, ClipboardItem, ClipboardModule};
@@ -255,6 +255,138 @@ pub fn remove_manual_target(state: State<'_, AppState>, ip: String) -> Result<()
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub fn list_lan_interfaces(state: State<'_, AppState>) -> Vec<LanInterfaceStatus> {
+    state.engine.list_lan_interfaces()
+}
+
+#[tauri::command]
+pub async fn open_logs(app: tauri::AppHandle) -> Result<(), String> {
+    let log_path = crate::logging::ensure_log_file()?;
+    crate::preview::open_file_external(&app, &log_path.to_string_lossy()).await
+}
+
+#[tauri::command]
+pub async fn copy_diagnostics(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let log_tail = crate::logging::read_log_tail(200);
+    let report = build_diagnostics_report(&state.engine, &log_tail);
+    write_text_to_system_clipboard(&app, &state, &report).await?;
+    Ok(report)
+}
+
+pub fn build_diagnostics_report(engine: &LandaEngine, log_tail: &str) -> String {
+    use std::fmt::Write;
+
+    let identity = engine.local_identity_info();
+    let settings = engine.get_settings();
+    let interfaces = engine.list_lan_interfaces();
+    let manual_targets = engine.list_manual_targets().unwrap_or_default();
+    let modules = engine.list_modules();
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Landa v{} ({}/{})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let _ = writeln!(out, "Device Name: {}", identity.device_name);
+    let _ = writeln!(out, "Peer ID: {}", identity.peer_id);
+    let _ = writeln!(out, "QUIC Port: {}", identity.quic_port);
+    let _ = writeln!(out, "App Data Dir: {}", engine.app_data_dir().display());
+    let _ = writeln!(out, "Download Dir: {}", settings.download_dir);
+
+    let _ = writeln!(out, "\nLAN Interfaces ({}):", interfaces.len());
+    if interfaces.is_empty() {
+        let _ = writeln!(out, "  (none)");
+    } else {
+        for iface in &interfaces {
+            let state_label = if iface.enabled { "enabled" } else { "excluded" };
+            let _ = writeln!(
+                out,
+                "  - {} | ip={} | subnet={} | broadcast={} | {}",
+                iface.name, iface.ip, iface.subnet_cidr, iface.broadcast, state_label
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "\nExcluded Subnets ({}):",
+        settings.excluded_subnets.len()
+    );
+    if settings.excluded_subnets.is_empty() {
+        let _ = writeln!(out, "  (none)");
+    } else {
+        for cidr in &settings.excluded_subnets {
+            let _ = writeln!(out, "  - {cidr}");
+        }
+    }
+
+    let _ = writeln!(out, "\nManual Targets ({}):", manual_targets.len());
+    if manual_targets.is_empty() {
+        let _ = writeln!(out, "  (none)");
+    } else {
+        for target in &manual_targets {
+            let _ = writeln!(out, "  - {}", target.ip);
+        }
+    }
+
+    let _ = writeln!(out, "\nModules:");
+    for m in &modules {
+        let _ = writeln!(
+            out,
+            "  - {}: enabled={}, available={}",
+            m.id, m.enabled, m.available
+        );
+    }
+
+    let _ = writeln!(out, "\nRecent Logs (landa.log):");
+    if log_tail.trim().is_empty() {
+        let _ = writeln!(out, "  (empty)");
+    } else {
+        let _ = writeln!(out, "{log_tail}");
+    }
+
+    out
+}
+
+async fn write_text_to_system_clipboard(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    text: &str,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        let _ = state;
+        let bridge = app
+            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+            .ok_or_else(|| "Android bridge unavailable".to_string())?;
+        bridge.write_system_clipboard_text_async(text).await
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = app;
+        let mut guard = state
+            .desktop_clipboard
+            .lock()
+            .map_err(|_| "Clipboard lock poisoned".to_string())?;
+        if guard.is_none() {
+            *guard = arboard::Clipboard::new().ok();
+        }
+        let cb = guard
+            .as_mut()
+            .ok_or_else(|| "System clipboard unavailable".to_string())?;
+        cb.set_text(text.to_string())
+            .map_err(|e| format!("Failed to copy text: {e}"))
+    }
+}
+
 // --- Optional Module: Shares ---
 
 #[cfg(feature = "mod-shares")]
@@ -285,6 +417,74 @@ pub fn shares_add_local(
 #[cfg(not(feature = "mod-shares"))]
 #[tauri::command]
 pub fn shares_add_local(_path: String, _name: Option<String>) -> Result<serde_json::Value, String> {
+    Err("shares module is not compiled".into())
+}
+
+#[cfg(feature = "mod-shares")]
+#[tauri::command]
+pub async fn shares_pick_folder_android(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<LocalShareRoot>, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        let bridge = app
+            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+            .ok_or_else(|| "Android bridge unavailable".to_string())?;
+        let Some((uri, name, is_dir)) = bridge.pick_share_folder_async().await? else {
+            return Ok(None);
+        };
+        let root = state
+            .shares
+            .add_local_share_uri(uri, name, is_dir)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(root))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, state);
+        Err("shares_pick_folder_android is only supported on Android".into())
+    }
+}
+
+#[cfg(not(feature = "mod-shares"))]
+#[tauri::command]
+pub async fn shares_pick_folder_android() -> Result<Option<serde_json::Value>, String> {
+    Err("shares module is not compiled".into())
+}
+
+#[cfg(feature = "mod-shares")]
+#[tauri::command]
+pub async fn shares_pick_file_android(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<LocalShareRoot>, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        let bridge = app
+            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+            .ok_or_else(|| "Android bridge unavailable".to_string())?;
+        let Some((uri, name, is_dir)) = bridge.pick_share_file_async().await? else {
+            return Ok(None);
+        };
+        let root = state
+            .shares
+            .add_local_share_uri(uri, name, is_dir)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(root))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, state);
+        Err("shares_pick_file_android is only supported on Android".into())
+    }
+}
+
+#[cfg(not(feature = "mod-shares"))]
+#[tauri::command]
+pub async fn shares_pick_file_android() -> Result<Option<serde_json::Value>, String> {
     Err("shares module is not compiled".into())
 }
 
@@ -684,31 +884,7 @@ pub async fn clipboard_copy_to_system(
 
     if !is_image {
         let text_to_copy = text_val.unwrap_or_default();
-        #[cfg(target_os = "android")]
-        {
-            use tauri::Manager;
-            let bridge = app
-                .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
-                .ok_or_else(|| "Android bridge unavailable".to_string())?;
-            return bridge.write_system_clipboard_text_async(&text_to_copy).await;
-        }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        {
-            let _ = app;
-            let mut guard = state
-                .desktop_clipboard
-                .lock()
-                .map_err(|_| "Clipboard lock poisoned".to_string())?;
-            if guard.is_none() {
-                *guard = arboard::Clipboard::new().ok();
-            }
-            let cb = guard
-                .as_mut()
-                .ok_or_else(|| "System clipboard unavailable".to_string())?;
-            return cb
-                .set_text(text_to_copy)
-                .map_err(|e| format!("Failed to copy text: {e}"));
-        }
+        return write_text_to_system_clipboard(&app, &state, &text_to_copy).await;
     }
 
     let path = image_path.ok_or_else(|| "Clipboard image path missing".to_string())?;
@@ -874,32 +1050,6 @@ pub fn take_pending_shared_files(app: tauri::AppHandle) -> Result<Vec<String>, S
     }
     let _ = app;
     Ok(Vec::new())
-}
-
-#[tauri::command]
-pub fn has_all_files_access(app: tauri::AppHandle) -> Result<bool, String> {
-    #[cfg(target_os = "android")]
-    {
-        use tauri::Manager;
-        if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
-            return bridge.has_all_files_access();
-        }
-    }
-    let _ = app;
-    Ok(true)
-}
-
-#[tauri::command]
-pub fn request_all_files_access(app: tauri::AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    {
-        use tauri::Manager;
-        if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
-            return bridge.request_all_files_access();
-        }
-    }
-    let _ = app;
-    Ok(())
 }
 
 #[tauri::command]
@@ -1113,4 +1263,34 @@ pub async fn videolink_stop() -> Result<serde_json::Value, String> {
         "fileName": null,
         "sizeBytes": null
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use landa_core::LandaConfig;
+
+    #[tokio::test]
+    async fn diagnostics_report_includes_identity_subnets_and_logs() {
+        let temp_dir = std::env::temp_dir().join(format!("landa-diag-{}", uuid::Uuid::new_v4()));
+        let engine = LandaEngine::new_loopback(LandaConfig {
+            app_data_dir: temp_dir.clone(),
+            default_download_dir: temp_dir.join("dl"),
+            default_device_name: "DiagNode".into(),
+        })
+        .unwrap();
+
+        let mut settings = engine.get_settings();
+        settings.excluded_subnets = vec!["192.168.56.12/24".into()];
+        let saved = engine.update_settings(settings).unwrap();
+        assert_eq!(saved.excluded_subnets, vec!["192.168.56.0/24".to_string()]);
+
+        let report = build_diagnostics_report(&engine, "2026-11-23 INFO test log line");
+        assert!(report.contains("Device Name: DiagNode"));
+        assert!(report.contains("192.168.56.0/24"));
+        assert!(report.contains("2026-11-23 INFO test log line"));
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

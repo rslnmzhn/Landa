@@ -236,7 +236,7 @@ pub async fn download_and_verify_update(
     if target_path.exists() {
         if let Ok(existing_sha) = compute_file_sha256(&target_path).await {
             if existing_sha == expected_sha {
-                let path_str = target_path.to_string_lossy().to_string();
+                let path_str = finalize_verified_update_path(app, &target_path, &safe_name).await?;
                 emit_progress(
                     app,
                     "ready",
@@ -350,7 +350,7 @@ pub async fn download_and_verify_update(
         .await
         .map_err(|e| format!("Failed to finalize update file: {e}"))?;
 
-    let path_str = target_path.to_string_lossy().to_string();
+    let path_str = finalize_verified_update_path(app, &target_path, &safe_name).await?;
     emit_progress(
         app,
         "ready",
@@ -362,100 +362,123 @@ pub async fn download_and_verify_update(
     Ok(path_str)
 }
 
-pub async fn install_update(app: &AppHandle, file_path: &str) -> Result<(), String> {
-    let updates_dir = resolve_updates_dir(app)?;
-    let canonical_dir = updates_dir
-        .canonicalize()
-        .map_err(|e| format!("Updates directory unavailable: {e}"))?;
-    let canonical_file = PathBuf::from(file_path)
-        .canonicalize()
-        .map_err(|e| format!("Update file not found: {e}"))?;
-
-    if !canonical_file.starts_with(&canonical_dir) || !canonical_file.is_file() {
-        return Err("Invalid update file path".into());
-    }
-
-    emit_progress(
-        app,
-        "installing",
-        0,
-        0,
-        Some(canonical_file.to_string_lossy().to_string()),
-        None,
-    );
-
-    #[cfg(target_os = "windows")]
-    {
-        let ext = canonical_file
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ext == "exe" {
-            std::process::Command::new(&canonical_file)
-                .spawn()
-                .map_err(|e| format!("Failed to launch installer: {e}"))?;
-            let app_handle = app.clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(350)).await;
-                app_handle.exit(0);
-            });
-            return Ok(());
-        }
-        use tauri_plugin_opener::OpenerExt;
-        app.opener()
-            .reveal_item_in_dir(&canonical_file)
-            .map_err(|e| format!("Failed to open update folder: {e}"))?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let ext = canonical_file
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ext == "appimage" {
-            let perms = std::fs::Permissions::from_mode(0o755);
-            std::fs::set_permissions(&canonical_file, perms)
-                .map_err(|e| format!("Failed to mark AppImage executable: {e}"))?;
-            std::process::Command::new(&canonical_file)
-                .spawn()
-                .map_err(|e| format!("Failed to launch AppImage: {e}"))?;
-            let app_handle = app.clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(350)).await;
-                app_handle.exit(0);
-            });
-            return Ok(());
-        }
-        use tauri_plugin_opener::OpenerExt;
-        app.opener()
-            .reveal_item_in_dir(&canonical_file)
-            .map_err(|e| format!("Failed to open update folder: {e}"))?;
-        Ok(())
-    }
-
+async fn finalize_verified_update_path(
+    app: &AppHandle,
+    target_path: &Path,
+    safe_name: &str,
+) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
-        if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
-            bridge
-                .install_apk_update_async(&canonical_file.to_string_lossy())
-                .await
-        } else {
-            Err("Android bridge unavailable".into())
-        }
+        let bridge = app
+            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+            .ok_or_else(|| "Android bridge unavailable".to_string())?;
+        let saved = bridge
+            .save_update_apk_to_downloads_async(&target_path.to_string_lossy(), safe_name)
+            .await?;
+        Ok(saved.display_path)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, safe_name);
+        Ok(target_path.to_string_lossy().to_string())
+    }
+}
+
+pub async fn install_update(app: &AppHandle, file_path: &str) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = file_path;
+        let bridge = app
+            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+            .ok_or_else(|| "Android bridge unavailable".to_string())?;
+        bridge.open_downloads_folder_async().await
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
+    #[cfg(not(target_os = "android"))]
     {
-        use tauri_plugin_opener::OpenerExt;
-        app.opener()
-            .reveal_item_in_dir(&canonical_file)
-            .map_err(|e| format!("Failed to open update folder: {e}"))?;
-        Ok(())
+        let updates_dir = resolve_updates_dir(app)?;
+        let canonical_dir = updates_dir
+            .canonicalize()
+            .map_err(|e| format!("Updates directory unavailable: {e}"))?;
+        let canonical_file = PathBuf::from(file_path)
+            .canonicalize()
+            .map_err(|e| format!("Update file not found: {e}"))?;
+
+        if !canonical_file.starts_with(&canonical_dir) || !canonical_file.is_file() {
+            return Err("Invalid update file path".into());
+        }
+
+        emit_progress(
+            app,
+            "installing",
+            0,
+            0,
+            Some(canonical_file.to_string_lossy().to_string()),
+            None,
+        );
+
+        #[cfg(target_os = "windows")]
+        {
+            let ext = canonical_file
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext == "exe" {
+                std::process::Command::new(&canonical_file)
+                    .spawn()
+                    .map_err(|e| format!("Failed to launch installer: {e}"))?;
+                let app_handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    app_handle.exit(0);
+                });
+                return Ok(());
+            }
+            use tauri_plugin_opener::OpenerExt;
+            app.opener()
+                .reveal_item_in_dir(&canonical_file)
+                .map_err(|e| format!("Failed to open update folder: {e}"))?;
+            Ok(())
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ext = canonical_file
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext == "appimage" {
+                let perms = std::fs::Permissions::from_mode(0o755);
+                std::fs::set_permissions(&canonical_file, perms)
+                    .map_err(|e| format!("Failed to mark AppImage executable: {e}"))?;
+                std::process::Command::new(&canonical_file)
+                    .spawn()
+                    .map_err(|e| format!("Failed to launch AppImage: {e}"))?;
+                let app_handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    app_handle.exit(0);
+                });
+                return Ok(());
+            }
+            use tauri_plugin_opener::OpenerExt;
+            app.opener()
+                .reveal_item_in_dir(&canonical_file)
+                .map_err(|e| format!("Failed to open update folder: {e}"))?;
+            Ok(())
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            use tauri_plugin_opener::OpenerExt;
+            app.opener()
+                .reveal_item_in_dir(&canonical_file)
+                .map_err(|e| format!("Failed to open update folder: {e}"))?;
+            Ok(())
+        }
     }
 }
 

@@ -22,6 +22,8 @@ pub struct AppSettings {
     pub language: String,
     pub discovery_interval_secs: u64,
     pub enabled_modules: HashMap<String, bool>,
+    #[serde(default)]
+    pub excluded_subnets: Vec<String>,
 }
 
 impl AppSettings {
@@ -40,6 +42,7 @@ impl AppSettings {
             language: "ru".to_string(),
             discovery_interval_secs: 5,
             enabled_modules,
+            excluded_subnets: Vec::new(),
         }
     }
 }
@@ -506,5 +509,49 @@ fn str_to_category(s: &str) -> DeviceCategory {
         "desktop" => DeviceCategory::Desktop,
         "phone" => DeviceCategory::Phone,
         _ => DeviceCategory::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_settings_deserializes_legacy_json_without_excluded_subnets() {
+        let legacy_json = r#"{
+            "deviceName": "Legacy PC",
+            "downloadDir": "/tmp/downloads",
+            "autoAcceptFromFriends": true,
+            "minimizeToTray": false,
+            "leftHandedMode": false,
+            "theme": "dark",
+            "language": "ru",
+            "discoveryIntervalSecs": 5,
+            "enabledModules": {"shares": true}
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.device_name, "Legacy PC");
+        assert!(parsed.excluded_subnets.is_empty());
+    }
+
+    #[test]
+    fn storage_persists_excluded_subnets_roundtrip() {
+        let temp_dir = std::env::temp_dir().join(format!("landa-storage-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("landa.sqlite");
+        let storage = Storage::open(&db_path).unwrap();
+
+        let mut settings = AppSettings::default_with("Test".into(), temp_dir.join("dl"));
+        settings.excluded_subnets = vec!["192.168.56.0/24".into(), "172.17.0.0/16".into()];
+        storage.save_settings(&settings).unwrap();
+
+        let loaded = storage
+            .load_settings(AppSettings::default_with("Fallback".into(), temp_dir.clone()))
+            .unwrap();
+        assert_eq!(
+            loaded.excluded_subnets,
+            vec!["192.168.56.0/24".to_string(), "172.17.0.0/16".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

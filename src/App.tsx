@@ -415,6 +415,7 @@ export function App() {
           {activeTab === "shares" && (
             <SharesView
               t={t}
+              identity={identity}
               peers={peers}
               enabled={sharesEnabled}
               onPreviewRemoteFile={openRemoteSharePreview}

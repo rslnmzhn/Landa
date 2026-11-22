@@ -90,6 +90,16 @@ export interface AppSettings {
   language: "ru" | "en";
   discoveryIntervalSecs: number;
   enabledModules: Record<string, boolean>;
+  excludedSubnets?: string[];
+}
+
+export interface LanInterfaceInfo {
+  name: string;
+  ip: string;
+  netmask: string;
+  broadcast: string;
+  subnetCidr: string;
+  enabled: boolean;
 }
 
 export interface ModuleStatus {

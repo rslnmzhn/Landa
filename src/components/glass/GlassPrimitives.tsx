@@ -121,10 +121,12 @@ export function GlassToggle({
   checked,
   onChange,
   label,
+  description,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   label: string;
+  description?: string;
 }) {
   return (
     <button
@@ -134,8 +136,15 @@ export function GlassToggle({
       onClick={() => onChange(!checked)}
       className="flex min-h-[48px] w-full items-center justify-between gap-4 rounded-2xl px-2 py-2 text-left transition hover:bg-white/10 dark:hover:bg-white/5"
     >
-      <span className="min-w-0 flex-1 text-sm font-medium text-slate-900/90 dark:text-white/90">
-        {label}
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
+          {label}
+        </span>
+        {description && (
+          <span className="block font-mono text-xs text-slate-700/65 dark:text-white/50">
+            {description}
+          </span>
+        )}
       </span>
       <span
         className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full border transition-colors duration-200 ${

@@ -37,13 +37,23 @@ val releaseStoreFilePath = readSigningValue("storeFile", "ANDROID_KEYSTORE_PATH"
 val releaseStorePassword = readSigningValue("storePassword", "ANDROID_KEYSTORE_PASSWORD")
 val releaseKeyAlias = readSigningValue("keyAlias", "ANDROID_KEY_ALIAS")
 val releaseKeyPassword = readSigningValue("keyPassword", "ANDROID_KEY_PASSWORD")
+val releaseStoreFile = releaseStoreFilePath?.let { rootProject.file(it) }
 
 val hasReleaseSigning = listOf(
     releaseStoreFilePath,
     releaseStorePassword,
     releaseKeyAlias,
     releaseKeyPassword,
-).all { !it.isNullOrBlank() }
+).all { !it.isNullOrBlank() } && releaseStoreFile?.isFile == true
+
+val isReleaseTaskRequested = gradle.startParameter.taskNames.any {
+    it.contains("release", ignoreCase = true)
+}
+if (isReleaseTaskRequested && !hasReleaseSigning) {
+    throw GradleException(
+        "Android release signing is required. Configure key.properties or ANDROID_KEYSTORE_PATH, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD."
+    )
+}
 
 android {
     compileSdk = 36
@@ -51,7 +61,7 @@ android {
     signingConfigs {
         if (hasReleaseSigning) {
             create("release") {
-                storeFile = rootProject.file(releaseStoreFilePath!!)
+                storeFile = releaseStoreFile
                 storePassword = releaseStorePassword
                 keyAlias = releaseKeyAlias
                 keyPassword = releaseKeyPassword
@@ -80,15 +90,12 @@ android {
             }
         }
         getByName("release") {
-            signingConfig = if (hasReleaseSigning) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
-            optimization {
-               enable = true
-            }
+            manifestPlaceholders["usesCleartextTraffic"] = "false"
+            signingConfig = signingConfigs.findByName("release")
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
                 *fileTree(".") {
                   include("**/*.pro")
                   exclude("build/**")
@@ -129,6 +136,27 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
+}
+
+class RequireReleaseSigningAction(private val configured: Boolean) : org.gradle.api.Action<Task> {
+    override fun execute(task: Task) {
+        if (!configured) {
+            throw GradleException(
+                "Android release signing is required. Refusing to build an unsigned or debug-signed release APK."
+            )
+        }
+    }
+}
+
+tasks.matching {
+    it.name.contains("Release") && (
+        it.name.startsWith("validateSigning") ||
+            it.name.startsWith("package") ||
+            it.name.startsWith("assemble") ||
+            it.name.startsWith("bundle")
+        )
+}.configureEach {
+    doFirst(RequireReleaseSigningAction(hasReleaseSigning))
 }
 
 apply(from = file("tauri.build.gradle.kts"))

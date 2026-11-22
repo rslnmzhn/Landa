@@ -6,6 +6,7 @@ import type {
   ClipboardPasteResult,
   CoreEvent,
   FriendRequestInfo,
+  LanInterfaceInfo,
   LocalIdentityInfo,
   LocalShareRoot,
   ManualTarget,
@@ -65,10 +66,18 @@ export const api = {
   removeManualTarget: (ip: string) =>
     invoke<void>("remove_manual_target", { ip }),
 
+  listLanInterfaces: () => invoke<LanInterfaceInfo[]>("list_lan_interfaces"),
+  openLogs: () => invoke<void>("open_logs"),
+  copyDiagnostics: () => invoke<string>("copy_diagnostics"),
+
   // Shares module
   sharesListLocal: () => invoke<LocalShareRoot[]>("shares_list_local"),
   sharesAddLocal: (path: string, name: string | null) =>
     invoke<LocalShareRoot>("shares_add_local", { path, name }),
+  sharesPickFolderAndroid: () =>
+    invoke<LocalShareRoot | null>("shares_pick_folder_android"),
+  sharesPickFileAndroid: () =>
+    invoke<LocalShareRoot | null>("shares_pick_file_android"),
   sharesRemoveLocal: (id: string) =>
     invoke<void>("shares_remove_local", { id }),
   sharesBrowseRemoteRoots: (peerId: string) =>
@@ -135,8 +144,6 @@ export const api = {
   takePendingSharedFiles: () => invoke<string[]>("take_pending_shared_files"),
   takePendingFocusTarget: () =>
     invoke<PendingFocusTarget | null>("take_pending_focus_target"),
-  hasAllFilesAccess: () => invoke<boolean>("has_all_files_access"),
-  requestAllFilesAccess: () => invoke<void>("request_all_files_access"),
   ensureStartupPermissions: () => invoke<void>("ensure_startup_permissions"),
 
   // App Auto-Update

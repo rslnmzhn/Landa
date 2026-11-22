@@ -301,6 +301,12 @@ fn authorize_preview_target(
     }
 
     if path_or_uri.starts_with("content://") {
+        #[cfg(feature = "mod-shares")]
+        if let Ok(roots) = state.shares.list_local_shares() {
+            if roots.iter().any(|r| !r.is_dir && r.path == path_or_uri) {
+                return Ok(());
+            }
+        }
         return Err("Unauthorized content URI".into());
     }
 

@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { api, formatBytes } from "../../core/api";
 import type {
+  LocalIdentityInfo,
   LocalShareRoot,
   PeerInfo,
   ShareEntry,
@@ -114,6 +115,7 @@ function LazyShareThumbnail({
 
 interface SharesViewProps {
   t: TranslationDict;
+  identity: LocalIdentityInfo | null;
   peers: PeerInfo[];
   enabled: boolean;
   onPreviewRemoteFile: (peerId: string, rootId: string, relPath: string) => void;
@@ -124,6 +126,7 @@ interface SharesViewProps {
 
 export function SharesView({
   t,
+  identity,
   peers,
   enabled,
   onPreviewRemoteFile,
@@ -139,6 +142,10 @@ export function SharesView({
   const [entries, setEntries] = useState<ShareEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
+
+  const isAndroid =
+    identity?.os === "android" ||
+    navigator.userAgent.toLowerCase().includes("android");
 
   const trustedOnlinePeers = peers.filter((p) => p.isTrusted && p.isOnline);
 
@@ -158,9 +165,12 @@ export function SharesView({
 
   const handleAddLocal = async (directory: boolean) => {
     try {
-      const hasAccess = await api.hasAllFilesAccess().catch(() => true);
-      if (!hasAccess) {
-        await api.requestAllFilesAccess();
+      if (isAndroid) {
+        const added = directory
+          ? await api.sharesPickFolderAndroid()
+          : await api.sharesPickFileAndroid();
+        if (!added) return;
+        await loadLocal();
         return;
       }
       const selected = await open({ directory, multiple: false });

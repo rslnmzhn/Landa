@@ -197,17 +197,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -n "${ANDROID_KEYSTORE_BASE64}" && -n "${ANDROID_KEYSTORE_PASSWORD}" && -n "${ANDROID_KEY_ALIAS}" && -n "${ANDROID_KEY_PASSWORD}" ]]; then
-            echo "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > src-tauri/gen/android/release-keystore.jks
-            cat > src-tauri/gen/android/key.properties <<EOF
+          if [[ -z "${ANDROID_KEYSTORE_BASE64}" || -z "${ANDROID_KEYSTORE_PASSWORD}" || -z "${ANDROID_KEY_ALIAS}" || -z "${ANDROID_KEY_PASSWORD}" ]]; then
+            echo "::error::Android release signing secrets (ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD) are required for release builds." >&2
+            exit 1
+          fi
+          echo "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > src-tauri/gen/android/release-keystore.jks
+          cat > src-tauri/gen/android/key.properties <<EOF
           storeFile=release-keystore.jks
           storePassword=${ANDROID_KEYSTORE_PASSWORD}
           keyAlias=${ANDROID_KEY_ALIAS}
           keyPassword=${ANDROID_KEY_PASSWORD}
           EOF
-          else
-            echo "::warning::Android release signing secrets are not configured; falling back to debug signing key so APKs remain installable."
+          EXPECTED_CERT_SHA256="$(
+            keytool -list -v \
+              -keystore src-tauri/gen/android/release-keystore.jks \
+              -storepass "${ANDROID_KEYSTORE_PASSWORD}" \
+              -alias "${ANDROID_KEY_ALIAS}" \
+            | awk -F'SHA256: ' '/SHA256:/ { gsub(/:/, "", $2); print tolower($2); exit }'
+          )"
+          if [[ -z "${EXPECTED_CERT_SHA256}" ]]; then
+            echo "::error::Failed to extract SHA-256 certificate fingerprint from release keystore." >&2
+            exit 1
           fi
+          echo "EXPECTED_CERT_SHA256=${EXPECTED_CERT_SHA256}" >> "${GITHUB_ENV}"
 
       - name: Build Android APKs (release, split per ABI)
         env:
@@ -221,6 +233,35 @@ jobs:
           mkdir -p dist-android
           find src-tauri/gen/android/app/build/outputs/apk -type f -name "*.apk" -exec cp {} dist-android/ \;
           ls -la dist-android
+
+      - name: Verify Android APK signing and permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          APKSIGNER="${ANDROID_HOME}/build-tools/36.0.0/apksigner"
+          AAPT2="${ANDROID_HOME}/build-tools/36.0.0/aapt2"
+          for apk in dist-android/*.apk; do
+            echo "Verifying ${apk}..."
+            certs="$("${APKSIGNER}" verify --print-certs "${apk}")"
+            echo "${certs}"
+            if echo "${certs}" | grep -qi "CN=Android Debug"; then
+              echo "::error::${apk} is signed with a debug certificate!" >&2
+              exit 1
+            fi
+            actual_sha="$(echo "${certs}" | awk -F'SHA-256 digest: ' '/SHA-256 digest:/ { print tolower($2); exit }')"
+            if [[ "${actual_sha}" != "${EXPECTED_CERT_SHA256}" ]]; then
+              echo "::error::${apk} certificate SHA-256 (${actual_sha}) does not match expected (${EXPECTED_CERT_SHA256})!" >&2
+              exit 1
+            fi
+            perms="$("${AAPT2}" dump permissions "${apk}")"
+            echo "${perms}"
+            for forbidden in MANAGE_EXTERNAL_STORAGE REQUEST_INSTALL_PACKAGES READ_EXTERNAL_STORAGE; do
+              if echo "${perms}" | grep -q "${forbidden}"; then
+                echo "::error::${apk} declares forbidden permission ${forbidden}!" >&2
+                exit 1
+              fi
+            done
+          done
 
       - name: Upload Android artifact
         uses: actions/upload-artifact@v4

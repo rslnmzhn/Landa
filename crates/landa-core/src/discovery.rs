@@ -19,7 +19,10 @@ use crate::error::CoreError;
 use crate::events::{CoreEvent, PeerInfo};
 #[cfg(unix)]
 use crate::network::bind_socket_to_lan_network;
-use crate::network::{enumerate_lan_interfaces, DISCOVERY_MULTICAST_ADDR};
+use crate::network::{
+    enumerate_all_lan_interfaces, enumerate_lan_interfaces, is_ip_in_excluded_subnet,
+    DISCOVERY_MULTICAST_ADDR,
+};
 use crate::storage::Storage;
 
 const PEER_OFFLINE_TIMEOUT: Duration = Duration::from_secs(25);
@@ -295,7 +298,7 @@ impl DiscoveryService {
             }
         }
 
-        if interfaces.is_empty() {
+        if interfaces.is_empty() && enumerate_all_lan_interfaces().is_empty() {
             let _ = socket.send_to(&packet, global_bcast).await;
             let _ = socket.send_to(&packet, multicast_addr).await;
         }
@@ -325,6 +328,16 @@ impl DiscoveryService {
         };
         let ip = *v4.ip();
         let ip_str = ip.to_string();
+        if is_ip_in_excluded_subnet(ip) {
+            let is_manual = self
+                .storage
+                .list_manual_targets()
+                .map(|targets| targets.iter().any(|t| t.ip == ip_str))
+                .unwrap_or(false);
+            if !is_manual {
+                return;
+            }
+        }
 
         let is_new_or_changed = {
             let mut guard = self.live_peers.write().expect("live_peers lock poisoned");
@@ -419,8 +432,14 @@ fn bind_interface_sender_socket(local_ip: Ipv4Addr) -> Result<UdpSocket, CoreErr
 }
 
 fn join_multicast_on_lan(socket: &UdpSocket) {
+    let all_interfaces = enumerate_all_lan_interfaces();
+    for iface in &all_interfaces {
+        if is_ip_in_excluded_subnet(iface.ip) {
+            let _ = socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip);
+        }
+    }
     let interfaces = enumerate_lan_interfaces();
-    if interfaces.is_empty() {
+    if interfaces.is_empty() && all_interfaces.is_empty() {
         let _ = socket.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED);
     } else {
         for iface in interfaces {

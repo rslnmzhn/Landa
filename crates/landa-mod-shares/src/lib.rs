@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::Cursor;
+use std::io::{BufRead, BufReader, Cursor, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
@@ -143,11 +143,35 @@ impl ThumbnailLruCache {
     }
 }
 
+pub struct ShareOpenedFile {
+    pub file: std::fs::File,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub modified_ms: i64,
+}
+
+pub trait ShareContentProvider: Send + Sync {
+    fn list_dir(
+        &self,
+        root_uri: &str,
+        is_dir: bool,
+        rel_path: &str,
+    ) -> Result<Vec<ShareEntry>, CoreError>;
+
+    fn open_file(
+        &self,
+        root_uri: &str,
+        is_dir: bool,
+        rel_path: &str,
+    ) -> Result<ShareOpenedFile, CoreError>;
+}
+
 pub struct SharesModule {
     storage: Arc<Storage>,
     enabled: AtomicBool,
     local_thumb_cache: ThumbnailLruCache,
     remote_thumb_cache: ThumbnailLruCache,
+    content_provider: RwLock<Option<Arc<dyn ShareContentProvider>>>,
 }
 
 impl SharesModule {
@@ -157,7 +181,25 @@ impl SharesModule {
             enabled: AtomicBool::new(true),
             local_thumb_cache: ThumbnailLruCache::new(THUMB_CACHE_MAX_BYTES),
             remote_thumb_cache: ThumbnailLruCache::new(THUMB_CACHE_MAX_BYTES),
+            content_provider: RwLock::new(None),
         })
+    }
+
+    pub fn set_content_provider(&self, provider: Arc<dyn ShareContentProvider>) {
+        *self
+            .content_provider
+            .write()
+            .expect("share content provider lock poisoned") = Some(provider);
+    }
+
+    fn get_content_provider(&self) -> Result<Arc<dyn ShareContentProvider>, CoreError> {
+        self.content_provider
+            .read()
+            .expect("share content provider lock poisoned")
+            .clone()
+            .ok_or_else(|| {
+                CoreError::InvalidInput("content URI shares are not supported on this platform".into())
+            })
     }
 
     pub fn list_local_shares(&self) -> Result<Vec<LocalShareRoot>, CoreError> {
@@ -172,6 +214,12 @@ impl SharesModule {
         path: PathBuf,
         custom_name: Option<String>,
     ) -> Result<LocalShareRoot, CoreError> {
+        let raw_str = path.to_string_lossy();
+        if raw_str.starts_with("content://") {
+            return Err(CoreError::InvalidInput(
+                "use add_local_share_uri for content:// URIs".into(),
+            ));
+        }
         let canonical = std::fs::canonicalize(&path)?;
         let is_dir = canonical.is_dir();
         if !is_dir && !canonical.is_file() {
@@ -198,6 +246,39 @@ impl SharesModule {
             id: Uuid::new_v4().to_string(),
             name,
             path: canonical_str,
+            is_dir,
+        };
+        roots.push(root.clone());
+        self.storage.set_setting_json(SHARES_SETTING_KEY, &roots)?;
+        Ok(root)
+    }
+
+    pub fn add_local_share_uri(
+        &self,
+        uri: String,
+        name: String,
+        is_dir: bool,
+    ) -> Result<LocalShareRoot, CoreError> {
+        let trimmed_uri = uri.trim().to_string();
+        if !trimmed_uri.starts_with("content://") {
+            return Err(CoreError::InvalidInput("share URI must start with content://".into()));
+        }
+        let clean_name = name.trim().to_string();
+        let display_name = if clean_name.is_empty() {
+            if is_dir { "Folder".to_string() } else { "File".to_string() }
+        } else {
+            clean_name
+        };
+
+        let mut roots = self.list_local_shares()?;
+        if let Some(existing) = roots.iter().find(|r| r.path == trimmed_uri) {
+            return Ok(existing.clone());
+        }
+
+        let root = LocalShareRoot {
+            id: Uuid::new_v4().to_string(),
+            name: display_name,
+            path: trimmed_uri,
             is_dir,
         };
         roots.push(root.clone());
@@ -513,24 +594,35 @@ impl SharesModule {
         }
     }
 
-    fn resolve_root_target(&self, root_id: &str, rel_path: &str) -> Result<(LocalShareRoot, PathBuf), CoreError> {
-        let roots = self.list_local_shares()?;
-        let root = roots
+    fn find_root(&self, root_id: &str) -> Result<LocalShareRoot, CoreError> {
+        self.list_local_shares()?
             .into_iter()
             .find(|r| r.id == root_id)
-            .ok_or_else(|| CoreError::NotFound("share root".into()))?;
-        let root_canon = std::fs::canonicalize(&root.path)?;
+            .ok_or_else(|| CoreError::NotFound("share root".into()))
+    }
 
+    fn normalize_share_rel_path(is_dir: bool, rel_path: &str) -> Result<String, CoreError> {
         let trimmed = rel_path.trim();
         if trimmed.is_empty() || trimmed == "." || trimmed == "/" {
-            return Ok((root, root_canon));
+            return Ok(String::new());
         }
-        if !root.is_dir {
+        if !is_dir {
             return Err(CoreError::InvalidInput("cannot traverse into file share".into()));
         }
-
         let safe_rel = validate_relative_path(trimmed)?;
-        let candidate = root_canon.join(&safe_rel);
+        Ok(safe_rel.to_string_lossy().replace('\\', "/"))
+    }
+
+    fn resolve_root_target(&self, root_id: &str, rel_path: &str) -> Result<(LocalShareRoot, PathBuf), CoreError> {
+        let root = self.find_root(root_id)?;
+        let root_canon = std::fs::canonicalize(&root.path)?;
+
+        let clean_rel = Self::normalize_share_rel_path(root.is_dir, rel_path)?;
+        if clean_rel.is_empty() {
+            return Ok((root, root_canon));
+        }
+
+        let candidate = root_canon.join(&clean_rel);
         let target_canon = std::fs::canonicalize(&candidate)?;
         if !target_canon.starts_with(&root_canon) {
             return Err(CoreError::InvalidInput("path escapes share root".into()));
@@ -580,67 +672,160 @@ impl LandaModule for SharesModule {
                 send_response(&mut send, &ShareResponse::Roots(roots)).await?;
             }
             ShareRequest::ListDir { root_id, rel_path } => {
-                match self.resolve_root_target(&root_id, &rel_path) {
-                    Ok((root, target)) => {
-                        let entries = if !root.is_dir {
-                            let meta = std::fs::metadata(&target)?;
-                            vec![ShareEntry {
-                                name: root.name,
-                                rel_path: String::new(),
-                                is_dir: false,
-                                size_bytes: meta.len(),
-                                modified_ms: modified_ms(&meta),
-                            }]
-                        } else {
-                            read_dir_entries(&PathBuf::from(&root.path), &target)?
-                        };
-                        send_response(&mut send, &ShareResponse::Entries(entries)).await?;
-                    }
+                let root = match self.find_root(&root_id) {
+                    Ok(r) => r,
                     Err(err) => {
                         send_response(&mut send, &ShareResponse::Error(err.to_string())).await?;
+                        let _ = send.finish();
+                        return Ok(());
+                    }
+                };
+
+                if root.path.starts_with("content://") {
+                    let res = match (
+                        Self::normalize_share_rel_path(root.is_dir, &rel_path),
+                        self.get_content_provider(),
+                    ) {
+                        (Ok(clean_rel), Ok(provider)) => {
+                            let uri = root.path.clone();
+                            let is_dir = root.is_dir;
+                            tokio::task::spawn_blocking(move || {
+                                provider.list_dir(&uri, is_dir, &clean_rel)
+                            })
+                            .await
+                            .map_err(|e| CoreError::InvalidInput(e.to_string()))?
+                        }
+                        (Err(err), _) | (_, Err(err)) => Err(err),
+                    };
+                    match res {
+                        Ok(entries) => {
+                            send_response(&mut send, &ShareResponse::Entries(entries)).await?;
+                        }
+                        Err(err) => {
+                            send_response(&mut send, &ShareResponse::Error(err.to_string())).await?;
+                        }
+                    }
+                } else {
+                    match self.resolve_root_target(&root_id, &rel_path) {
+                        Ok((root, target)) => {
+                            let entries = if !root.is_dir {
+                                let meta = std::fs::metadata(&target)?;
+                                vec![ShareEntry {
+                                    name: root.name,
+                                    rel_path: String::new(),
+                                    is_dir: false,
+                                    size_bytes: meta.len(),
+                                    modified_ms: modified_ms(&meta),
+                                }]
+                            } else {
+                                read_dir_entries(&PathBuf::from(&root.path), &target)?
+                            };
+                            send_response(&mut send, &ShareResponse::Entries(entries)).await?;
+                        }
+                        Err(err) => {
+                            send_response(&mut send, &ShareResponse::Error(err.to_string())).await?;
+                        }
                     }
                 }
             }
             ShareRequest::DownloadFile { root_id, rel_path } => {
-                match self.resolve_root_target(&root_id, &rel_path) {
-                    Ok((_, target)) if target.is_file() => {
-                        let meta = tokio::fs::metadata(&target).await?;
-                        let file_name = target
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("file.bin")
-                            .to_string();
-                        send_response(
-                            &mut send,
-                            &ShareResponse::FileHeader {
-                                file_name,
-                                size_bytes: meta.len(),
-                            },
-                        )
-                        .await?;
-
-                        let mut file = tokio::fs::File::open(&target).await?;
-                        let mut hasher = blake3::Hasher::new();
-                        let mut buf = vec![0u8; CHUNK_SIZE];
-                        loop {
-                            let n = file.read(&mut buf).await?;
-                            if n == 0 {
-                                break;
-                            }
-                            hasher.update(&buf[..n]);
-                            send.write_all(&buf[..n]).await?;
-                        }
-                        send.write_all(hasher.finalize().as_bytes()).await?;
-                    }
-                    Ok(_) => {
-                        send_response(
-                            &mut send,
-                            &ShareResponse::Error("target is not a file".into()),
-                        )
-                        .await?;
-                    }
+                let root = match self.find_root(&root_id) {
+                    Ok(r) => r,
                     Err(err) => {
                         send_response(&mut send, &ShareResponse::Error(err.to_string())).await?;
+                        let _ = send.finish();
+                        return Ok(());
+                    }
+                };
+
+                if root.path.starts_with("content://") {
+                    let opened_res = match (
+                        Self::normalize_share_rel_path(root.is_dir, &rel_path),
+                        self.get_content_provider(),
+                    ) {
+                        (Ok(clean_rel), Ok(provider)) => {
+                            let uri = root.path.clone();
+                            let is_dir = root.is_dir;
+                            tokio::task::spawn_blocking(move || {
+                                provider.open_file(&uri, is_dir, &clean_rel)
+                            })
+                            .await
+                            .map_err(|e| CoreError::InvalidInput(e.to_string()))?
+                        }
+                        (Err(err), _) | (_, Err(err)) => Err(err),
+                    };
+                    match opened_res {
+                        Ok(opened) => {
+                            send_response(
+                                &mut send,
+                                &ShareResponse::FileHeader {
+                                    file_name: opened.file_name,
+                                    size_bytes: opened.size_bytes,
+                                },
+                            )
+                            .await?;
+
+                            let mut file = tokio::fs::File::from_std(opened.file);
+                            let mut hasher = blake3::Hasher::new();
+                            let mut buf = vec![0u8; CHUNK_SIZE];
+                            let mut remaining = opened.size_bytes;
+                            while remaining > 0 {
+                                let to_read = (remaining as usize).min(buf.len());
+                                let n = file.read(&mut buf[..to_read]).await?;
+                                if n == 0 {
+                                    break;
+                                }
+                                hasher.update(&buf[..n]);
+                                send.write_all(&buf[..n]).await?;
+                                remaining -= n as u64;
+                            }
+                            send.write_all(hasher.finalize().as_bytes()).await?;
+                        }
+                        Err(err) => {
+                            send_response(&mut send, &ShareResponse::Error(err.to_string())).await?;
+                        }
+                    }
+                } else {
+                    match self.resolve_root_target(&root_id, &rel_path) {
+                        Ok((_, target)) if target.is_file() => {
+                            let meta = tokio::fs::metadata(&target).await?;
+                            let file_name = target
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("file.bin")
+                                .to_string();
+                            send_response(
+                                &mut send,
+                                &ShareResponse::FileHeader {
+                                    file_name,
+                                    size_bytes: meta.len(),
+                                },
+                            )
+                            .await?;
+
+                            let mut file = tokio::fs::File::open(&target).await?;
+                            let mut hasher = blake3::Hasher::new();
+                            let mut buf = vec![0u8; CHUNK_SIZE];
+                            loop {
+                                let n = file.read(&mut buf).await?;
+                                if n == 0 {
+                                    break;
+                                }
+                                hasher.update(&buf[..n]);
+                                send.write_all(&buf[..n]).await?;
+                            }
+                            send.write_all(hasher.finalize().as_bytes()).await?;
+                        }
+                        Ok(_) => {
+                            send_response(
+                                &mut send,
+                                &ShareResponse::Error("target is not a file".into()),
+                            )
+                            .await?;
+                        }
+                        Err(err) => {
+                            send_response(&mut send, &ShareResponse::Error(err.to_string())).await?;
+                        }
                     }
                 }
             }
@@ -654,26 +839,50 @@ impl LandaModule for SharesModule {
                 } else {
                     max_size.clamp(64, 320)
                 };
-                match self.resolve_root_target(&root_id, &rel_path) {
-                    Ok((_, target)) if target.is_file() => {
-                        if !is_supported_thumb_image(&target) {
-                            send_response(
-                                &mut send,
-                                &ShareResponse::Error("unsupported thumbnail format".into()),
-                            )
-                            .await?;
-                        } else {
-                            let meta = tokio::fs::metadata(&target).await?;
-                            if meta.len() > MAX_THUMB_SOURCE_BYTES {
+                let root = match self.find_root(&root_id) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        send_response(&mut send, &ShareResponse::Error(err.to_string())).await?;
+                        let _ = send.finish();
+                        return Ok(());
+                    }
+                };
+
+                if root.path.starts_with("content://") {
+                    let opened_res = match (
+                        Self::normalize_share_rel_path(root.is_dir, &rel_path),
+                        self.get_content_provider(),
+                    ) {
+                        (Ok(clean_rel), Ok(provider)) => {
+                            let uri = root.path.clone();
+                            let is_dir = root.is_dir;
+                            tokio::task::spawn_blocking(move || {
+                                provider.open_file(&uri, is_dir, &clean_rel)
+                            })
+                            .await
+                            .map_err(|e| CoreError::InvalidInput(e.to_string()))?
+                        }
+                        (Err(err), _) | (_, Err(err)) => Err(err),
+                    };
+                    match opened_res {
+                        Ok(opened) => {
+                            if !is_supported_thumb_image_name(&opened.file_name) {
+                                send_response(
+                                    &mut send,
+                                    &ShareResponse::Error("unsupported thumbnail format".into()),
+                                )
+                                .await?;
+                            } else if opened.size_bytes > MAX_THUMB_SOURCE_BYTES {
                                 send_response(
                                     &mut send,
                                     &ShareResponse::Error("image too large for thumbnail".into()),
                                 )
                                 .await?;
                             } else {
-                                let mod_ms = modified_ms(&meta);
-                                let cache_key =
-                                    format!("{root_id}:{rel_path}:{mod_ms}:{target_size}");
+                                let cache_key = format!(
+                                    "{root_id}:{rel_path}:{}:{}:{target_size}",
+                                    opened.modified_ms, opened.size_bytes
+                                );
                                 if let Some(cached) = self.local_thumb_cache.get(&cache_key) {
                                     send_response(
                                         &mut send,
@@ -684,9 +893,11 @@ impl LandaModule for SharesModule {
                                     )
                                     .await?;
                                 } else {
-                                    let target_clone = target.clone();
                                     let gen_res = tokio::task::spawn_blocking(move || {
-                                        generate_image_thumbnail(&target_clone, target_size)
+                                        generate_image_thumbnail_from_reader(
+                                            BufReader::new(opened.file),
+                                            target_size,
+                                        )
                                     })
                                     .await
                                     .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
@@ -717,16 +928,85 @@ impl LandaModule for SharesModule {
                                 }
                             }
                         }
+                        Err(err) => {
+                            send_response(&mut send, &ShareResponse::Error(err.to_string())).await?;
+                        }
                     }
-                    Ok(_) => {
-                        send_response(
-                            &mut send,
-                            &ShareResponse::Error("target is not a file".into()),
-                        )
-                        .await?;
-                    }
-                    Err(err) => {
-                        send_response(&mut send, &ShareResponse::Error(err.to_string())).await?;
+                } else {
+                    match self.resolve_root_target(&root_id, &rel_path) {
+                        Ok((_, target)) if target.is_file() => {
+                            if !is_supported_thumb_image(&target) {
+                                send_response(
+                                    &mut send,
+                                    &ShareResponse::Error("unsupported thumbnail format".into()),
+                                )
+                                .await?;
+                            } else {
+                                let meta = tokio::fs::metadata(&target).await?;
+                                if meta.len() > MAX_THUMB_SOURCE_BYTES {
+                                    send_response(
+                                        &mut send,
+                                        &ShareResponse::Error("image too large for thumbnail".into()),
+                                    )
+                                    .await?;
+                                } else {
+                                    let mod_ms = modified_ms(&meta);
+                                    let cache_key =
+                                        format!("{root_id}:{rel_path}:{mod_ms}:{target_size}");
+                                    if let Some(cached) = self.local_thumb_cache.get(&cache_key) {
+                                        send_response(
+                                            &mut send,
+                                            &ShareResponse::Thumbnail {
+                                                mime_type: cached.mime_type,
+                                                bytes: cached.bytes,
+                                            },
+                                        )
+                                        .await?;
+                                    } else {
+                                        let target_clone = target.clone();
+                                        let gen_res = tokio::task::spawn_blocking(move || {
+                                            generate_image_thumbnail(&target_clone, target_size)
+                                        })
+                                        .await
+                                        .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
+
+                                        match gen_res {
+                                            Ok((mime_type, bytes)) => {
+                                                self.local_thumb_cache.insert(
+                                                    cache_key,
+                                                    CachedThumb {
+                                                        mime_type: mime_type.clone(),
+                                                        bytes: bytes.clone(),
+                                                    },
+                                                );
+                                                send_response(
+                                                    &mut send,
+                                                    &ShareResponse::Thumbnail { mime_type, bytes },
+                                                )
+                                                .await?;
+                                            }
+                                            Err(err) => {
+                                                send_response(
+                                                    &mut send,
+                                                    &ShareResponse::Error(err.to_string()),
+                                                )
+                                                .await?;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            send_response(
+                                &mut send,
+                                &ShareResponse::Error("target is not a file".into()),
+                            )
+                            .await?;
+                        }
+                        Err(err) => {
+                            send_response(&mut send, &ShareResponse::Error(err.to_string())).await?;
+                        }
                     }
                 }
             }
@@ -745,6 +1025,15 @@ fn to_share_thumbnail(entry: &CachedThumb) -> ShareThumbnail {
     }
 }
 
+fn is_supported_thumb_image_name(name: &str) -> bool {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif")
+}
+
 fn is_supported_thumb_image(path: &Path) -> bool {
     let ext = path
         .extension()
@@ -755,7 +1044,15 @@ fn is_supported_thumb_image(path: &Path) -> bool {
 }
 
 fn generate_image_thumbnail(path: &Path, max_size: u32) -> Result<(String, Vec<u8>), CoreError> {
-    let reader = image::ImageReader::open(path)?
+    let file = std::fs::File::open(path)?;
+    generate_image_thumbnail_from_reader(BufReader::new(file), max_size)
+}
+
+fn generate_image_thumbnail_from_reader<R: BufRead + Seek>(
+    reader: R,
+    max_size: u32,
+) -> Result<(String, Vec<u8>), CoreError> {
+    let reader = image::ImageReader::new(reader)
         .with_guessed_format()
         .map_err(|e| CoreError::InvalidInput(format!("image format error: {e}")))?;
     let img = reader
