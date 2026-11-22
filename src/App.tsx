@@ -63,9 +63,11 @@ export function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let unlistenIdentity: (() => void) | undefined;
 
     const bootstrap = async () => {
       try {
+        await api.ensureStartupPermissions().catch(() => {});
         const [id, p, reqs, hist, cfg, mods] = await Promise.all([
           api.getLocalIdentity(),
           api.listPeers(),
@@ -80,6 +82,7 @@ export function App() {
         setHistory(hist);
         setSettings(cfg);
         setModules(mods);
+        api.triggerScan().catch(() => {});
 
         const shared = await api.takePendingSharedFiles().catch(() => []);
         if (shared.length > 0) {
@@ -88,6 +91,11 @@ export function App() {
       } catch (e) {
         showToast("error", String(e));
       }
+
+      unlistenIdentity = await api.onIdentityUpdated(() => {
+        api.getLocalIdentity().then(setIdentity).catch(() => {});
+        api.getSettings().then(setSettings).catch(() => {});
+      });
 
       unlisten = await api.onCoreEvent((ev) => {
         switch (ev.type) {
@@ -132,7 +140,10 @@ export function App() {
 
     bootstrap();
 
-    const checkShared = () => {
+    const checkSharedAndScan = () => {
+      if (document.visibilityState === "visible") {
+        api.triggerScan().catch(() => {});
+      }
       api
         .takePendingSharedFiles()
         .then((shared) => {
@@ -142,15 +153,21 @@ export function App() {
         })
         .catch(() => {});
     };
-    window.addEventListener("focus", checkShared);
-    window.addEventListener("landa-share-intent", checkShared);
-    document.addEventListener("visibilitychange", checkShared);
+    const handleNetworkChanged = () => {
+      api.triggerScan().catch(() => {});
+    };
+    window.addEventListener("focus", checkSharedAndScan);
+    window.addEventListener("landa-share-intent", checkSharedAndScan);
+    window.addEventListener("landa-network-changed", handleNetworkChanged);
+    document.addEventListener("visibilitychange", checkSharedAndScan);
 
     return () => {
-      window.removeEventListener("focus", checkShared);
-      window.removeEventListener("landa-share-intent", checkShared);
-      document.removeEventListener("visibilitychange", checkShared);
+      window.removeEventListener("focus", checkSharedAndScan);
+      window.removeEventListener("landa-share-intent", checkSharedAndScan);
+      window.removeEventListener("landa-network-changed", handleNetworkChanged);
+      document.removeEventListener("visibilitychange", checkSharedAndScan);
       if (unlisten) unlisten();
+      if (unlistenIdentity) unlistenIdentity();
     };
   }, []);
 

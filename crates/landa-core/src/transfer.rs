@@ -186,6 +186,7 @@ impl TransferManager {
             eta_secs: None,
             status,
             error: error_message,
+            saved_paths: Vec::new(),
         }));
 
         result.map(|()| record)
@@ -228,6 +229,7 @@ impl TransferManager {
             eta_secs: None,
             status: "waiting_approval".to_string(),
             error: None,
+            saved_paths: Vec::new(),
         }));
 
         let decision: TransferDecision = tokio::select! {
@@ -423,7 +425,7 @@ impl TransferManager {
                     direction: "receive".to_string(),
                     peer_id: peer.peer_id.to_hex(),
                     peer_name: peer.display_name.clone(),
-                    current_file: String::new(),
+                    current_file: saved_paths.first().cloned().unwrap_or_default(),
                     files_done: saved_paths.len(),
                     file_count: offer.files.len(),
                     bytes_transferred: computed_total,
@@ -432,6 +434,7 @@ impl TransferManager {
                     eta_secs: None,
                     status: "completed".to_string(),
                     error: None,
+                    saved_paths: saved_paths.clone(),
                 }));
             }
             Err(err) => {
@@ -475,6 +478,7 @@ impl TransferManager {
                     eta_secs: None,
                     status: status.to_string(),
                     error: Some(err.to_string()),
+                    saved_paths: Vec::new(),
                 }));
             }
         }
@@ -503,6 +507,21 @@ impl TransferManager {
         let mut bytes_received: u64 = 0;
         let mut buf = vec![0u8; CHUNK_SIZE];
         let mut staged_files: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(offer.files.len());
+
+        if let Some(first) = offer.files.first() {
+            emit_progress(
+                &self.events,
+                transfer_id,
+                "receive",
+                peer,
+                &first.relative_path,
+                0,
+                offer.files.len(),
+                0,
+                total_bytes,
+                started,
+            );
+        }
 
         for (idx, (meta, rel_path)) in offer.files.iter().zip(sanitized_paths.iter()).enumerate() {
             let temp_file_path = resolve_within_root(temp_dir, rel_path)?;
@@ -714,5 +733,6 @@ fn emit_progress(
         eta_secs,
         status: "transferring".to_string(),
         error: None,
+        saved_paths: Vec::new(),
     }));
 }

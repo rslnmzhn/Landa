@@ -15,5 +15,8 @@ pub use events::{
     TransferHistoryRecord, TransferProgressInfo,
 };
 pub use module::{LandaModule, ModuleRegistry, ModuleStatus, PeerContext};
+pub use network::{
+    set_lan_interface_hook, set_socket_bind_hook, LanInterface, LanInterfaceHook, SocketBindHook,
+};
 pub use storage::{AppSettings, Storage};
 pub use transfer::ReceivePublishHook;

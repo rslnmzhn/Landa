@@ -425,3 +425,16 @@ pub fn request_all_files_access(app: tauri::AppHandle) -> Result<(), String> {
     let _ = app;
     Ok(())
 }
+
+#[tauri::command]
+pub async fn ensure_startup_permissions(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
+            return bridge.ensure_startup_permissions_async().await;
+        }
+    }
+    let _ = app;
+    Ok(())
+}

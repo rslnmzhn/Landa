@@ -58,6 +58,8 @@ pub struct TransferProgressInfo {
     pub eta_secs: Option<u64>,
     pub status: String,
     pub error: Option<String>,
+    #[serde(default)]
+    pub saved_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

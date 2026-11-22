@@ -90,9 +90,12 @@ export const api = {
   takePendingSharedFiles: () => invoke<string[]>("take_pending_shared_files"),
   hasAllFilesAccess: () => invoke<boolean>("has_all_files_access"),
   requestAllFilesAccess: () => invoke<void>("request_all_files_access"),
+  ensureStartupPermissions: () => invoke<void>("ensure_startup_permissions"),
 
   onCoreEvent: (handler: (event: CoreEvent) => void): Promise<UnlistenFn> =>
     listen<CoreEvent>("landa://event", (ev) => handler(ev.payload)),
+  onIdentityUpdated: (handler: () => void): Promise<UnlistenFn> =>
+    listen<void>("landa://identity-updated", () => handler()),
 };
 
 export function formatBytes(bytes: number): string {

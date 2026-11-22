@@ -79,27 +79,71 @@ pub fn run() {
                 m
             };
 
-            // Start background discovery & QUIC accept loops inside Tauri's async runtime
-            let engine_for_loops = Arc::clone(&engine);
-            tauri::async_runtime::spawn(async move {
-                engine_for_loops.start_loops();
-            });
-
-            // Forward CoreEvents to the WebView
-            let mut rx = engine.subscribe_events();
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                while let Ok(event) = rx.recv().await {
-                    let _ = handle.emit("landa://event", &event);
-                }
-            });
-
             #[cfg(target_os = "android")]
             {
+                landa_core::set_lan_interface_hook(android_bridge::make_lan_interface_hook(
+                    app.handle().clone(),
+                ));
+                landa_core::set_socket_bind_hook(android_bridge::make_socket_bind_hook(
+                    app.handle().clone(),
+                ));
                 engine.set_receive_publish_hook(android_bridge::make_publish_hook(
                     app.handle().clone(),
                 ));
             }
+
+            // Start background discovery & QUIC accept loops inside Tauri's async runtime
+            let engine_for_loops = Arc::clone(&engine);
+            tauri::async_runtime::spawn(async move {
+                engine_for_loops.start_loops();
+                engine_for_loops.trigger_scan();
+            });
+
+            #[cfg(target_os = "android")]
+            {
+                let handle_for_name = app.handle().clone();
+                let engine_for_name = Arc::clone(&engine);
+                tauri::async_runtime::spawn(async move {
+                    if let Some(bridge) =
+                        handle_for_name.try_state::<android_bridge::AndroidBridge<tauri::Wry>>()
+                    {
+                        if let Some(real_name) = bridge.get_system_device_name_async().await {
+                            engine_for_name.apply_system_device_name_if_placeholder(&real_name);
+                            let _ = handle_for_name.emit("landa://identity-updated", ());
+                        }
+                    }
+                });
+            }
+
+            // Forward CoreEvents to the WebView (and Android notifications)
+            let mut rx = engine.subscribe_events();
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while let Ok(event) = rx.recv().await {
+                    #[cfg(target_os = "android")]
+                    if let landa_core::CoreEvent::TransferProgress(ref info) = event {
+                        if info.direction == "receive" {
+                            if let Some(bridge) =
+                                handle.try_state::<android_bridge::AndroidBridge<tauri::Wry>>()
+                            {
+                                match info.status.as_str() {
+                                    "transferring" => {
+                                        bridge.show_transfer_progress_async(info).await;
+                                    }
+                                    "completed" => {
+                                        bridge.show_transfer_completed_async(info).await;
+                                    }
+                                    "failed" | "cancelled" => {
+                                        bridge.show_transfer_failed_async(info).await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    let _ = handle.emit("landa://event", &event);
+                }
+            });
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             {
@@ -151,6 +195,7 @@ pub fn run() {
             commands::take_pending_shared_files,
             commands::has_all_files_access,
             commands::request_all_files_access,
+            commands::ensure_startup_permissions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Landa");

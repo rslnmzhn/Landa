@@ -184,7 +184,20 @@ impl LandaEngine {
     }
 
     pub fn trigger_scan(&self) {
+        self.transport.rebind_network();
         self.discovery.trigger_scan();
+    }
+
+    pub fn apply_system_device_name_if_placeholder(&self, real_name: &str) {
+        let trimmed = real_name.trim();
+        if trimmed.is_empty() || trimmed == "Android Device" || trimmed == "Landa Device" {
+            return;
+        }
+        let mut next = self.get_settings();
+        if next.device_name.trim().is_empty() || next.device_name == "Android Device" {
+            next.device_name = trimmed.to_string();
+            let _ = self.update_settings(next);
+        }
     }
 
     pub fn rename_peer(&self, peer_id_hex: &str, alias: Option<&str>) -> Result<(), CoreError> {
@@ -412,15 +425,31 @@ impl LandaEngine {
 
         let (ip_str, port) = match live {
             Some(l) => (l.ip.to_string(), l.quic_port),
-            None => (
-                stored
+            None => {
+                let last_ip = stored
                     .last_ip
                     .clone()
-                    .ok_or_else(|| CoreError::NotFound("peer IP unknown".into()))?,
-                stored
+                    .ok_or_else(|| CoreError::NotFound("peer IP unknown".into()))?;
+                let last_port = stored
                     .last_port
-                    .ok_or_else(|| CoreError::NotFound("peer port unknown".into()))?,
-            ),
+                    .ok_or_else(|| CoreError::NotFound("peer port unknown".into()))?;
+                let is_loopback = last_ip
+                    .parse::<IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false);
+                let is_manual = self
+                    .storage
+                    .list_manual_targets()
+                    .map(|targets| targets.iter().any(|t| t.ip == last_ip))
+                    .unwrap_or(false);
+                if !is_manual && !is_loopback {
+                    self.trigger_scan();
+                    return Err(CoreError::NotFound(
+                        "device is offline or unreachable on LAN".into(),
+                    ));
+                }
+                (last_ip, last_port)
+            }
         };
 
         let ip: IpAddr = ip_str
