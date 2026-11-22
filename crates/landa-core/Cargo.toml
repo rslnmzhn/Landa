@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64 = "0.22"
 blake3.workspace = true
 chrono.workspace = true
 if-addrs.workspace = true

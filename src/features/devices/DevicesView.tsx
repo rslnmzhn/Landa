@@ -4,11 +4,14 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownToLine,
   Check,
+  Copy,
   Edit3,
   FileUp,
   FolderUp,
   Laptop,
+  QrCode,
   RefreshCw,
+  ScanLine,
   ShieldCheck,
   Smartphone,
   Upload,
@@ -22,6 +25,7 @@ import type {
   FriendRequestInfo,
   LocalIdentityInfo,
   PeerInfo,
+  QrConnectInfo,
   UpdateCheckResult,
   UpdateProgressEvent,
 } from "../../core/types";
@@ -75,6 +79,12 @@ export function DevicesView({
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [hoveredPeerId, setHoveredPeerId] = useState<string | null>(null);
   const [droppedPaths, setDroppedPaths] = useState<string[]>([]);
+  const [qrModalOpen, setQrModalOpen] = useState(false);
+  const [qrInfo, setQrInfo] = useState<QrConnectInfo | null>(null);
+  const [qrLoading, setQrLoading] = useState(false);
+  const [qrUriDraft, setQrUriDraft] = useState("");
+  const [qrConnecting, setQrConnecting] = useState(false);
+  const [qrConnectedPeer, setQrConnectedPeer] = useState<PeerInfo | null>(null);
 
   const peersRef = useRef(peers);
   peersRef.current = peers;
@@ -247,6 +257,45 @@ export function DevicesView({
     }
   };
 
+  const handleOpenQrModal = async () => {
+    setQrModalOpen(true);
+    setQrLoading(true);
+    try {
+      const info = await api.getQrConnectInfo();
+      setQrInfo(info);
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setQrLoading(false);
+    }
+  };
+
+  const handleScanQrAndroid = async () => {
+    try {
+      const peer = await api.scanQrAndConnectAndroid();
+      if (!peer) return;
+      setQrConnectedPeer(peer);
+    } catch (e) {
+      onError(String(e));
+    }
+  };
+
+  const handleConnectQrUri = async () => {
+    const trimmed = qrUriDraft.trim();
+    if (!trimmed) return;
+    setQrConnecting(true);
+    try {
+      const peer = await api.connectViaQrUri(trimmed);
+      setQrUriDraft("");
+      setQrModalOpen(false);
+      setQrConnectedPeer(peer);
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setQrConnecting(false);
+    }
+  };
+
   const isDownloading =
     installingUpdate &&
     (updateProgress?.stage === "downloading" ||
@@ -284,6 +333,28 @@ export function DevicesView({
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
+          {isAndroid && (
+            <GlassButton
+              onClick={handleScanQrAndroid}
+              size="sm"
+              title={t.devices.scanQr}
+              aria-label={t.devices.scanQr}
+              className="px-3"
+            >
+              <ScanLine className="h-4 w-4" />
+            </GlassButton>
+          )}
+
+          <GlassButton
+            onClick={handleOpenQrModal}
+            size="sm"
+            title={t.devices.showQr}
+            aria-label={t.devices.showQr}
+            className="px-3"
+          >
+            <QrCode className="h-4 w-4" />
+          </GlassButton>
+
           <GlassButton
             onClick={handleOpenUpdateModal}
             size="sm"
@@ -778,6 +849,137 @@ export function DevicesView({
             </div>
           );
         })()}
+      </GlassModal>
+
+      {/* QR Quick Connect Modal */}
+      <GlassModal
+        open={qrModalOpen}
+        onClose={() => setQrModalOpen(false)}
+        title={t.devices.qrTitle}
+      >
+        <div className="space-y-4">
+          {qrLoading ? (
+            <div className="flex items-center justify-center py-10">
+              <RefreshCw className="h-6 w-6 animate-spin text-indigo-500 dark:text-indigo-300" />
+            </div>
+          ) : qrInfo ? (
+            <>
+              <p className="text-xs text-slate-700/75 dark:text-white/60">
+                {t.devices.qrHint}
+              </p>
+              <div className="flex justify-center">
+                <div className="rounded-3xl bg-white p-4 shadow-lg">
+                  <img
+                    src={`data:image/svg+xml;utf8,${encodeURIComponent(qrInfo.svg)}`}
+                    alt="Landa QR"
+                    className="h-52 w-52"
+                  />
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-2 rounded-2xl bg-white/20 dark:bg-white/5 px-3.5 py-2.5">
+                <span className="font-mono text-xs text-slate-800/85 dark:text-white/80">
+                  {qrInfo.ip}:{qrInfo.port}
+                </span>
+                <GlassButton
+                  size="sm"
+                  variant="ghost"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(qrInfo.uri);
+                      onNotice?.(t.devices.qrCopied);
+                    } catch (e) {
+                      onError(String(e));
+                    }
+                  }}
+                >
+                  <Copy className="h-3.5 w-3.5" />
+                  <span>{t.devices.qrCopyLink}</span>
+                </GlassButton>
+              </div>
+            </>
+          ) : null}
+
+          <div className="flex gap-2 pt-1">
+            <GlassInput
+              value={qrUriDraft}
+              onChange={(e) => setQrUriDraft(e.target.value)}
+              placeholder={t.devices.qrPastePlaceholder}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void handleConnectQrUri();
+              }}
+            />
+            <GlassButton
+              variant="primary"
+              disabled={!qrUriDraft.trim() || qrConnecting}
+              onClick={handleConnectQrUri}
+              className="shrink-0"
+            >
+              {t.devices.qrConnectBtn}
+            </GlassButton>
+          </div>
+
+          <div className="flex justify-end">
+            <GlassButton variant="ghost" onClick={() => setQrModalOpen(false)}>
+              {t.update.close}
+            </GlassButton>
+          </div>
+        </div>
+      </GlassModal>
+
+      {/* QR Connected Confirmation Modal */}
+      <GlassModal
+        open={qrConnectedPeer !== null}
+        onClose={() => setQrConnectedPeer(null)}
+        title={t.devices.qrConnectedTitle}
+      >
+        {qrConnectedPeer && (
+          <div className="space-y-4">
+            <div className="rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-3 space-y-1">
+              <div className="font-semibold text-slate-900/95 dark:text-white/95">
+                {qrConnectedPeer.displayName}
+              </div>
+              <div className="flex items-center gap-2 font-mono text-xs text-slate-700/70 dark:text-white/55">
+                <span>{qrConnectedPeer.ip ?? "—"}</span>
+                <span>·</span>
+                <span>
+                  {t.devices.sasLabel}: {qrConnectedPeer.sasCode}
+                </span>
+              </div>
+            </div>
+
+            {!qrConnectedPeer.isTrusted && (
+              <p className="text-sm text-slate-800/85 dark:text-white/80">
+                {t.devices.qrConnectedDesc}
+              </p>
+            )}
+
+            <div className="flex justify-end gap-2">
+              <GlassButton
+                variant="ghost"
+                onClick={() => setQrConnectedPeer(null)}
+              >
+                {t.devices.qrDone}
+              </GlassButton>
+              {!qrConnectedPeer.isTrusted && (
+                <GlassButton
+                  variant="primary"
+                  onClick={async () => {
+                    const peerId = qrConnectedPeer.peerId;
+                    setQrConnectedPeer(null);
+                    try {
+                      await api.sendFriendRequest(peerId);
+                    } catch (e) {
+                      onError(String(e));
+                    }
+                  }}
+                >
+                  <UserPlus className="h-4 w-4" />
+                  <span>{t.devices.addFriend}</span>
+                </GlassButton>
+              )}
+            </div>
+          </div>
+        )}
       </GlassModal>
     </div>
   );

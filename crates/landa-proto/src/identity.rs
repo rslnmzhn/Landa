@@ -137,6 +137,12 @@ impl DeviceIdentity {
             .map_err(|_| ProtoError::InvalidCrypto)
     }
 
+    pub fn validate_public_key(public_key: &[u8; 32]) -> Result<(), ProtoError> {
+        VerifyingKey::from_bytes(public_key)
+            .map(|_| ())
+            .map_err(|_| ProtoError::InvalidCrypto)
+    }
+
     /// Deterministic 6-digit Short Authentication String (SAS) shared by both peers.
     pub fn sas_code(pk_a: &[u8; 32], pk_b: &[u8; 32]) -> String {
         let mut hasher = blake3::Hasher::new();

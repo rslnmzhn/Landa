@@ -660,6 +660,7 @@ name = "landa-core"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "base64",
  "blake3",
  "chrono",
  "if-addrs",

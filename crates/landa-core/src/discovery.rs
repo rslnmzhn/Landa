@@ -82,6 +82,47 @@ impl DiscoveryService {
         guard.get(peer_id).cloned()
     }
 
+    pub fn register_direct_peer(
+        &self,
+        peer_id: PeerId,
+        public_key: [u8; 32],
+        device_name: &str,
+        ip: Ipv4Addr,
+        quic_port: u16,
+    ) -> Result<(), CoreError> {
+        self.storage.upsert_peer(
+            &peer_id,
+            &public_key,
+            device_name,
+            DeviceOs::Unknown,
+            DeviceCategory::Unknown,
+            Some(&ip.to_string()),
+            Some(quic_port),
+        )?;
+        {
+            let mut guard = self.live_peers.write().expect("live_peers lock poisoned");
+            let existing = guard.get(&peer_id).cloned();
+            guard.insert(
+                peer_id,
+                LivePeer {
+                    peer_id,
+                    public_key,
+                    device_name: device_name.to_string(),
+                    os: existing.as_ref().map(|e| e.os).unwrap_or(DeviceOs::Unknown),
+                    category: existing
+                        .as_ref()
+                        .map(|e| e.category)
+                        .unwrap_or(DeviceCategory::Unknown),
+                    ip,
+                    quic_port,
+                    last_seen: Instant::now(),
+                },
+            );
+        }
+        let _ = self.events.send(CoreEvent::PeersChanged);
+        Ok(())
+    }
+
     pub fn list_peers(&self) -> Result<Vec<PeerInfo>, CoreError> {
         let stored = self.storage.list_peers()?;
         let live = self.live_peers.read().expect("live_peers lock poisoned");

@@ -13,6 +13,7 @@ import type {
   PeerInfo,
   PendingFocusTarget,
   PreviewDescriptor,
+  QrConnectInfo,
   ShareEntry,
   ShareRootInfo,
   ShareThumbnail,
@@ -149,6 +150,13 @@ export const api = {
     invoke<PreviewDescriptor>("prepare_file_preview", { pathOrUri }),
   openFileExternal: (pathOrUri: string) =>
     invoke<void>("open_file_external", { pathOrUri }),
+
+  // QR Quick Connect
+  getQrConnectInfo: () => invoke<QrConnectInfo>("get_qr_connect_info"),
+  connectViaQrUri: (uri: string) =>
+    invoke<PeerInfo>("connect_via_qr_uri", { uri }),
+  scanQrAndConnectAndroid: () =>
+    invoke<PeerInfo | null>("scan_qr_and_connect_android"),
 
   onCoreEvent: (handler: (event: CoreEvent) => void): Promise<UnlistenFn> =>
     listen<CoreEvent>("landa://event", (ev) => handler(ev.payload)),

@@ -197,6 +197,13 @@ export interface PendingFocusTarget {
   peerId?: string | null;
 }
 
+export interface QrConnectInfo {
+  uri: string;
+  svg: string;
+  ip: string;
+  port: number;
+}
+
 export type CoreEvent =
   | { type: "peersChanged" }
   | { type: "friendRequestsChanged" }

@@ -422,6 +422,57 @@ impl LandaEngine {
         Ok(())
     }
 
+    pub fn local_qr_connect_uri(&self) -> Result<(String, String, u16), CoreError> {
+        let ip = crate::qr::pick_primary_lan_ip().ok_or_else(|| {
+            CoreError::NotFound("no active LAN IPv4 interface found".into())
+        })?;
+        let port = self.transport.local_port();
+        let device_name = self
+            .settings
+            .read()
+            .expect("settings lock poisoned")
+            .device_name
+            .clone();
+        let uri = crate::qr::build_qr_connect_uri(
+            ip,
+            port,
+            self.identity.peer_id(),
+            &self.identity.public_key_bytes(),
+            &device_name,
+        );
+        Ok((uri, ip.to_string(), port))
+    }
+
+    pub async fn connect_via_qr_uri(&self, uri: &str) -> Result<PeerInfo, CoreError> {
+        let payload = crate::qr::parse_qr_connect_uri(uri)?;
+        if payload.peer_id == self.identity.peer_id() {
+            return Err(CoreError::InvalidInput(
+                "cannot connect to your own device".into(),
+            ));
+        }
+
+        self.discovery.register_direct_peer(
+            payload.peer_id,
+            payload.public_key,
+            &payload.device_name,
+            payload.ip,
+            payload.port,
+        )?;
+        let _ = self
+            .storage
+            .add_manual_target(&payload.ip.to_string(), Some(&payload.device_name));
+
+        let addr = SocketAddr::new(IpAddr::V4(payload.ip), payload.port);
+        self.transport.connect_peer(addr, payload.peer_id).await?;
+        self.discovery.trigger_scan();
+
+        let target_hex = payload.peer_id.to_hex();
+        self.list_peers()?
+            .into_iter()
+            .find(|p| p.peer_id == target_hex)
+            .ok_or_else(|| CoreError::NotFound("connected peer missing from storage".into()))
+    }
+
     pub async fn open_trusted_module_stream(
         &self,
         peer_id_hex: &str,

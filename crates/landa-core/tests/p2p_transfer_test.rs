@@ -241,3 +241,59 @@ async fn quic_send_items_via_open_source_hook_preserves_folder_tree() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+#[tokio::test]
+async fn qr_connect_establishes_verified_quic_without_auto_trust() {
+    let dir_a = temp_dir("qr-a");
+    let dir_b = temp_dir("qr-b");
+
+    let engine_a = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_a.clone(),
+        default_download_dir: dir_a.join("downloads"),
+        default_device_name: "QR Scanner".into(),
+    })
+    .unwrap();
+    let engine_b = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_b.clone(),
+        default_download_dir: dir_b.join("downloads"),
+        default_device_name: "QR Host".into(),
+    })
+    .unwrap();
+
+    engine_a.start_transport_loop();
+    engine_b.start_transport_loop();
+
+    let info_b = engine_b.local_identity_info();
+    let peer_id_b = PeerId::from_hex(&info_b.peer_id).unwrap();
+    let pk_b = hex_decode_32(&info_b.public_key_hex);
+
+    let qr_uri = landa_core::build_qr_connect_uri(
+        std::net::Ipv4Addr::LOCALHOST,
+        info_b.quic_port,
+        peer_id_b,
+        &pk_b,
+        &info_b.device_name,
+    );
+
+    let connected = engine_a.connect_via_qr_uri(&qr_uri).await.unwrap();
+    assert_eq!(connected.peer_id, info_b.peer_id);
+    assert_eq!(connected.display_name, "QR Host");
+    assert!(connected.is_online);
+    assert!(!connected.is_trusted);
+
+    // Self-connect via QR must be rejected
+    let info_a = engine_a.local_identity_info();
+    let self_uri = landa_core::build_qr_connect_uri(
+        std::net::Ipv4Addr::LOCALHOST,
+        info_a.quic_port,
+        PeerId::from_hex(&info_a.peer_id).unwrap(),
+        &hex_decode_32(&info_a.public_key_hex),
+        &info_a.device_name,
+    );
+    assert!(engine_a.connect_via_qr_uri(&self_uri).await.is_err());
+
+    engine_a.shutdown();
+    engine_b.shutdown();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}

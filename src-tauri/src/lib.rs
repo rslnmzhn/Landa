@@ -385,6 +385,9 @@ pub fn run() {
             commands::install_update,
             commands::prepare_file_preview,
             commands::open_file_external,
+            commands::get_qr_connect_info,
+            commands::connect_via_qr_uri,
+            commands::scan_qr_and_connect_android,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Landa");

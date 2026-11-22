@@ -938,6 +938,74 @@ pub async fn prepare_file_preview(
     crate::preview::prepare_file_preview(&app, &state, &server, &path_or_uri).await
 }
 
+// --- QR Quick Connect ---
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QrConnectInfo {
+    pub uri: String,
+    pub svg: String,
+    pub ip: String,
+    pub port: u16,
+}
+
+#[tauri::command]
+pub fn get_qr_connect_info(state: State<'_, AppState>) -> Result<QrConnectInfo, String> {
+    let (uri, ip, port) = state
+        .engine
+        .local_qr_connect_uri()
+        .map_err(|e| e.to_string())?;
+    let code = qrcode::QrCode::new(uri.as_bytes())
+        .map_err(|e| format!("Failed to generate QR code: {e}"))?;
+    let svg = code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(220, 220)
+        .dark_color(qrcode::render::svg::Color("#0f172a"))
+        .light_color(qrcode::render::svg::Color("#ffffff"))
+        .build();
+    Ok(QrConnectInfo { uri, svg, ip, port })
+}
+
+#[tauri::command]
+pub async fn connect_via_qr_uri(
+    state: State<'_, AppState>,
+    uri: String,
+) -> Result<PeerInfo, String> {
+    state
+        .engine
+        .connect_via_qr_uri(&uri)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn scan_qr_and_connect_android(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<PeerInfo>, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        let bridge = app
+            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+            .ok_or_else(|| "Android bridge unavailable".to_string())?;
+        let Some(uri) = bridge.scan_qr_code_async().await? else {
+            return Ok(None);
+        };
+        let peer = state
+            .engine
+            .connect_via_qr_uri(&uri)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Some(peer))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, state);
+        Err("QR camera scanner is only supported on Android".into())
+    }
+}
+
 #[tauri::command]
 pub async fn open_file_external(
     app: tauri::AppHandle,

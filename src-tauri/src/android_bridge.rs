@@ -203,6 +203,13 @@ struct WriteClipboardImageArgs {
     image_path: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanQrResponse {
+    cancelled: bool,
+    uri: Option<String>,
+}
+
 pub struct AndroidBridge<R: Runtime> {
     handle: PluginHandle<R>,
 }
@@ -395,6 +402,19 @@ impl<R: Runtime> AndroidBridge<R> {
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    pub async fn scan_qr_code_async(&self) -> Result<Option<String>, String> {
+        let res = self
+            .handle
+            .run_mobile_plugin_async::<ScanQrResponse>("scanQrCode", ())
+            .await
+            .map_err(|e| e.to_string())?;
+        if res.cancelled {
+            Ok(None)
+        } else {
+            Ok(res.uri.filter(|u| !u.trim().is_empty()))
+        }
     }
 
     pub async fn show_transfer_failed_async(&self, info: &TransferProgressInfo) {

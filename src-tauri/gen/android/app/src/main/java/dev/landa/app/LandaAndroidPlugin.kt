@@ -698,6 +698,48 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun scanQrCode(invoke: Invoke) {
+        try {
+            val intent = Intent(activity, QrScannerActivity::class.java)
+            startActivityForResult(invoke, intent, "scanQrCodeResult")
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to launch QR scanner")
+        }
+    }
+
+    @ActivityCallback
+    fun scanQrCodeResult(invoke: Invoke, result: ActivityResult) {
+        if (result.resultCode == Activity.RESULT_CANCELED) {
+            val err = result.data?.getStringExtra(QrScannerActivity.EXTRA_ERROR)
+            if (!err.isNullOrBlank()) {
+                invoke.reject(err)
+                return
+            }
+            val res = JSObject()
+            res.put("cancelled", true)
+            res.put("uri", null)
+            invoke.resolve(res)
+            return
+        }
+        if (result.resultCode != Activity.RESULT_OK) {
+            invoke.reject("QR scan failed")
+            return
+        }
+        val uri = result.data?.getStringExtra(QrScannerActivity.EXTRA_QR_URI)
+        if (uri.isNullOrBlank()) {
+            val res = JSObject()
+            res.put("cancelled", true)
+            res.put("uri", null)
+            invoke.resolve(res)
+            return
+        }
+        val res = JSObject()
+        res.put("cancelled", false)
+        res.put("uri", uri)
+        invoke.resolve(res)
+    }
+
+    @Command
     fun readSystemClipboard(invoke: Invoke) {
         activity.runOnUiThread {
             try {
