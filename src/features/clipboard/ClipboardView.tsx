@@ -9,6 +9,7 @@ import {
   X,
 } from "lucide-react";
 import { api, formatBytes } from "../../core/api";
+import { processClipboardImagePaste } from "./clipboardPaste.ts";
 import type {
   ClipboardItem,
   PeerInfo,
@@ -227,30 +228,22 @@ export function ClipboardView({
   const handleInputPaste = async (
     e: React.ClipboardEvent<HTMLInputElement>
   ) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    for (let i = 0; i < items.length; i++) {
-      const clipItem = items[i];
-      if (clipItem.type.startsWith("image/")) {
-        const file = clipItem.getAsFile();
-        if (!file) continue;
-        e.preventDefault();
-        try {
-          const buf = await file.arrayBuffer();
-          const saved = await api.clipboardPushLocalImageBytes(
-            Array.from(new Uint8Array(buf))
-          );
+    await processClipboardImagePaste(
+      e.clipboardData?.items,
+      () => e.preventDefault(),
+      {
+        pushLocalImageBytes: api.clipboardPushLocalImageBytes,
+        onImageSaved: async (saved) => {
           if (targetId === "local") {
             await loadLocal();
           } else {
             setPendingImage(saved);
           }
-        } catch (err) {
-          onError(String(err));
-        }
-        return;
+        },
+        onError,
+        tooLargeMessage: t.clipboard.imageTooLarge,
       }
-    }
+    );
   };
 
   const copyItemToSystem = async (item: ClipboardItem) => {
