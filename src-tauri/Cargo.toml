@@ -12,9 +12,10 @@ name = "landa_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-default = ["mod-shares", "mod-clipboard"]
+default = ["mod-shares", "mod-clipboard", "mod-videolink"]
 mod-shares = ["dep:landa-mod-shares"]
 mod-clipboard = ["dep:landa-mod-clipboard"]
+mod-videolink = ["dep:landa-mod-videolink"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -25,6 +26,7 @@ landa-core = { path = "../crates/landa-core" }
 landa-proto = { path = "../crates/landa-proto" }
 landa-mod-shares = { path = "../crates/landa-mod-shares", optional = true }
 landa-mod-clipboard = { path = "../crates/landa-mod-clipboard", optional = true }
+landa-mod-videolink = { path = "../crates/landa-mod-videolink", optional = true }
 qrcode = { version = "0.15", default-features = false, features = ["svg"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "http2", "charset"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

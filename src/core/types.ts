@@ -129,6 +129,14 @@ export interface ShareThumbnail {
   dataUrl: string;
 }
 
+export interface VideoLinkStatus {
+  running: boolean;
+  url: string | null;
+  port: number | null;
+  fileName: string | null;
+  sizeBytes: number | null;
+}
+
 export type ClipboardContentKind = "text" | "image";
 
 export interface ClipboardItem {

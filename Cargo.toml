@@ -5,6 +5,7 @@ members = [
     "crates/landa-core",
     "crates/landa-mod-shares",
     "crates/landa-mod-clipboard",
+    "crates/landa-mod-videolink",
 ]
 
 [workspace.package]

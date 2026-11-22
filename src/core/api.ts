@@ -21,6 +21,7 @@ import type {
   UpdateAssetInfo,
   UpdateCheckResult,
   UpdateProgressEvent,
+  VideoLinkStatus,
 } from "./types";
 
 export const api = {
@@ -157,6 +158,12 @@ export const api = {
     invoke<PeerInfo>("connect_via_qr_uri", { uri }),
   scanQrAndConnectAndroid: () =>
     invoke<PeerInfo | null>("scan_qr_and_connect_android"),
+
+  // Video Link module
+  videolinkStatus: () => invoke<VideoLinkStatus>("videolink_status"),
+  videolinkStart: (pathOrUri: string, password: string) =>
+    invoke<VideoLinkStatus>("videolink_start", { pathOrUri, password }),
+  videolinkStop: () => invoke<VideoLinkStatus>("videolink_stop"),
 
   onCoreEvent: (handler: (event: CoreEvent) => void): Promise<UnlistenFn> =>
     listen<CoreEvent>("landa://event", (ev) => handler(ev.payload)),

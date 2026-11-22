@@ -2547,6 +2547,7 @@ dependencies = [
  "landa-core",
  "landa-mod-clipboard",
  "landa-mod-shares",
+ "landa-mod-videolink",
  "landa-proto",
  "qrcode",
  "reqwest",
@@ -2626,6 +2627,22 @@ dependencies = [
  "serde",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "landa-mod-videolink"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "landa-core",
+ "landa-proto",
+ "quinn",
+ "rand 0.8.8",
+ "serde",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

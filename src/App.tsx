@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
   Clipboard,
+  Film,
   FolderHeart,
   Laptop,
   Settings,
@@ -35,8 +36,15 @@ import { ClipboardView } from "./features/clipboard/ClipboardView";
 import { ActivityView } from "./features/activity/ActivityView";
 import { SettingsView } from "./features/settings/SettingsView";
 import { FilePreviewModal } from "./features/preview/FilePreviewModal";
+import { VideoLinkView } from "./features/videolink/VideoLinkView";
 
-type TabId = "devices" | "shares" | "clipboard" | "activity" | "settings";
+type TabId =
+  | "devices"
+  | "shares"
+  | "clipboard"
+  | "videolink"
+  | "activity"
+  | "settings";
 
 export function App() {
   const [activeTab, setActiveTab] = useState<TabId>("devices");
@@ -256,11 +264,13 @@ export function App() {
 
   const sharesEnabled = isModuleEnabled("shares");
   const clipboardEnabled = isModuleEnabled("clipboard");
+  const videolinkEnabled = isModuleEnabled("videolink");
 
   useEffect(() => {
     if (activeTab === "shares" && !sharesEnabled) setActiveTab("devices");
     if (activeTab === "clipboard" && !clipboardEnabled) setActiveTab("devices");
-  }, [activeTab, sharesEnabled, clipboardEnabled]);
+    if (activeTab === "videolink" && !videolinkEnabled) setActiveTab("devices");
+  }, [activeTab, sharesEnabled, clipboardEnabled, videolinkEnabled]);
 
   const activeTransferList = useMemo(
     () => Object.values(activeTransfers),
@@ -290,6 +300,13 @@ export function App() {
         icon: <Clipboard className="h-4 w-4" />,
       });
     }
+    if (videolinkEnabled) {
+      items.push({
+        id: "videolink",
+        label: t.nav.videolink,
+        icon: <Film className="h-4 w-4" />,
+      });
+    }
     items.push({
       id: "activity",
       label: t.nav.activity,
@@ -306,6 +323,7 @@ export function App() {
     t,
     sharesEnabled,
     clipboardEnabled,
+    videolinkEnabled,
     friendRequests,
     activeTransferList.length,
   ]);
@@ -412,6 +430,14 @@ export function App() {
               enabled={clipboardEnabled}
               refreshTick={clipboardTick}
               onPreviewDescriptor={(desc) => setPreviewData(desc)}
+              onError={(m) => showToast("error", m)}
+              onNotice={(m) => showToast("notice", m)}
+            />
+          )}
+          {activeTab === "videolink" && (
+            <VideoLinkView
+              t={t}
+              enabled={videolinkEnabled}
               onError={(m) => showToast("error", m)}
               onNotice={(m) => showToast("notice", m)}
             />

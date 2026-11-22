@@ -8,7 +8,6 @@
 |---|---|---|---|
 | 11 | [11-android-play-protect-fix.md](./11-android-play-protect-fix.md) | Устранение предупреждения Google Play Protect на Android APK | Высокий |
 | 10 | [10-diagnostics-and-release-signing.md](./10-diagnostics-and-release-signing.md) | Просмотр логов, выбор сетевых интерфейсов и релизная подпись Android/CI | Средний |
-| 09 | [09-video-link-module.md](./09-video-link-module.md) | Опциональный модуль веб-ссылки на видео (`landa-mod-videolink`) | Низкий |
 
 ## Done
 
@@ -22,3 +21,4 @@
 | 06 | [06-android-background-and-alerts.md](./06-android-background-and-alerts.md) | Foreground Service на Android и уведомления о входящих запросах в фоне | Done |
 | 07 | [07-clipboard-images.md](./07-clipboard-images.md) | Поддержка изображений (PNG) в модуле `Clipboard` | Done |
 | 08 | [08-qr-quick-connect.md](./08-qr-quick-connect.md) | Быстрое подключение и спаривание по QR-коду поверх QUIC | Done |
+| 09 | [09-video-link-module.md](./09-video-link-module.md) | Опциональный модуль веб-ссылки на видео (`landa-mod-videolink`) | Done |

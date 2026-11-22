@@ -11,6 +11,8 @@ use landa_core::{
 use landa_mod_clipboard::{ClipboardContentKind, ClipboardItem, ClipboardModule};
 #[cfg(feature = "mod-shares")]
 use landa_mod_shares::{LocalShareRoot, ShareEntry, ShareRootInfo, ShareThumbnail, SharesModule};
+#[cfg(feature = "mod-videolink")]
+use landa_mod_videolink::{VideoLinkModule, VideoLinkStatus, VideoSource};
 use tauri::State;
 
 pub struct AppState {
@@ -19,6 +21,8 @@ pub struct AppState {
     pub shares: Arc<SharesModule>,
     #[cfg(feature = "mod-clipboard")]
     pub clipboard: Arc<ClipboardModule>,
+    #[cfg(feature = "mod-videolink")]
+    pub videolink: Arc<VideoLinkModule>,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub desktop_clipboard: Mutex<Option<arboard::Clipboard>>,
 }
@@ -210,15 +214,20 @@ pub fn list_modules(state: State<'_, AppState>) -> Vec<ModuleStatus> {
 }
 
 #[tauri::command]
-pub fn set_module_enabled(
+pub async fn set_module_enabled(
     state: State<'_, AppState>,
     id: String,
     enabled: bool,
 ) -> Result<Vec<ModuleStatus>, String> {
-    state
+    let statuses = state
         .engine
         .set_module_enabled(&id, enabled)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    #[cfg(feature = "mod-videolink")]
+    if id == "videolink" && !enabled {
+        state.videolink.stop().await;
+    }
+    Ok(statuses)
 }
 
 #[tauri::command]
@@ -1012,4 +1021,96 @@ pub async fn open_file_external(
     path_or_uri: String,
 ) -> Result<(), String> {
     crate::preview::open_file_external(&app, &path_or_uri).await
+}
+
+// --- Optional Module: Video Link ---
+
+#[cfg(feature = "mod-videolink")]
+#[tauri::command]
+pub fn videolink_status(state: State<'_, AppState>) -> VideoLinkStatus {
+    state.videolink.status()
+}
+
+#[cfg(not(feature = "mod-videolink"))]
+#[tauri::command]
+pub fn videolink_status() -> serde_json::Value {
+    serde_json::json!({
+        "running": false,
+        "url": null,
+        "port": null,
+        "fileName": null,
+        "sizeBytes": null
+    })
+}
+
+#[cfg(feature = "mod-videolink")]
+#[tauri::command]
+pub async fn videolink_start(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path_or_uri: String,
+    password: String,
+) -> Result<VideoLinkStatus, String> {
+    let trimmed = path_or_uri.trim();
+    if trimmed.is_empty() {
+        return Err("Video file path is empty".into());
+    }
+
+    let source = if trimmed.starts_with("content://") {
+        #[cfg(target_os = "android")]
+        {
+            use tauri::Manager;
+            let bridge = app
+                .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+                .ok_or_else(|| "Android bridge unavailable".to_string())?;
+            let meta = bridge.get_content_uri_meta_async(trimmed).await?;
+            VideoSource::ContentUri {
+                uri: trimmed.to_string(),
+                file_name: meta.name,
+                size_bytes: meta.size_bytes,
+                mime_type: Some(meta.mime_type),
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = app;
+            return Err("content:// URIs are only supported on Android".into());
+        }
+    } else {
+        let _ = app;
+        VideoSource::File(PathBuf::from(trimmed))
+    };
+
+    state
+        .videolink
+        .start(source, password)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "mod-videolink"))]
+#[tauri::command]
+pub async fn videolink_start(
+    _path_or_uri: String,
+    _password: String,
+) -> Result<serde_json::Value, String> {
+    Err("videolink module is not compiled".into())
+}
+
+#[cfg(feature = "mod-videolink")]
+#[tauri::command]
+pub async fn videolink_stop(state: State<'_, AppState>) -> Result<VideoLinkStatus, String> {
+    Ok(state.videolink.stop().await)
+}
+
+#[cfg(not(feature = "mod-videolink"))]
+#[tauri::command]
+pub async fn videolink_stop() -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "running": false,
+        "url": null,
+        "port": null,
+        "fileName": null,
+        "sizeBytes": null
+    }))
 }

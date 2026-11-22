@@ -1,0 +1,165 @@
+use std::net::Ipv4Addr;
+
+use landa_core::LandaModule;
+use landa_mod_videolink::{VideoLinkModule, VideoSource};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use uuid::Uuid;
+
+async fn send_raw_http(addr: std::net::SocketAddr, req: &str) -> (String, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("valid HTTP response headers");
+    let headers = String::from_utf8_lossy(&raw[..split]).to_string();
+    let body = raw[split + 4..].to_vec();
+    (headers, body)
+}
+
+fn extract_set_cookie(headers: &str) -> Option<String> {
+    for line in headers.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("set-cookie") {
+                let cookie_pair = v.split(';').next()?.trim();
+                return Some(cookie_pair.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn videolink_auth_range_streaming_and_stop() {
+    let temp_dir = std::env::temp_dir().join(format!("landa-vl-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let video_path = temp_dir.join("sample&clip'1.mp4");
+    let payload: Vec<u8> = (0..256u16).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&video_path, &payload).unwrap();
+
+    let module = VideoLinkModule::new();
+    let status = module
+        .start_with_bind(
+            Ipv4Addr::LOCALHOST,
+            0,
+            VideoSource::File(video_path.clone()),
+            "secret-pass-42".into(),
+        )
+        .await
+        .unwrap();
+    assert!(status.running);
+    assert_eq!(status.file_name.as_deref(), Some("sample&clip'1.mp4"));
+    assert_eq!(status.size_bytes, Some(payload.len() as u64));
+
+    let addr = module.bound_addr().await.unwrap();
+
+    // 1. Unauthenticated /stream must be rejected with 401 and leak no bytes
+    let (hdrs, body) = send_raw_http(
+        addr,
+        "GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(hdrs.starts_with("HTTP/1.1 401 Unauthorized"), "{hdrs}");
+    assert_eq!(body, b"Unauthorized");
+
+    // 2. Unauthenticated /watch renders login form (escaped filename, no <video>)
+    let (hdrs, body) = send_raw_http(
+        addr,
+        "GET /watch HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(hdrs.starts_with("HTTP/1.1 200 OK"), "{hdrs}");
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("action=\"/login\""));
+    assert!(html.contains("sample&amp;clip&#39;1.mp4"));
+    assert!(!html.contains("<video"));
+
+    // 3. Wrong password returns 401 and sets no cookie
+    let wrong_body = "password=wrong";
+    let (hdrs, _) = send_raw_http(
+        addr,
+        &format!(
+            "POST /login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{wrong_body}",
+            wrong_body.len()
+        ),
+    )
+    .await;
+    assert!(hdrs.starts_with("HTTP/1.1 401 Unauthorized"), "{hdrs}");
+    assert!(extract_set_cookie(&hdrs).is_none());
+
+    // 4. Valid password issues session cookie
+    let ok_body = "password=secret-pass-42";
+    let (hdrs, _) = send_raw_http(
+        addr,
+        &format!(
+            "POST /login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_body}",
+            ok_body.len()
+        ),
+    )
+    .await;
+    assert!(hdrs.starts_with("HTTP/1.1 303 See Other"), "{hdrs}");
+    let cookie = extract_set_cookie(&hdrs).expect("session cookie must be set");
+    assert!(cookie.starts_with("landa_vl_session="));
+
+    // 5. Authenticated /watch renders HTML5 player
+    let (hdrs, body) = send_raw_http(
+        addr,
+        &format!(
+            "GET /watch HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(hdrs.starts_with("HTTP/1.1 200 OK"), "{hdrs}");
+    let player_html = String::from_utf8_lossy(&body);
+    assert!(player_html.contains("<video"));
+    assert!(player_html.contains("src=\"/stream\""));
+
+    // 6. Authenticated /stream with Range returns 206 Partial Content and exact slice
+    let (hdrs, body) = send_raw_http(
+        addr,
+        &format!(
+            "GET /stream HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nRange: bytes=10-24\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(hdrs.starts_with("HTTP/1.1 206 Partial Content"), "{hdrs}");
+    assert!(hdrs.contains("Content-Range: bytes 10-24/256"), "{hdrs}");
+    assert!(hdrs.contains("Accept-Ranges: bytes"), "{hdrs}");
+    assert_eq!(body, &payload[10..=24]);
+
+    // 7. Out-of-bounds Range returns 416
+    let (hdrs, _) = send_raw_http(
+        addr,
+        &format!(
+            "GET /stream HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nRange: bytes=9999-\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(hdrs.starts_with("HTTP/1.1 416 Range Not Satisfiable"), "{hdrs}");
+
+    // 8. Stopping server closes listener immediately
+    let stopped = module.stop().await;
+    assert!(!stopped.running);
+    assert!(!module.status().running);
+    assert!(TcpStream::connect(addr).await.is_err());
+
+    // 9. Disabling module blocks starting
+    module.set_enabled(false);
+    let disabled_res = module
+        .start_with_bind(
+            Ipv4Addr::LOCALHOST,
+            0,
+            VideoSource::File(video_path),
+            "secret-pass-42".into(),
+        )
+        .await;
+    assert!(disabled_res.is_err());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

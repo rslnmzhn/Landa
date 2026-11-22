@@ -1,0 +1,20 @@
+[package]
+name = "landa-mod-videolink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+landa-core = { path = "../landa-core" }
+landa-proto = { path = "../landa-proto" }
+quinn.workspace = true
+rand.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

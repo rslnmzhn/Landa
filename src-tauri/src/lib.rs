@@ -15,6 +15,8 @@ use landa_core::{LandaConfig, LandaEngine};
 use landa_mod_clipboard::ClipboardModule;
 #[cfg(feature = "mod-shares")]
 use landa_mod_shares::SharesModule;
+#[cfg(feature = "mod-videolink")]
+use landa_mod_videolink::VideoLinkModule;
 use tauri::{Emitter, Manager};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri_plugin_notification::NotificationExt;
@@ -81,6 +83,17 @@ pub fn run() {
                     engine.events().clone(),
                     engine.app_data_dir().join("clipboard_images"),
                 );
+                engine.register_module(m.clone());
+                m
+            };
+
+            #[cfg(feature = "mod-videolink")]
+            let videolink = {
+                let m = VideoLinkModule::new();
+                #[cfg(target_os = "android")]
+                m.set_open_source_hook(android_bridge::make_open_source_hook(
+                    app.handle().clone(),
+                ));
                 engine.register_module(m.clone());
                 m
             };
@@ -329,6 +342,8 @@ pub fn run() {
                 shares,
                 #[cfg(feature = "mod-clipboard")]
                 clipboard,
+                #[cfg(feature = "mod-videolink")]
+                videolink,
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 desktop_clipboard: std::sync::Mutex::new(None),
             });
@@ -388,6 +403,9 @@ pub fn run() {
             commands::get_qr_connect_info,
             commands::connect_via_qr_uri,
             commands::scan_qr_and_connect_android,
+            commands::videolink_status,
+            commands::videolink_start,
+            commands::videolink_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Landa");

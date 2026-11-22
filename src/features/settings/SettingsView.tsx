@@ -207,6 +207,8 @@ export function SettingsView({
                 ? t.settings.modShares
                 : mod.id === "clipboard"
                 ? t.settings.modClipboard
+                : mod.id === "videolink"
+                ? t.settings.modVideoLink
                 : mod.id;
             return (
               <GlassToggle

@@ -29,6 +29,7 @@ impl AppSettings {
         let mut enabled_modules = HashMap::new();
         enabled_modules.insert("shares".to_string(), true);
         enabled_modules.insert("clipboard".to_string(), true);
+        enabled_modules.insert("videolink".to_string(), true);
         Self {
             device_name,
             download_dir: download_dir.to_string_lossy().to_string(),
