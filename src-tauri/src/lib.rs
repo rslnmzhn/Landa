@@ -3,6 +3,7 @@ mod android_bridge;
 mod commands;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod desktop;
+mod updater;
 
 use std::sync::Arc;
 
@@ -196,6 +197,9 @@ pub fn run() {
             commands::has_all_files_access,
             commands::request_all_files_access,
             commands::ensure_startup_permissions,
+            commands::check_for_updates,
+            commands::download_update,
+            commands::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Landa");

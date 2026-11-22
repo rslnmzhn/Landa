@@ -132,6 +132,34 @@ export interface ClipboardItem {
   createdAt: number;
 }
 
+export interface UpdateAssetInfo {
+  platform: string;
+  arch: string;
+  format: string;
+  fileName: string;
+  size: number;
+  sha256: string;
+  downloadUrl: string;
+}
+
+export interface UpdateCheckResult {
+  currentVersion: string;
+  latestVersion: string;
+  hasUpdate: boolean;
+  releaseTag: string;
+  releaseNotes: string;
+  publishedAt: string | null;
+  asset: UpdateAssetInfo | null;
+}
+
+export interface UpdateProgressEvent {
+  stage: "downloading" | "verifying" | "ready" | "installing" | "failed";
+  downloadedBytes: number;
+  totalBytes: number;
+  filePath: string | null;
+  error: string | null;
+}
+
 export type CoreEvent =
   | { type: "peersChanged" }
   | { type: "friendRequestsChanged" }

@@ -16,6 +16,8 @@ import type {
   PeerInfo,
   TransferHistoryRecord,
   TransferProgressInfo,
+  UpdateCheckResult,
+  UpdateProgressEvent,
 } from "./core/types";
 import { translations } from "./i18n/translations";
 import {
@@ -49,6 +51,9 @@ export function App() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [modules, setModules] = useState<ModuleStatus[]>([]);
   const [clipboardTick, setClipboardTick] = useState(0);
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [updateProgress, setUpdateProgress] =
+    useState<UpdateProgressEvent | null>(null);
   const [toast, setToast] = useState<{
     kind: "error" | "notice";
     text: string;
@@ -64,6 +69,7 @@ export function App() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let unlistenIdentity: (() => void) | undefined;
+    let unlistenUpdate: (() => void) | undefined;
 
     const bootstrap = async () => {
       try {
@@ -83,6 +89,7 @@ export function App() {
         setSettings(cfg);
         setModules(mods);
         api.triggerScan().catch(() => {});
+        api.checkForUpdates().then(setUpdateInfo).catch(() => {});
 
         const shared = await api.takePendingSharedFiles().catch(() => []);
         if (shared.length > 0) {
@@ -95,6 +102,10 @@ export function App() {
       unlistenIdentity = await api.onIdentityUpdated(() => {
         api.getLocalIdentity().then(setIdentity).catch(() => {});
         api.getSettings().then(setSettings).catch(() => {});
+      });
+
+      unlistenUpdate = await api.onUpdateProgress((ev) => {
+        setUpdateProgress(ev);
       });
 
       unlisten = await api.onCoreEvent((ev) => {
@@ -168,6 +179,7 @@ export function App() {
       document.removeEventListener("visibilitychange", checkSharedAndScan);
       if (unlisten) unlisten();
       if (unlistenIdentity) unlistenIdentity();
+      if (unlistenUpdate) unlistenUpdate();
     };
   }, []);
 
@@ -269,6 +281,9 @@ export function App() {
               peers={peers}
               friendRequests={friendRequests}
               leftHanded={settings?.leftHandedMode ?? false}
+              updateInfo={updateInfo}
+              updateProgress={updateProgress}
+              onUpdateInfoChange={setUpdateInfo}
               onError={(m) => showToast("error", m)}
             />
           )}

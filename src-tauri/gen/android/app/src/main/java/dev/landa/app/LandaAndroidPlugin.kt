@@ -80,6 +80,11 @@ class TransferFailedNotifArgs {
     var error: String? = null
 }
 
+@InvokeArg
+class InstallApkArgs {
+    lateinit var apkPath: String
+}
+
 @TauriPlugin
 class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     private var multicastLock: WifiManager.MulticastLock? = null
@@ -473,6 +478,50 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.resolve()
         } catch (ex: Exception) {
             invoke.reject(ex.message ?: "Failed to request storage permission")
+        }
+    }
+
+    @Command
+    fun installApkUpdate(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(InstallApkArgs::class.java)
+            val apkFile = File(args.apkPath).canonicalFile
+            val cacheRoot = activity.cacheDir.canonicalFile
+            val filesRoot = activity.filesDir.canonicalFile
+            val inAllowedDir = apkFile.path.startsWith(cacheRoot.path + File.separator) ||
+                apkFile.path.startsWith(filesRoot.path + File.separator)
+            if (!inAllowedDir || !apkFile.exists() || !apkFile.isFile) {
+                invoke.reject("Invalid APK update path")
+                return
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                !activity.packageManager.canRequestPackageInstalls()
+            ) {
+                val settingsIntent = Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:${activity.packageName}")
+                ).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                activity.startActivity(settingsIntent)
+                invoke.reject("INSTALL_PERMISSION_REQUIRED")
+                return
+            }
+
+            val uri = FileProvider.getUriForFile(
+                activity,
+                "${activity.packageName}.fileprovider",
+                apkFile
+            )
+            val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            activity.startActivity(installIntent)
+            invoke.resolve()
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to launch APK installer")
         }
     }
 

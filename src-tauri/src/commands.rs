@@ -438,3 +438,23 @@ pub async fn ensure_startup_permissions(app: tauri::AppHandle) -> Result<(), Str
     let _ = app;
     Ok(())
 }
+
+// --- App Auto-Update ---
+
+#[tauri::command]
+pub async fn check_for_updates() -> Result<crate::updater::UpdateCheckResult, String> {
+    crate::updater::check_for_updates().await
+}
+
+#[tauri::command]
+pub async fn download_update(
+    app: tauri::AppHandle,
+    asset: crate::updater::UpdateAssetInfo,
+) -> Result<String, String> {
+    crate::updater::download_and_verify_update(&app, asset).await
+}
+
+#[tauri::command]
+pub async fn install_update(app: tauri::AppHandle, file_path: String) -> Result<(), String> {
+    crate::updater::install_update(&app, &file_path).await
+}

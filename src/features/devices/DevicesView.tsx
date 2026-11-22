@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  ArrowDownToLine,
   Check,
   Edit3,
   FileUp,
@@ -14,11 +15,13 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { api } from "../../core/api";
+import { api, formatBytes } from "../../core/api";
 import type {
   FriendRequestInfo,
   LocalIdentityInfo,
   PeerInfo,
+  UpdateCheckResult,
+  UpdateProgressEvent,
 } from "../../core/types";
 import type { TranslationDict } from "../../i18n/translations";
 import {
@@ -35,6 +38,9 @@ interface DevicesViewProps {
   peers: PeerInfo[];
   friendRequests: FriendRequestInfo[];
   leftHanded: boolean;
+  updateInfo: UpdateCheckResult | null;
+  updateProgress: UpdateProgressEvent | null;
+  onUpdateInfoChange: (next: UpdateCheckResult | null) => void;
   onError: (msg: string) => void;
 }
 
@@ -44,11 +50,19 @@ export function DevicesView({
   peers,
   friendRequests,
   leftHanded,
+  updateInfo,
+  updateProgress,
+  onUpdateInfoChange,
   onError,
 }: DevicesViewProps) {
   const [scanning, setScanning] = useState(false);
   const [renameTarget, setRenameTarget] = useState<PeerInfo | null>(null);
   const [aliasDraft, setAliasDraft] = useState("");
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [downloadedPath, setDownloadedPath] = useState<string | null>(null);
+  const [updateHint, setUpdateHint] = useState<string | null>(null);
 
   const handleScan = async () => {
     setScanning(true);
@@ -89,6 +103,61 @@ export function DevicesView({
     }
   };
 
+  const runUpdateCheck = async () => {
+    setCheckingUpdate(true);
+    setUpdateHint(null);
+    try {
+      const res = await api.checkForUpdates();
+      onUpdateInfoChange(res);
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const handleOpenUpdateModal = () => {
+    setUpdateModalOpen(true);
+    setUpdateHint(null);
+    if (!updateInfo) {
+      void runUpdateCheck();
+    }
+  };
+
+  const handleDownloadAndInstall = async () => {
+    if (!updateInfo?.asset) return;
+    setInstallingUpdate(true);
+    setUpdateHint(null);
+    try {
+      const path = downloadedPath ?? (await api.downloadUpdate(updateInfo.asset));
+      setDownloadedPath(path);
+      await api.installUpdate(path);
+    } catch (e) {
+      const msg = String(e);
+      if (msg.includes("INSTALL_PERMISSION_REQUIRED")) {
+        setUpdateHint(t.update.permissionHint);
+      } else {
+        onError(msg);
+      }
+    } finally {
+      setInstallingUpdate(false);
+    }
+  };
+
+  const isDownloading =
+    installingUpdate &&
+    (updateProgress?.stage === "downloading" ||
+      updateProgress?.stage === "verifying");
+  const downloadPct =
+    updateProgress && updateProgress.totalBytes > 0
+      ? Math.min(
+          100,
+          Math.round(
+            (updateProgress.downloadedBytes / updateProgress.totalBytes) * 100
+          )
+        )
+      : 0;
+
   return (
     <div className="space-y-5">
       {/* Minimal Header */}
@@ -111,17 +180,32 @@ export function DevicesView({
           )}
         </div>
 
-        <GlassButton
-          onClick={handleScan}
-          size="sm"
-          title={t.devices.scan}
-          aria-label={t.devices.scan}
-        >
-          <RefreshCw
-            className={`h-4 w-4 ${scanning ? "animate-spin" : ""}`}
-          />
-          <span className="hidden sm:inline">{t.devices.scan}</span>
-        </GlassButton>
+        <div className="flex items-center gap-2 shrink-0">
+          <GlassButton
+            onClick={handleOpenUpdateModal}
+            size="sm"
+            title={t.update.tooltip}
+            aria-label={t.update.tooltip}
+            className="relative px-3"
+          >
+            <ArrowDownToLine className="h-4 w-4" />
+            {updateInfo?.hasUpdate && (
+              <span className="absolute right-2 top-2 h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.85)]" />
+            )}
+          </GlassButton>
+
+          <GlassButton
+            onClick={handleScan}
+            size="sm"
+            title={t.devices.scan}
+            aria-label={t.devices.scan}
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${scanning ? "animate-spin" : ""}`}
+            />
+            <span className="hidden sm:inline">{t.devices.scan}</span>
+          </GlassButton>
+        </div>
       </div>
 
       {/* Pending Friend Requests */}
@@ -326,6 +410,127 @@ export function DevicesView({
             <GlassButton variant="primary" onClick={handleSaveRename}>
               {t.settings.save}
             </GlassButton>
+          </div>
+        </div>
+      </GlassModal>
+
+      {/* App Update Modal */}
+      <GlassModal
+        open={updateModalOpen}
+        onClose={() => {
+          if (!installingUpdate) setUpdateModalOpen(false);
+        }}
+        title={t.update.title}
+      >
+        <div className="space-y-4">
+          {checkingUpdate ? (
+            <div className="flex items-center gap-2.5 py-2 text-sm text-slate-700/80 dark:text-white/70">
+              <RefreshCw className="h-4 w-4 animate-spin" />
+              <span>{t.update.checking}</span>
+            </div>
+          ) : updateInfo ? (
+            <>
+              <div className="flex items-center justify-between rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-3 text-sm">
+                <div>
+                  <div className="text-xs text-slate-700/65 dark:text-white/50">
+                    {t.update.current}
+                  </div>
+                  <div className="font-mono font-medium">
+                    v{updateInfo.currentVersion}
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-xs text-slate-700/65 dark:text-white/50">
+                    {t.update.latest}
+                  </div>
+                  <div className="font-mono font-semibold text-indigo-600 dark:text-indigo-300">
+                    v{updateInfo.latestVersion}
+                  </div>
+                </div>
+              </div>
+
+              {!updateInfo.hasUpdate ? (
+                <div className="text-sm text-emerald-700 dark:text-emerald-300">
+                  {t.update.upToDate}
+                </div>
+              ) : (
+                <>
+                  {updateInfo.releaseNotes && (
+                    <div className="max-h-36 overflow-y-auto whitespace-pre-wrap rounded-2xl bg-white/20 dark:bg-white/5 p-3 font-mono text-xs text-slate-800/85 dark:text-white/75">
+                      {updateInfo.releaseNotes}
+                    </div>
+                  )}
+
+                  {updateInfo.asset ? (
+                    <div className="flex items-center justify-between text-xs font-mono text-slate-700/70 dark:text-white/55">
+                      <span className="truncate">{updateInfo.asset.fileName}</span>
+                      <span className="shrink-0 ml-2">
+                        {formatBytes(updateInfo.asset.size)}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-amber-700 dark:text-amber-300">
+                      {t.update.noAsset}
+                    </div>
+                  )}
+
+                  {isDownloading && updateProgress && (
+                    <div className="space-y-1.5">
+                      <div className="h-2 w-full overflow-hidden rounded-full bg-white/20 dark:bg-white/10">
+                        <div
+                          className="h-full rounded-full bg-gradient-to-r from-indigo-400 to-cyan-400 transition-all duration-150"
+                          style={{ width: `${downloadPct}%` }}
+                        />
+                      </div>
+                      <div className="flex justify-between font-mono text-xs text-slate-700/70 dark:text-white/55">
+                        <span>
+                          {updateProgress.stage === "verifying"
+                            ? t.update.verifying
+                            : t.update.downloading}
+                        </span>
+                        <span>{downloadPct}%</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {updateHint && (
+                    <div className="rounded-2xl bg-amber-400/15 border border-amber-400/30 px-3 py-2 text-xs text-amber-900 dark:text-amber-200">
+                      {updateHint}
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          ) : null}
+
+          <div className="flex justify-end gap-2">
+            <GlassButton
+              variant="ghost"
+              disabled={installingUpdate}
+              onClick={() => setUpdateModalOpen(false)}
+            >
+              {t.update.close}
+            </GlassButton>
+            {!updateInfo?.hasUpdate && (
+              <GlassButton
+                variant="glass"
+                disabled={checkingUpdate}
+                onClick={runUpdateCheck}
+              >
+                {t.update.checkAgain}
+              </GlassButton>
+            )}
+            {updateInfo?.hasUpdate && updateInfo.asset && (
+              <GlassButton
+                variant="primary"
+                disabled={installingUpdate || checkingUpdate}
+                onClick={handleDownloadAndInstall}
+              >
+                {downloadedPath
+                  ? t.update.installNow
+                  : t.update.downloadAndInstall}
+              </GlassButton>
+            )}
           </div>
         </div>
       </GlassModal>

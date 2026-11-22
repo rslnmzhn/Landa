@@ -13,6 +13,9 @@ import type {
   ShareEntry,
   ShareRootInfo,
   TransferHistoryRecord,
+  UpdateAssetInfo,
+  UpdateCheckResult,
+  UpdateProgressEvent,
 } from "./types";
 
 export const api = {
@@ -92,10 +95,23 @@ export const api = {
   requestAllFilesAccess: () => invoke<void>("request_all_files_access"),
   ensureStartupPermissions: () => invoke<void>("ensure_startup_permissions"),
 
+  // App Auto-Update
+  checkForUpdates: () => invoke<UpdateCheckResult>("check_for_updates"),
+  downloadUpdate: (asset: UpdateAssetInfo) =>
+    invoke<string>("download_update", { asset }),
+  installUpdate: (filePath: string) =>
+    invoke<void>("install_update", { filePath }),
+
   onCoreEvent: (handler: (event: CoreEvent) => void): Promise<UnlistenFn> =>
     listen<CoreEvent>("landa://event", (ev) => handler(ev.payload)),
   onIdentityUpdated: (handler: () => void): Promise<UnlistenFn> =>
     listen<void>("landa://identity-updated", () => handler()),
+  onUpdateProgress: (
+    handler: (event: UpdateProgressEvent) => void
+  ): Promise<UnlistenFn> =>
+    listen<UpdateProgressEvent>("landa://update-progress", (ev) =>
+      handler(ev.payload)
+    ),
 };
 
 export function formatBytes(bytes: number): string {

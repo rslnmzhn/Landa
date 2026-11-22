@@ -89,6 +89,12 @@ struct TransferFailedNotifArgs {
     error: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallApkArgs {
+    apk_path: String,
+}
+
 pub struct AndroidBridge<R: Runtime> {
     handle: PluginHandle<R>,
 }
@@ -219,6 +225,19 @@ impl<R: Runtime> AndroidBridge<R> {
     pub fn request_all_files_access(&self) -> Result<(), String> {
         self.handle
             .run_mobile_plugin::<serde_json::Value>("requestAllFilesAccess", ())
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn install_apk_update_async(&self, apk_path: &str) -> Result<(), String> {
+        self.handle
+            .run_mobile_plugin_async::<serde_json::Value>(
+                "installApkUpdate",
+                InstallApkArgs {
+                    apk_path: apk_path.to_string(),
+                },
+            )
+            .await
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
