@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownToLine,
@@ -10,6 +11,7 @@ import {
   RefreshCw,
   ShieldCheck,
   Smartphone,
+  Upload,
   UserMinus,
   UserPlus,
   Wifi,
@@ -42,6 +44,12 @@ interface DevicesViewProps {
   updateProgress: UpdateProgressEvent | null;
   onUpdateInfoChange: (next: UpdateCheckResult | null) => void;
   onError: (msg: string) => void;
+  onNotice?: (msg: string) => void;
+}
+
+function pathBasename(path: string): string {
+  const parts = path.split(/[/\\]/).filter(Boolean);
+  return parts[parts.length - 1] ?? path;
 }
 
 export function DevicesView({
@@ -54,6 +62,7 @@ export function DevicesView({
   updateProgress,
   onUpdateInfoChange,
   onError,
+  onNotice,
 }: DevicesViewProps) {
   const [scanning, setScanning] = useState(false);
   const [renameTarget, setRenameTarget] = useState<PeerInfo | null>(null);
@@ -63,6 +72,96 @@ export function DevicesView({
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [downloadedPath, setDownloadedPath] = useState<string | null>(null);
   const [updateHint, setUpdateHint] = useState<string | null>(null);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [hoveredPeerId, setHoveredPeerId] = useState<string | null>(null);
+  const [droppedPaths, setDroppedPaths] = useState<string[]>([]);
+
+  const peersRef = useRef(peers);
+  peersRef.current = peers;
+  const tRef = useRef(t);
+  tRef.current = t;
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+  const onNoticeRef = useRef(onNotice);
+  onNoticeRef.current = onNotice;
+
+  const isAndroid =
+    identity?.os === "android" ||
+    navigator.userAgent.toLowerCase().includes("android");
+
+  const sendPathsToPeer = async (peerId: string, paths: string[]) => {
+    if (paths.length === 0) return;
+    const peer = peersRef.current.find((p) => p.peerId === peerId);
+    if (peer) {
+      onNoticeRef.current?.(`${tRef.current.devices.dropSending}: ${peer.displayName}`);
+    }
+    try {
+      await api.sendFiles(peerId, paths);
+    } catch (e) {
+      onErrorRef.current(String(e));
+    }
+  };
+
+  useEffect(() => {
+    if (isAndroid) return;
+
+    const findOnlinePeerAtPosition = (position: { x: number; y: number }): string | null => {
+      const dpr = window.devicePixelRatio || 1;
+      const x = position.x / dpr;
+      const y = position.y / dpr;
+      const el = document.elementFromPoint(x, y);
+      const card = el?.closest<HTMLElement>("[data-peer-id]");
+      const peerId = card?.dataset.peerId ?? null;
+      if (!peerId) return null;
+      const peer = peersRef.current.find((p) => p.peerId === peerId && p.isOnline);
+      return peer ? peer.peerId : null;
+    };
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const payload = event.payload;
+        if (payload.type === "enter" || payload.type === "over") {
+          setIsDraggingFiles(true);
+          setHoveredPeerId(findOnlinePeerAtPosition(payload.position));
+        } else if (payload.type === "leave") {
+          setIsDraggingFiles(false);
+          setHoveredPeerId(null);
+        } else if (payload.type === "drop") {
+          setIsDraggingFiles(false);
+          setHoveredPeerId(null);
+          if (payload.paths.length === 0) return;
+
+          const targetPeerId = findOnlinePeerAtPosition(payload.position);
+          if (targetPeerId) {
+            void sendPathsToPeer(targetPeerId, payload.paths);
+            return;
+          }
+
+          const onlinePeers = peersRef.current.filter((p) => p.isOnline);
+          if (onlinePeers.length === 0) {
+            onErrorRef.current(tRef.current.devices.dropNoOnline);
+            return;
+          }
+          setDroppedPaths(payload.paths);
+        }
+      })
+      .then((fn) => {
+        if (disposed) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [isAndroid]);
 
   const handleScan = async () => {
     setScanning(true);
@@ -77,9 +176,6 @@ export function DevicesView({
 
   const handleSendFiles = async (peerId: string, directory: boolean) => {
     try {
-      const isAndroid =
-        identity?.os === "android" ||
-        navigator.userAgent.toLowerCase().includes("android");
       if (directory && isAndroid) {
         await api.sendFolderAndroid(peerId);
         return;
@@ -291,107 +387,139 @@ export function DevicesView({
         </GlassCard>
       ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          {peers.map((peer) => (
-            <GlassCard
-              key={peer.peerId}
-              className="flex flex-col justify-between gap-4 p-5 hover:bg-white/20 dark:hover:bg-white/[0.1]"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex items-center gap-3.5 min-w-0">
-                  <div className="relative flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-white/35 dark:bg-white/10 border border-white/30 dark:border-white/15">
-                    {peer.category === "phone" ? (
-                      <Smartphone className="h-6 w-6 text-slate-800 dark:text-white/90" />
-                    ) : (
-                      <Laptop className="h-6 w-6 text-slate-800 dark:text-white/90" />
-                    )}
-                    <span
-                      className={`absolute -bottom-0.5 -right-0.5 h-3.5 w-3.5 rounded-full border-2 border-white/80 dark:border-[#0b0f1e] ${
-                        peer.isOnline ? "bg-emerald-400" : "bg-slate-400"
+          {peers.map((peer) => {
+            const canDrop = isDraggingFiles && peer.isOnline;
+            const isDropHovered = canDrop && hoveredPeerId === peer.peerId;
+            return (
+              <GlassCard
+                key={peer.peerId}
+                data-peer-id={peer.peerId}
+                className={`relative overflow-hidden flex flex-col justify-between gap-4 p-5 transition-all duration-200 ${
+                  isDropHovered
+                    ? "ring-2 ring-indigo-400/90 bg-indigo-500/15 dark:bg-indigo-400/15 shadow-[0_0_36px_rgba(99,102,241,0.35)] scale-[1.01]"
+                    : canDrop
+                      ? "ring-1 ring-indigo-400/50 bg-white/20 dark:bg-white/[0.09]"
+                      : "hover:bg-white/20 dark:hover:bg-white/[0.1]"
+                }`}
+              >
+                {canDrop && (
+                  <div
+                    aria-hidden="true"
+                    className={`pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-3xl transition-all duration-200 ${
+                      isDropHovered
+                        ? "bg-indigo-500/20 dark:bg-indigo-500/25 backdrop-blur-md opacity-100"
+                        : "bg-indigo-500/5 backdrop-blur-[2px] opacity-90"
+                    }`}
+                  >
+                    <div
+                      className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold shadow-lg transition-transform duration-200 ${
+                        isDropHovered
+                          ? "scale-105 border-indigo-300/70 bg-indigo-500/85 text-white"
+                          : "border-white/40 dark:border-white/20 bg-white/70 dark:bg-slate-900/70 text-slate-900 dark:text-white/90"
                       }`}
-                    />
-                  </div>
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-1.5">
-                      <h3 className="truncate text-base font-semibold text-slate-900/95 dark:text-white/95">
-                        {peer.displayName}
-                      </h3>
-                      <button
-                        type="button"
-                        title={t.devices.rename}
-                        onClick={() => {
-                          setRenameTarget(peer);
-                          setAliasDraft(peer.aliasName ?? peer.deviceName);
-                        }}
-                        className="rounded-full p-1.5 text-slate-600/65 dark:text-white/40 hover:bg-white/20 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white"
-                      >
-                        <Edit3 className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                    <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-700/65 dark:text-white/50 font-mono">
-                      <span>{peer.ip ?? "—"}</span>
-                      <span>·</span>
-                      <span className="uppercase">{peer.os}</span>
+                    >
+                      <Upload className="h-3.5 w-3.5" />
+                      <span>{t.devices.dropHint}</span>
                     </div>
                   </div>
+                )}
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-3.5 min-w-0">
+                    <div className="relative flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-white/35 dark:bg-white/10 border border-white/30 dark:border-white/15">
+                      {peer.category === "phone" ? (
+                        <Smartphone className="h-6 w-6 text-slate-800 dark:text-white/90" />
+                      ) : (
+                        <Laptop className="h-6 w-6 text-slate-800 dark:text-white/90" />
+                      )}
+                      <span
+                        className={`absolute -bottom-0.5 -right-0.5 h-3.5 w-3.5 rounded-full border-2 border-white/80 dark:border-[#0b0f1e] ${
+                          peer.isOnline ? "bg-emerald-400" : "bg-slate-400"
+                        }`}
+                      />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <h3 className="truncate text-base font-semibold text-slate-900/95 dark:text-white/95">
+                          {peer.displayName}
+                        </h3>
+                        <button
+                          type="button"
+                          title={t.devices.rename}
+                          onClick={() => {
+                            setRenameTarget(peer);
+                            setAliasDraft(peer.aliasName ?? peer.deviceName);
+                          }}
+                          className="rounded-full p-1.5 text-slate-600/65 dark:text-white/40 hover:bg-white/20 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white"
+                        >
+                          <Edit3 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                      <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-700/65 dark:text-white/50 font-mono">
+                        <span>{peer.ip ?? "—"}</span>
+                        <span>·</span>
+                        <span className="uppercase">{peer.os}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {peer.isTrusted && (
+                    <GlassBadge tone="success">
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                      <span>{t.devices.friend}</span>
+                    </GlassBadge>
+                  )}
                 </div>
 
-                {peer.isTrusted && (
-                  <GlassBadge tone="success">
-                    <ShieldCheck className="h-3.5 w-3.5" />
-                    <span>{t.devices.friend}</span>
-                  </GlassBadge>
-                )}
-              </div>
-
-              <div className="flex items-center gap-2">
-                <GlassButton
-                  variant="primary"
-                  size="sm"
-                  disabled={!peer.isOnline}
-                  onClick={() => handleSendFiles(peer.peerId, false)}
-                  className="flex-1"
-                >
-                  <FileUp className="h-4 w-4" />
-                  <span>{t.devices.sendFiles}</span>
-                </GlassButton>
-                <GlassButton
-                  variant="glass"
-                  size="sm"
-                  disabled={!peer.isOnline}
-                  title={t.devices.sendFolder}
-                  onClick={() => handleSendFiles(peer.peerId, true)}
-                >
-                  <FolderUp className="h-4 w-4" />
-                </GlassButton>
-                {peer.isTrusted ? (
+                <div className="flex items-center gap-2">
                   <GlassButton
-                    variant="ghost"
+                    variant="primary"
                     size="sm"
-                    title={t.devices.unfriend}
-                    onClick={() =>
-                      api.unfriend(peer.peerId).catch((e) => onError(String(e)))
-                    }
+                    disabled={!peer.isOnline}
+                    onClick={() => handleSendFiles(peer.peerId, false)}
+                    className="flex-1"
                   >
-                    <UserMinus className="h-4 w-4" />
+                    <FileUp className="h-4 w-4" />
+                    <span>{t.devices.sendFiles}</span>
                   </GlassButton>
-                ) : (
                   <GlassButton
                     variant="glass"
                     size="sm"
                     disabled={!peer.isOnline}
-                    title={t.devices.addFriend}
-                    onClick={() =>
-                      api
-                        .sendFriendRequest(peer.peerId)
-                        .catch((e) => onError(String(e)))
-                    }
+                    title={t.devices.sendFolder}
+                    onClick={() => handleSendFiles(peer.peerId, true)}
                   >
-                    <UserPlus className="h-4 w-4" />
+                    <FolderUp className="h-4 w-4" />
                   </GlassButton>
-                )}
-              </div>
-            </GlassCard>
-          ))}
+                  {peer.isTrusted ? (
+                    <GlassButton
+                      variant="ghost"
+                      size="sm"
+                      title={t.devices.unfriend}
+                      onClick={() =>
+                        api.unfriend(peer.peerId).catch((e) => onError(String(e)))
+                      }
+                    >
+                      <UserMinus className="h-4 w-4" />
+                    </GlassButton>
+                  ) : (
+                    <GlassButton
+                      variant="glass"
+                      size="sm"
+                      disabled={!peer.isOnline}
+                      title={t.devices.addFriend}
+                      onClick={() =>
+                        api
+                          .sendFriendRequest(peer.peerId)
+                          .catch((e) => onError(String(e)))
+                      }
+                    >
+                      <UserPlus className="h-4 w-4" />
+                    </GlassButton>
+                  )}
+                </div>
+              </GlassCard>
+            );
+          })}
         </div>
       )}
 
@@ -540,6 +668,116 @@ export function DevicesView({
             )}
           </div>
         </div>
+      </GlassModal>
+
+      {/* Drag & Drop Quick Send Modal */}
+      <GlassModal
+        open={droppedPaths.length > 0}
+        onClose={() => setDroppedPaths([])}
+        title={t.devices.dropModalTitle}
+      >
+        {(() => {
+          const onlinePeers = peers.filter((p) => p.isOnline);
+          const singlePeer = onlinePeers.length === 1 ? onlinePeers[0] : null;
+          return (
+            <div className="space-y-4">
+              <div className="text-xs font-mono text-slate-700/75 dark:text-white/60">
+                {t.devices.dropFilesCount}: {droppedPaths.length}
+              </div>
+
+              <div className="max-h-28 space-y-1 overflow-y-auto rounded-2xl bg-white/20 dark:bg-white/5 p-3 font-mono text-xs">
+                {droppedPaths.map((p) => (
+                  <div key={p} className="truncate">
+                    {pathBasename(p)}
+                  </div>
+                ))}
+              </div>
+
+              {onlinePeers.length === 0 ? (
+                <div className="rounded-2xl bg-white/20 dark:bg-white/5 p-3 text-xs text-slate-700/75 dark:text-white/60">
+                  {t.devices.dropNoOnline}
+                </div>
+              ) : singlePeer ? (
+                <div className="space-y-3">
+                  <div className="text-sm text-slate-800/85 dark:text-white/80">
+                    {t.devices.dropConfirmSingle}:
+                  </div>
+                  <div className="flex items-center justify-between rounded-2xl bg-white/25 dark:bg-white/10 px-4 py-3">
+                    <div className="flex items-center gap-3 min-w-0">
+                      {singlePeer.category === "phone" ? (
+                        <Smartphone className="h-5 w-5 shrink-0 text-slate-800 dark:text-white/90" />
+                      ) : (
+                        <Laptop className="h-5 w-5 shrink-0 text-slate-800 dark:text-white/90" />
+                      )}
+                      <span className="truncate font-medium text-slate-900/95 dark:text-white/95">
+                        {singlePeer.displayName}
+                      </span>
+                    </div>
+                    <span className="font-mono text-xs text-slate-700/70 dark:text-white/55">
+                      {singlePeer.ip ?? ""}
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="text-sm text-slate-800/85 dark:text-white/80">
+                    {t.devices.dropPickDevice}
+                  </div>
+                  <div className="max-h-52 space-y-2 overflow-y-auto">
+                    {onlinePeers.map((peer) => (
+                      <button
+                        key={peer.peerId}
+                        type="button"
+                        onClick={() => {
+                          const paths = droppedPaths;
+                          setDroppedPaths([]);
+                          void sendPathsToPeer(peer.peerId, paths);
+                        }}
+                        className="flex min-h-[44px] w-full items-center justify-between rounded-2xl bg-white/25 dark:bg-white/10 px-4 py-3 text-left transition hover:bg-white/35 dark:hover:bg-white/15"
+                      >
+                        <div className="flex items-center gap-3 min-w-0">
+                          {peer.category === "phone" ? (
+                            <Smartphone className="h-5 w-5 shrink-0 text-slate-800 dark:text-white/90" />
+                          ) : (
+                            <Laptop className="h-5 w-5 shrink-0 text-slate-800 dark:text-white/90" />
+                          )}
+                          <span className="truncate font-medium text-slate-900/95 dark:text-white/95">
+                            {peer.displayName}
+                          </span>
+                        </div>
+                        <span className="font-mono text-xs text-slate-700/70 dark:text-white/55">
+                          {peer.ip ?? ""}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2">
+                <GlassButton
+                  variant="ghost"
+                  onClick={() => setDroppedPaths([])}
+                >
+                  {t.devices.dropCancel}
+                </GlassButton>
+                {singlePeer && (
+                  <GlassButton
+                    variant="primary"
+                    onClick={() => {
+                      const paths = droppedPaths;
+                      setDroppedPaths([]);
+                      void sendPathsToPeer(singlePeer.peerId, paths);
+                    }}
+                  >
+                    <FileUp className="h-4 w-4" />
+                    <span>{t.devices.dropSendAction}</span>
+                  </GlassButton>
+                )}
+              </div>
+            </div>
+          );
+        })()}
       </GlassModal>
     </div>
   );

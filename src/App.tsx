@@ -321,6 +321,7 @@ export function App() {
               updateProgress={updateProgress}
               onUpdateInfoChange={setUpdateInfo}
               onError={(m) => showToast("error", m)}
+              onNotice={(m) => showToast("notice", m)}
             />
           )}
           {activeTab === "shares" && (
