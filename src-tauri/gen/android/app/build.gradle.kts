@@ -80,8 +80,10 @@ android {
             }
         }
         getByName("release") {
-            if (hasReleaseSigning) {
-                signingConfig = signingConfigs.getByName("release")
+            signingConfig = if (hasReleaseSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
             }
             optimization {
                enable = true

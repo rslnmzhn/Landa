@@ -203,7 +203,7 @@ jobs:
           keyPassword=${ANDROID_KEY_PASSWORD}
           EOF
           else
-            echo "::warning::Android release signing secrets are not configured; building unsigned release APK."
+            echo "::warning::Android release signing secrets are not configured; falling back to debug signing key so APKs remain installable."
           fi
 
       - name: Build Android APKs (release, split per ABI)
@@ -435,18 +435,23 @@ jobs:
           VERSION="${{ needs.resolve_release.outputs.release_version }}"
           mkdir -p release_final
 
-          # Android APKs
-          for abi in arm64-v8a armeabi-v7a x86_64 universal; do
-            found="$(find release_assets/android-apk-release -type f -name "*${abi}*.apk" | head -n 1 || true)"
+          # Android APKs (Tauri Gradle flavors: arm64, arm, x86_64, universal)
+          declare -A abi_map=(
+            ["arm64"]="arm64-v8a"
+            ["arm"]="armeabi-v7a"
+            ["x86_64"]="x86_64"
+            ["universal"]="universal"
+          )
+          for flavor in arm64 arm x86_64 universal; do
+            found="$(find release_assets/android-apk-release -type f -name "app-${flavor}-*.apk" | head -n 1 || true)"
             if [[ -n "${found}" ]]; then
-              cp "${found}" "release_final/landa-v${VERSION}-android-${abi}.apk"
+              cp "${found}" "release_final/landa-v${VERSION}-android-${abi_map[$flavor]}.apk"
             fi
           done
-          if ! ls release_final/*.apk >/dev/null 2>&1; then
-            first_apk="$(find release_assets/android-apk-release -type f -name "*.apk" | head -n 1 || true)"
-            if [[ -n "${first_apk}" ]]; then
-              cp "${first_apk}" "release_final/landa-v${VERSION}-android-universal.apk"
-            fi
+          if [[ ! -f "release_final/landa-v${VERSION}-android-arm64-v8a.apk" ]]; then
+            echo "::error::Missing arm64-v8a APK in release_assets/android-apk-release" >&2
+            ls -la release_assets/android-apk-release >&2
+            exit 1
           fi
 
           # Linux & Windows
