@@ -44,6 +44,21 @@ export function ActivityView({
     }
   };
 
+  const statusLabel = (status: string) => {
+    switch (status) {
+      case "completed":
+        return t.activity.completed;
+      case "failed":
+        return t.activity.failed;
+      case "cancelled":
+        return t.activity.cancelled;
+      case "rejected":
+        return t.activity.rejected;
+      default:
+        return status;
+    }
+  };
+
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between gap-3">
@@ -65,7 +80,7 @@ export function ActivityView({
       {/* Active Transfers */}
       {activeTransfers.length > 0 && (
         <GlassCard elevated className="p-5 space-y-3">
-          <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700/70 dark:text-white/55">
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
             {t.activity.active}
           </h2>
           <div className="space-y-3">
@@ -120,7 +135,7 @@ export function ActivityView({
                       {formatBytes(tr.totalBytes)}
                     </span>
                     <span>
-                      {formatSpeed(tr.speedBps)} · ETA {formatEta(tr.etaSecs)}
+                      {formatSpeed(tr.speedBps)} · {formatEta(tr.etaSecs)}
                     </span>
                   </div>
                 </div>
@@ -132,11 +147,13 @@ export function ActivityView({
 
       {/* History */}
       <GlassCard className="p-5 space-y-3">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700/70 dark:text-white/55">
-          {t.activity.history}
-        </h2>
+        {activeTransfers.length > 0 && (
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
+            {t.activity.history}
+          </h2>
+        )}
         {history.length === 0 ? (
-          <p className="py-6 text-center text-sm text-slate-700/70 dark:text-white/55">
+          <p className="py-8 text-center text-sm text-slate-700/65 dark:text-white/50">
             {t.activity.empty}
           </p>
         ) : (
@@ -168,11 +185,12 @@ export function ActivityView({
                             : "neutral"
                         }
                       >
-                        {item.status}
+                        {statusLabel(item.status)}
                       </GlassBadge>
                     </div>
                     <div className="font-mono text-xs text-slate-700/65 dark:text-white/50">
-                      {item.fileCount} files · {formatBytes(item.totalBytes)}
+                      {item.fileCount} {t.activity.filesUnit} ·{" "}
+                      {formatBytes(item.totalBytes)}
                     </div>
                   </div>
                 </div>
@@ -186,7 +204,9 @@ export function ActivityView({
                       onClick={() => handleOpenSaved(item.savedPaths)}
                     >
                       <FolderOpen className="h-4 w-4" />
-                      <span>{t.activity.openFolder}</span>
+                      <span className="hidden sm:inline">
+                        {t.activity.openFolder}
+                      </span>
                     </GlassButton>
                   )}
               </div>

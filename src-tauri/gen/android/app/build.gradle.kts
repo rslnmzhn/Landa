@@ -46,7 +46,7 @@ val hasReleaseSigning = listOf(
 ).all { !it.isNullOrBlank() }
 
 android {
-    compileSdk = 37
+    compileSdk = 36
     namespace = "dev.landa.app"
     signingConfigs {
         if (hasReleaseSigning) {
@@ -62,7 +62,7 @@ android {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "dev.landa.app"
         minSdk = 24
-        targetSdk = 37
+        targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "5000").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "0.5.0")
     }

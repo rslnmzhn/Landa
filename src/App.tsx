@@ -244,54 +244,56 @@ export function App() {
 
       {/* Main Scrollable Content */}
       <main className="safe-top mx-auto max-w-5xl px-4 pb-28 pt-6 sm:px-6">
-        {activeTab === "devices" && (
-          <DevicesView
-            t={t}
-            identity={identity}
-            peers={peers}
-            friendRequests={friendRequests}
-            leftHanded={settings?.leftHandedMode ?? false}
-            onError={(m) => showToast("error", m)}
-          />
-        )}
-        {activeTab === "shares" && (
-          <SharesView
-            t={t}
-            peers={peers}
-            enabled={sharesEnabled}
-            onError={(m) => showToast("error", m)}
-            onNotice={(m) => showToast("notice", m)}
-          />
-        )}
-        {activeTab === "clipboard" && (
-          <ClipboardView
-            t={t}
-            peers={peers}
-            enabled={clipboardEnabled}
-            refreshTick={clipboardTick}
-            onError={(m) => showToast("error", m)}
-            onNotice={(m) => showToast("notice", m)}
-          />
-        )}
-        {activeTab === "activity" && (
-          <ActivityView
-            t={t}
-            activeTransfers={activeTransferList}
-            history={history}
-            onError={(m) => showToast("error", m)}
-          />
-        )}
-        {activeTab === "settings" && settings && (
-          <SettingsView
-            t={t}
-            settings={settings}
-            modules={modules}
-            onSettingsUpdated={setSettings}
-            onModulesUpdated={setModules}
-            onError={(m) => showToast("error", m)}
-            onNotice={(m) => showToast("notice", m)}
-          />
-        )}
+        <div key={activeTab} className="animate-glass-view">
+          {activeTab === "devices" && (
+            <DevicesView
+              t={t}
+              identity={identity}
+              peers={peers}
+              friendRequests={friendRequests}
+              leftHanded={settings?.leftHandedMode ?? false}
+              onError={(m) => showToast("error", m)}
+            />
+          )}
+          {activeTab === "shares" && (
+            <SharesView
+              t={t}
+              peers={peers}
+              enabled={sharesEnabled}
+              onError={(m) => showToast("error", m)}
+              onNotice={(m) => showToast("notice", m)}
+            />
+          )}
+          {activeTab === "clipboard" && (
+            <ClipboardView
+              t={t}
+              peers={peers}
+              enabled={clipboardEnabled}
+              refreshTick={clipboardTick}
+              onError={(m) => showToast("error", m)}
+              onNotice={(m) => showToast("notice", m)}
+            />
+          )}
+          {activeTab === "activity" && (
+            <ActivityView
+              t={t}
+              activeTransfers={activeTransferList}
+              history={history}
+              onError={(m) => showToast("error", m)}
+            />
+          )}
+          {activeTab === "settings" && settings && (
+            <SettingsView
+              t={t}
+              settings={settings}
+              modules={modules}
+              onSettingsUpdated={setSettings}
+              onModulesUpdated={setModules}
+              onError={(m) => showToast("error", m)}
+              onNotice={(m) => showToast("notice", m)}
+            />
+          )}
+        </div>
       </main>
 
       {/* Floating Liquid Glass Pill Navigation */}

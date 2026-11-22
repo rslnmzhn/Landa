@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Copy, RefreshCw, Send, Trash2 } from "lucide-react";
 import { api } from "../../core/api";
 import type { ClipboardItem, PeerInfo } from "../../core/types";
@@ -8,6 +8,7 @@ import {
   GlassButton,
   GlassCard,
   GlassInput,
+  GlassSegmented,
 } from "../../components/glass/GlassPrimitives";
 
 interface ClipboardViewProps {
@@ -28,11 +29,14 @@ export function ClipboardView({
   onNotice,
 }: ClipboardViewProps) {
   const [draft, setDraft] = useState("");
+  const [targetId, setTargetId] = useState<string>("local");
   const [localItems, setLocalItems] = useState<ClipboardItem[]>([]);
-  const [selectedPeerId, setSelectedPeerId] = useState("");
   const [remoteItems, setRemoteItems] = useState<ClipboardItem[]>([]);
 
-  const trustedOnlinePeers = peers.filter((p) => p.isTrusted && p.isOnline);
+  const trustedOnlinePeers = useMemo(
+    () => peers.filter((p) => p.isTrusted && p.isOnline),
+    [peers]
+  );
 
   const loadLocal = async () => {
     try {
@@ -42,40 +46,38 @@ export function ClipboardView({
     }
   };
 
-  useEffect(() => {
-    if (enabled) {
-      loadLocal();
-    }
-  }, [enabled, refreshTick]);
-
-  const handleSaveLocal = async () => {
-    if (!draft.trim()) return;
-    try {
-      await api.clipboardPushLocalText(draft);
-      setDraft("");
-      await loadLocal();
-    } catch (e) {
-      onError(String(e));
-    }
-  };
-
-  const handleSendToPeer = async (peerId: string) => {
-    if (!draft.trim()) return;
-    try {
-      await api.clipboardSendToPeer(peerId, draft);
-      await api.clipboardPushLocalText(draft);
-      setDraft("");
-      await loadLocal();
-      onNotice(t.clipboard.copied);
-    } catch (e) {
-      onError(String(e));
-    }
-  };
-
-  const handleFetchRemote = async (peerId: string) => {
-    setSelectedPeerId(peerId);
+  const loadRemote = async (peerId: string) => {
     try {
       setRemoteItems(await api.clipboardFetchRemote(peerId));
+    } catch (e) {
+      onError(String(e));
+    }
+  };
+
+  useEffect(() => {
+    if (!enabled) return;
+    if (targetId === "local") {
+      loadLocal();
+    } else if (trustedOnlinePeers.some((p) => p.peerId === targetId)) {
+      loadRemote(targetId);
+    } else {
+      setTargetId("local");
+    }
+  }, [enabled, refreshTick, targetId, trustedOnlinePeers]);
+
+  const handleSubmit = async () => {
+    if (!draft.trim()) return;
+    try {
+      if (targetId === "local") {
+        await api.clipboardPushLocalText(draft);
+        setDraft("");
+        await loadLocal();
+      } else {
+        await api.clipboardSendToPeer(targetId, draft);
+        await api.clipboardPushLocalText(draft);
+        setDraft("");
+        onNotice(t.clipboard.sent);
+      }
     } catch (e) {
       onError(String(e));
     }
@@ -98,62 +100,81 @@ export function ClipboardView({
     );
   }
 
+  const targetOptions = [
+    { id: "local", label: t.clipboard.localTab },
+    ...trustedOnlinePeers.map((p) => ({
+      id: p.peerId,
+      label: p.displayName,
+    })),
+  ];
+
+  const visibleItems = targetId === "local" ? localItems : remoteItems;
+
   return (
     <div className="space-y-5">
-      <div>
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-2xl font-semibold tracking-tight text-slate-900/95 dark:text-white/95">
           {t.clipboard.title}
         </h1>
-        <p className="text-sm text-slate-700/70 dark:text-white/60">
-          {t.clipboard.subtitle}
-        </p>
+        {targetId !== "local" && (
+          <GlassButton
+            size="sm"
+            variant="glass"
+            onClick={() => loadRemote(targetId)}
+          >
+            <RefreshCw className="h-4 w-4" />
+          </GlassButton>
+        )}
       </div>
 
-      {/* Compose / Send */}
-      <GlassCard className="p-5 space-y-3">
-        <div className="flex flex-col gap-3 sm:flex-row">
+      {/* Single Unified Target Selector */}
+      {targetOptions.length > 1 && (
+        <div className="overflow-x-auto pb-1">
+          <GlassSegmented
+            options={targetOptions}
+            value={targetId}
+            onChange={setTargetId}
+          />
+        </div>
+      )}
+
+      {/* Compose */}
+      <GlassCard className="p-4">
+        <div className="flex gap-2">
           <GlassInput
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder={t.clipboard.inputPlaceholder}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") handleSubmit();
+            }}
           />
-          <GlassButton variant="primary" onClick={handleSaveLocal}>
-            {t.clipboard.saveLocal}
+          <GlassButton
+            variant="primary"
+            disabled={!draft.trim()}
+            onClick={handleSubmit}
+          >
+            {targetId === "local" ? (
+              <span>{t.clipboard.saveLocal}</span>
+            ) : (
+              <>
+                <Send className="h-4 w-4" />
+                <span className="hidden sm:inline">{t.clipboard.send}</span>
+              </>
+            )}
           </GlassButton>
         </div>
-
-        {trustedOnlinePeers.length > 0 && (
-          <div className="flex flex-wrap items-center gap-2 pt-1">
-            <span className="text-xs text-slate-700/70 dark:text-white/55">
-              {t.clipboard.sendTo}:
-            </span>
-            {trustedOnlinePeers.map((p) => (
-              <GlassButton
-                key={p.peerId}
-                size="sm"
-                disabled={!draft.trim()}
-                onClick={() => handleSendToPeer(p.peerId)}
-              >
-                <Send className="h-3.5 w-3.5" />
-                <span>{p.displayName}</span>
-              </GlassButton>
-            ))}
-          </div>
-        )}
       </GlassCard>
 
-      {/* Local History */}
-      <GlassCard className="p-5 space-y-3">
-        <h2 className="text-base font-semibold text-slate-900/90 dark:text-white/90">
-          {t.clipboard.localHistory}
-        </h2>
-        {localItems.length === 0 ? (
-          <p className="text-sm text-slate-700/70 dark:text-white/55">
+      {/* Items List */}
+      <GlassCard className="p-4">
+        {visibleItems.length === 0 ? (
+          <p className="py-6 text-center text-sm text-slate-700/65 dark:text-white/50">
             {t.clipboard.empty}
           </p>
         ) : (
           <div className="space-y-2">
-            {localItems.map((item) => (
+            {visibleItems.map((item) => (
               <div
                 key={item.id}
                 className="flex items-center justify-between gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-3"
@@ -162,7 +183,7 @@ export function ClipboardView({
                   <p className="line-clamp-2 break-all text-sm text-slate-900/90 dark:text-white/90">
                     {item.text}
                   </p>
-                  {item.sourcePeerName && (
+                  {targetId === "local" && item.sourcePeerName && (
                     <div className="mt-1">
                       <GlassBadge tone="accent">
                         {item.sourcePeerName}
@@ -178,68 +199,24 @@ export function ClipboardView({
                   >
                     <Copy className="h-4 w-4" />
                   </GlassButton>
-                  <GlassButton
-                    size="sm"
-                    variant="ghost"
-                    onClick={async () => {
-                      await api.clipboardDeleteLocal(item.id);
-                      await loadLocal();
-                    }}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </GlassButton>
+                  {targetId === "local" && (
+                    <GlassButton
+                      size="sm"
+                      variant="ghost"
+                      onClick={async () => {
+                        await api.clipboardDeleteLocal(item.id);
+                        await loadLocal();
+                      }}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </GlassButton>
+                  )}
                 </div>
               </div>
             ))}
           </div>
         )}
       </GlassCard>
-
-      {/* Remote Friend Clipboard */}
-      {trustedOnlinePeers.length > 0 && (
-        <GlassCard className="p-5 space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <h2 className="text-base font-semibold text-slate-900/90 dark:text-white/90">
-              {t.clipboard.remoteTitle}
-            </h2>
-            <div className="flex flex-wrap gap-2">
-              {trustedOnlinePeers.map((p) => (
-                <GlassButton
-                  key={p.peerId}
-                  size="sm"
-                  variant={selectedPeerId === p.peerId ? "primary" : "glass"}
-                  onClick={() => handleFetchRemote(p.peerId)}
-                >
-                  <RefreshCw className="h-3.5 w-3.5" />
-                  <span>{p.displayName}</span>
-                </GlassButton>
-              ))}
-            </div>
-          </div>
-
-          {remoteItems.length > 0 && (
-            <div className="space-y-2">
-              {remoteItems.map((item) => (
-                <div
-                  key={item.id}
-                  className="flex items-center justify-between gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-3"
-                >
-                  <p className="line-clamp-2 break-all text-sm text-slate-900/90 dark:text-white/90">
-                    {item.text}
-                  </p>
-                  <GlassButton
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => copyText(item.text)}
-                  >
-                    <Copy className="h-4 w-4" />
-                  </GlassButton>
-                </div>
-              ))}
-            </div>
-          )}
-        </GlassCard>
-      )}
     </div>
   );
 }

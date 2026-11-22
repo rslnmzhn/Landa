@@ -91,43 +91,43 @@ export function DevicesView({
 
   return (
     <div className="space-y-5">
-      {/* Header */}
+      {/* Minimal Header */}
       <div
-        className={`flex flex-wrap items-center justify-between gap-3 ${
+        className={`flex items-center justify-between gap-3 ${
           leftHanded ? "flex-row-reverse" : ""
         }`}
       >
-        <div>
+        <div className="flex items-center gap-3 min-w-0">
           <h1 className="text-2xl font-semibold tracking-tight text-slate-900/95 dark:text-white/95">
             {t.devices.title}
           </h1>
-          <p className="text-sm text-slate-700/70 dark:text-white/60">
-            {t.devices.subtitle}
-          </p>
-        </div>
-
-        <div className="flex items-center gap-2">
           {identity && (
             <GlassBadge tone="neutral">
               <span className="h-2 w-2 rounded-full bg-emerald-400" />
-              <span className="font-mono text-xs">
-                {identity.deviceName} · {identity.peerId.slice(0, 8)}
+              <span className="truncate max-w-[140px] text-xs">
+                {identity.deviceName}
               </span>
             </GlassBadge>
           )}
-          <GlassButton onClick={handleScan} size="sm">
-            <RefreshCw
-              className={`h-4 w-4 ${scanning ? "animate-spin" : ""}`}
-            />
-            <span>{t.devices.scan}</span>
-          </GlassButton>
         </div>
+
+        <GlassButton
+          onClick={handleScan}
+          size="sm"
+          title={t.devices.scan}
+          aria-label={t.devices.scan}
+        >
+          <RefreshCw
+            className={`h-4 w-4 ${scanning ? "animate-spin" : ""}`}
+          />
+          <span className="hidden sm:inline">{t.devices.scan}</span>
+        </GlassButton>
       </div>
 
       {/* Pending Friend Requests */}
       {friendRequests.length > 0 && (
-        <GlassCard elevated className="p-4 space-y-3">
-          <div className="text-xs font-semibold uppercase tracking-wider text-slate-700/70 dark:text-white/55">
+        <GlassCard elevated className="p-4 space-y-2.5">
+          <div className="text-xs font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
             {t.devices.requestsTitle}
           </div>
           <div className="space-y-2">
@@ -148,7 +148,7 @@ export function DevicesView({
                     </span>
                     <span>·</span>
                     <span className="font-mono">
-                      {t.devices.sasLabel}: {req.sasCode}
+                      {t.devices.sasLabel} {req.sasCode}
                     </span>
                   </div>
                 </div>
@@ -187,27 +187,23 @@ export function DevicesView({
 
       {/* Device Grid */}
       {peers.length === 0 ? (
-        <GlassCard className="flex flex-col items-center justify-center px-6 py-14 text-center">
-          <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-indigo-500/20 border border-indigo-400/30">
-            <Wifi className="h-7 w-7 text-indigo-600 dark:text-indigo-300" />
+        <GlassCard className="flex flex-col items-center justify-center px-6 py-16 text-center">
+          <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-indigo-500/15 border border-indigo-400/25">
+            <Wifi className="h-6 w-6 text-indigo-600 dark:text-indigo-300" />
           </div>
-          <h3 className="text-lg font-medium text-slate-900/90 dark:text-white/90">
+          <h3 className="text-base font-medium text-slate-900/90 dark:text-white/90">
             {t.devices.emptyTitle}
           </h3>
-          <p className="mt-1 max-w-md text-sm text-slate-700/70 dark:text-white/55">
+          <p className="mt-1 max-w-sm text-xs text-slate-700/65 dark:text-white/50">
             {t.devices.emptyDesc}
           </p>
-          <GlassButton className="mt-5" variant="primary" onClick={handleScan}>
-            <RefreshCw className="h-4 w-4" />
-            <span>{t.devices.scan}</span>
-          </GlassButton>
         </GlassCard>
       ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           {peers.map((peer) => (
             <GlassCard
               key={peer.peerId}
-              className="flex flex-col justify-between gap-4 p-5 hover:bg-white/20 dark:hover:bg-white/[0.11]"
+              className="flex flex-col justify-between gap-4 p-5 hover:bg-white/20 dark:hover:bg-white/[0.1]"
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-center gap-3.5 min-w-0">
@@ -224,7 +220,7 @@ export function DevicesView({
                     />
                   </div>
                   <div className="min-w-0">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1.5">
                       <h3 className="truncate text-base font-semibold text-slate-900/95 dark:text-white/95">
                         {peer.displayName}
                       </h3>
@@ -235,35 +231,28 @@ export function DevicesView({
                           setRenameTarget(peer);
                           setAliasDraft(peer.aliasName ?? peer.deviceName);
                         }}
-                        className="rounded-full p-1.5 text-slate-600/70 dark:text-white/45 hover:bg-white/20 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white"
+                        className="rounded-full p-1.5 text-slate-600/65 dark:text-white/40 hover:bg-white/20 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white"
                       >
                         <Edit3 className="h-3.5 w-3.5" />
                       </button>
                     </div>
-                    <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-slate-700/70 dark:text-white/55 font-mono">
+                    <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-700/65 dark:text-white/50 font-mono">
                       <span>{peer.ip ?? "—"}</span>
                       <span>·</span>
                       <span className="uppercase">{peer.os}</span>
-                      <span>·</span>
-                      <span>SAS {peer.sasCode}</span>
                     </div>
                   </div>
                 </div>
 
-                <div className="flex flex-col items-end gap-1.5 shrink-0">
-                  {peer.isTrusted && (
-                    <GlassBadge tone="success">
-                      <ShieldCheck className="h-3.5 w-3.5" />
-                      <span>{t.devices.friend}</span>
-                    </GlassBadge>
-                  )}
-                  <GlassBadge tone={peer.isOnline ? "accent" : "neutral"}>
-                    {peer.isOnline ? t.devices.online : t.devices.offline}
+                {peer.isTrusted && (
+                  <GlassBadge tone="success">
+                    <ShieldCheck className="h-3.5 w-3.5" />
+                    <span>{t.devices.friend}</span>
                   </GlassBadge>
-                </div>
+                )}
               </div>
 
-              <div className="flex flex-wrap items-center gap-2 pt-1">
+              <div className="flex items-center gap-2">
                 <GlassButton
                   variant="primary"
                   size="sm"
@@ -278,10 +267,10 @@ export function DevicesView({
                   variant="glass"
                   size="sm"
                   disabled={!peer.isOnline}
+                  title={t.devices.sendFolder}
                   onClick={() => handleSendFiles(peer.peerId, true)}
                 >
                   <FolderUp className="h-4 w-4" />
-                  <span>{t.devices.sendFolder}</span>
                 </GlassButton>
                 {peer.isTrusted ? (
                   <GlassButton

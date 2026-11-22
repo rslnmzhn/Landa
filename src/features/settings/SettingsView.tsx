@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Plus, Trash2 } from "lucide-react";
+import { FolderOpen, Plus, Trash2 } from "lucide-react";
 import { api } from "../../core/api";
 import type { AppSettings, ManualTarget, ModuleStatus } from "../../core/types";
 import type { TranslationDict } from "../../i18n/translations";
@@ -8,6 +8,7 @@ import {
   GlassButton,
   GlassCard,
   GlassInput,
+  GlassSegmented,
   GlassToggle,
 } from "../../components/glass/GlassPrimitives";
 
@@ -50,14 +51,21 @@ export function SettingsView({
     loadTargets();
   }, []);
 
-  const save = async (next: AppSettings) => {
+  const save = async (next: AppSettings, notify = false) => {
     setDraft(next);
     try {
       const saved = await api.updateSettings(next);
       onSettingsUpdated(saved);
+      if (notify) onNotice(t.settings.saved);
     } catch (e) {
       onError(String(e));
     }
+  };
+
+  const commitDeviceName = () => {
+    const trimmed = draft.deviceName.trim();
+    if (!trimmed || trimmed === settings.deviceName) return;
+    save({ ...draft, deviceName: trimmed }, true);
   };
 
   const handlePickDownloadDir = async () => {
@@ -100,44 +108,40 @@ export function SettingsView({
         {t.settings.title}
       </h1>
 
-      {/* Device & Network */}
+      {/* Device & Behavior */}
       <GlassCard className="p-5 space-y-4">
-        <h2 className="text-base font-semibold text-slate-900/90 dark:text-white/90">
-          {t.settings.identity}
-        </h2>
-
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium text-slate-700/75 dark:text-white/60">
-            {t.settings.deviceName}
-          </label>
-          <div className="flex gap-2">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-slate-700/70 dark:text-white/55">
+              {t.settings.deviceName}
+            </label>
             <GlassInput
               value={draft.deviceName}
               onChange={(e) =>
                 setDraft({ ...draft, deviceName: e.target.value })
               }
-            />
-            <GlassButton
-              variant="primary"
-              onClick={async () => {
-                await save(draft);
-                onNotice(t.settings.saved);
+              onBlur={commitDeviceName}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.currentTarget.blur();
+                }
               }}
-            >
-              {t.settings.save}
-            </GlassButton>
+            />
           </div>
-        </div>
 
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium text-slate-700/75 dark:text-white/60">
-            {t.settings.downloadDir}
-          </label>
-          <div className="flex gap-2">
-            <GlassInput value={draft.downloadDir} readOnly />
-            <GlassButton onClick={handlePickDownloadDir}>
-              {t.settings.chooseDir}
-            </GlassButton>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-slate-700/70 dark:text-white/55">
+              {t.settings.downloadDir}
+            </label>
+            <div className="flex gap-2">
+              <GlassInput value={draft.downloadDir} readOnly />
+              <GlassButton
+                onClick={handlePickDownloadDir}
+                title={t.settings.chooseDir}
+              >
+                <FolderOpen className="h-4 w-4" />
+              </GlassButton>
+            </div>
           </div>
         </div>
 
@@ -146,85 +150,56 @@ export function SettingsView({
             checked={draft.autoAcceptFromFriends}
             onChange={(v) => save({ ...draft, autoAcceptFromFriends: v })}
             label={t.settings.autoAccept}
-            description={t.settings.autoAcceptDesc}
           />
           <GlassToggle
             checked={draft.minimizeToTray}
             onChange={(v) => save({ ...draft, minimizeToTray: v })}
             label={t.settings.minimizeToTray}
-            description={t.settings.minimizeToTrayDesc}
           />
           <GlassToggle
             checked={draft.leftHandedMode}
             onChange={(v) => save({ ...draft, leftHandedMode: v })}
             label={t.settings.leftHanded}
-            description={t.settings.leftHandedDesc}
           />
         </div>
 
-        {/* Theme & Language */}
-        <div className="grid grid-cols-1 gap-4 pt-2 sm:grid-cols-2">
-          <div className="space-y-2">
-            <div className="text-xs font-medium text-slate-700/75 dark:text-white/60">
+        {/* Theme & Language with Sliding Liquid Glass Segmented Controls */}
+        <div className="grid grid-cols-1 gap-4 pt-1 sm:grid-cols-2">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-sm font-medium text-slate-900/90 dark:text-white/90">
               {t.settings.theme}
-            </div>
-            <div className="flex gap-2">
-              <GlassButton
-                size="sm"
-                variant={draft.theme === "dark" ? "primary" : "glass"}
-                onClick={() => save({ ...draft, theme: "dark" })}
-                className="flex-1"
-              >
-                {t.settings.themeDark}
-              </GlassButton>
-              <GlassButton
-                size="sm"
-                variant={draft.theme === "light" ? "primary" : "glass"}
-                onClick={() => save({ ...draft, theme: "light" })}
-                className="flex-1"
-              >
-                {t.settings.themeLight}
-              </GlassButton>
-            </div>
+            </span>
+            <GlassSegmented
+              options={[
+                { id: "dark", label: t.settings.themeDark },
+                { id: "light", label: t.settings.themeLight },
+              ]}
+              value={draft.theme === "light" ? "light" : "dark"}
+              onChange={(v) => save({ ...draft, theme: v as "dark" | "light" })}
+            />
           </div>
 
-          <div className="space-y-2">
-            <div className="text-xs font-medium text-slate-700/75 dark:text-white/60">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-sm font-medium text-slate-900/90 dark:text-white/90">
               {t.settings.language}
-            </div>
-            <div className="flex gap-2">
-              <GlassButton
-                size="sm"
-                variant={draft.language === "ru" ? "primary" : "glass"}
-                onClick={() => save({ ...draft, language: "ru" })}
-                className="flex-1"
-              >
-                Русский
-              </GlassButton>
-              <GlassButton
-                size="sm"
-                variant={draft.language === "en" ? "primary" : "glass"}
-                onClick={() => save({ ...draft, language: "en" })}
-                className="flex-1"
-              >
-                English
-              </GlassButton>
-            </div>
+            </span>
+            <GlassSegmented
+              options={[
+                { id: "ru", label: "RU" },
+                { id: "en", label: "EN" },
+              ]}
+              value={draft.language === "en" ? "en" : "ru"}
+              onChange={(v) => save({ ...draft, language: v as "ru" | "en" })}
+            />
           </div>
         </div>
       </GlassCard>
 
       {/* Modular Features */}
-      <GlassCard className="p-5 space-y-3">
-        <div>
-          <h2 className="text-base font-semibold text-slate-900/90 dark:text-white/90">
-            {t.settings.modules}
-          </h2>
-          <p className="text-xs text-slate-700/70 dark:text-white/55">
-            {t.settings.modulesDesc}
-          </p>
-        </div>
-
+      <GlassCard className="p-5 space-y-2">
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
+          {t.settings.modules}
+        </h2>
         <div className="divide-y divide-white/15 dark:divide-white/10">
           {modules.map((mod) => {
             const label =
@@ -233,19 +208,12 @@ export function SettingsView({
                 : mod.id === "clipboard"
                 ? t.settings.modClipboard
                 : mod.id;
-            const desc =
-              mod.id === "shares"
-                ? t.settings.modSharesDesc
-                : mod.id === "clipboard"
-                ? t.settings.modClipboardDesc
-                : undefined;
             return (
               <GlassToggle
                 key={mod.id}
                 checked={mod.enabled}
                 onChange={(v) => handleToggleModule(mod.id, v)}
                 label={label}
-                description={desc}
               />
             );
           })}
@@ -254,7 +222,7 @@ export function SettingsView({
 
       {/* Manual IP Targets */}
       <GlassCard className="p-5 space-y-3">
-        <h2 className="text-base font-semibold text-slate-900/90 dark:text-white/90">
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
           {t.settings.manualTargets}
         </h2>
         <div className="flex gap-2">
@@ -268,7 +236,6 @@ export function SettingsView({
           />
           <GlassButton variant="primary" onClick={handleAddIp}>
             <Plus className="h-4 w-4" />
-            <span>{t.settings.addIp}</span>
           </GlassButton>
         </div>
 
@@ -277,7 +244,7 @@ export function SettingsView({
             {targets.map((target) => (
               <div
                 key={target.ip}
-                className="flex items-center justify-between rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2.5"
+                className="flex items-center justify-between rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2"
               >
                 <span className="font-mono text-sm text-slate-900/90 dark:text-white/90">
                   {target.ip}

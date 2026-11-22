@@ -4,9 +4,9 @@ import {
   ArrowLeft,
   Download,
   File,
+  FilePlus,
   Folder,
   FolderPlus,
-  FilePlus,
   Trash2,
 } from "lucide-react";
 import { api, formatBytes } from "../../core/api";
@@ -21,6 +21,7 @@ import {
   GlassBadge,
   GlassButton,
   GlassCard,
+  GlassSegmented,
 } from "../../components/glass/GlassPrimitives";
 
 interface SharesViewProps {
@@ -161,19 +162,14 @@ export function SharesView({
 
   return (
     <div className="space-y-5">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight text-slate-900/95 dark:text-white/95">
-          {t.shares.title}
-        </h1>
-        <p className="text-sm text-slate-700/70 dark:text-white/60">
-          {t.shares.subtitle}
-        </p>
-      </div>
+      <h1 className="text-2xl font-semibold tracking-tight text-slate-900/95 dark:text-white/95">
+        {t.shares.title}
+      </h1>
 
       {/* My Shared Folders */}
-      <GlassCard className="p-5 space-y-4">
+      <GlassCard className="p-5 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-base font-semibold text-slate-900/90 dark:text-white/90">
+          <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
             {t.shares.myShares}
           </h2>
           <div className="flex items-center gap-2">
@@ -189,7 +185,7 @@ export function SharesView({
         </div>
 
         {localShares.length === 0 ? (
-          <p className="text-sm text-slate-700/70 dark:text-white/55">
+          <p className="text-sm text-slate-700/65 dark:text-white/50">
             {t.shares.noLocalShares}
           </p>
         ) : (
@@ -197,7 +193,7 @@ export function SharesView({
             {localShares.map((root) => (
               <div
                 key={root.id}
-                className="flex items-center justify-between gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-3"
+                className="flex items-center justify-between gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2.5"
               >
                 <div className="flex items-center gap-3 min-w-0">
                   {root.isDir ? (
@@ -205,14 +201,9 @@ export function SharesView({
                   ) : (
                     <File className="h-5 w-5 shrink-0 text-sky-500 dark:text-sky-300" />
                   )}
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
-                      {root.name}
-                    </div>
-                    <div className="truncate font-mono text-xs text-slate-700/65 dark:text-white/45">
-                      {root.path}
-                    </div>
-                  </div>
+                  <span className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
+                    {root.name}
+                  </span>
                 </div>
                 <GlassButton
                   variant="ghost"
@@ -233,35 +224,31 @@ export function SharesView({
       {/* Friends' Shares */}
       <GlassCard className="p-5 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-base font-semibold text-slate-900/90 dark:text-white/90">
+          <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
             {t.shares.friendShares}
           </h2>
           {trustedOnlinePeers.length > 0 && (
-            <div className="flex flex-wrap gap-2">
-              {trustedOnlinePeers.map((p) => (
-                <GlassButton
-                  key={p.peerId}
-                  size="sm"
-                  variant={selectedPeerId === p.peerId ? "primary" : "glass"}
-                  onClick={() => handleSelectPeer(p.peerId)}
-                >
-                  {p.displayName}
-                </GlassButton>
-              ))}
-            </div>
+            <GlassSegmented
+              options={trustedOnlinePeers.map((p) => ({
+                id: p.peerId,
+                label: p.displayName,
+              }))}
+              value={selectedPeerId}
+              onChange={handleSelectPeer}
+            />
           )}
         </div>
 
         {trustedOnlinePeers.length === 0 ? (
-          <p className="text-sm text-slate-700/70 dark:text-white/55">
+          <p className="text-sm text-slate-700/65 dark:text-white/50">
             {t.shares.noFriends}
           </p>
         ) : !selectedPeerId ? (
-          <p className="text-sm text-slate-700/70 dark:text-white/55">
+          <p className="text-sm text-slate-700/65 dark:text-white/50">
             {t.shares.selectFriend}
           </p>
         ) : loading ? (
-          <div className="py-6 text-center text-sm text-slate-700/70 dark:text-white/55">
+          <div className="py-6 text-center text-sm text-slate-700/65 dark:text-white/50">
             ...
           </div>
         ) : !activeRoot ? (
@@ -300,7 +287,7 @@ export function SharesView({
             </div>
 
             {entries.length === 0 ? (
-              <p className="text-sm text-slate-700/70 dark:text-white/55">
+              <p className="text-sm text-slate-700/65 dark:text-white/50">
                 {t.shares.emptyDir}
               </p>
             ) : (
@@ -339,9 +326,6 @@ export function SharesView({
                         onClick={() => handleDownload(entry)}
                       >
                         <Download className="h-4 w-4" />
-                        <span className="hidden sm:inline">
-                          {t.shares.download}
-                        </span>
                       </GlassButton>
                     )}
                   </div>
