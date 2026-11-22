@@ -77,6 +77,13 @@ export function DevicesView({
 
   const handleSendFiles = async (peerId: string, directory: boolean) => {
     try {
+      const isAndroid =
+        identity?.os === "android" ||
+        navigator.userAgent.toLowerCase().includes("android");
+      if (directory && isAndroid) {
+        await api.sendFolderAndroid(peerId);
+        return;
+      }
       const selected = await open({
         multiple: !directory,
         directory,

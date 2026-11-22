@@ -19,16 +19,19 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
 import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.webkit.MimeTypeMap
 import android.webkit.WebView
+import androidx.activity.result.ActivityResult
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
@@ -85,6 +88,11 @@ class InstallApkArgs {
     lateinit var apkPath: String
 }
 
+@InvokeArg
+class OpenContentUriArgs {
+    lateinit var uri: String
+}
+
 @TauriPlugin
 class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     private var multicastLock: WifiManager.MulticastLock? = null
@@ -100,6 +108,8 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         private const val CHANNEL_PROGRESS = "landa_transfer_progress"
         private const val CHANNEL_DONE = "landa_transfer_done"
         private const val REQ_STARTUP_PERMS = 1002
+        private const val MAX_FOLDER_FILES = 10_000
+        private const val MAX_FOLDER_DEPTH = 32
     }
 
     init {
@@ -433,6 +443,268 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         val res = JSObject()
         res.put("paths", arr)
         invoke.resolve(res)
+    }
+
+    @Command
+    fun pickFolderForSend(invoke: Invoke) {
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                )
+            }
+            startActivityForResult(invoke, intent, "pickFolderForSendResult")
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to open folder picker")
+        }
+    }
+
+    @ActivityCallback
+    fun pickFolderForSendResult(invoke: Invoke, result: ActivityResult) {
+        if (result.resultCode == Activity.RESULT_CANCELED) {
+            val res = JSObject()
+            res.put("cancelled", true)
+            res.put("items", JSArray())
+            invoke.resolve(res)
+            return
+        }
+        if (result.resultCode != Activity.RESULT_OK) {
+            invoke.reject("Folder picker failed")
+            return
+        }
+        val treeUri = result.data?.data
+        if (treeUri == null) {
+            val res = JSObject()
+            res.put("cancelled", true)
+            res.put("items", JSArray())
+            invoke.resolve(res)
+            return
+        }
+
+        runCatching {
+            activity.contentResolver.takePersistableUriPermission(
+                treeUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
+
+        Thread {
+            try {
+                val collected = collectSafTreeFiles(treeUri)
+                val arr = JSArray()
+                for (item in collected) {
+                    val obj = JSObject()
+                    obj.put("uri", item.uri)
+                    obj.put("relativePath", item.relativePath)
+                    obj.put("sizeBytes", item.sizeBytes)
+                    arr.put(obj)
+                }
+                val res = JSObject()
+                res.put("cancelled", false)
+                res.put("items", arr)
+                invoke.resolve(res)
+            } catch (ex: Exception) {
+                invoke.reject(ex.message ?: "Failed to read selected folder")
+            }
+        }.start()
+    }
+
+    @Command
+    fun openContentUriFd(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(OpenContentUriArgs::class.java)
+            if (!args.uri.startsWith("content://")) {
+                invoke.reject("Only content:// URIs are supported")
+                return
+            }
+            val parsed = Uri.parse(args.uri)
+            val pfd = activity.contentResolver.openFileDescriptor(parsed, "r")
+            if (pfd == null) {
+                invoke.reject("Unable to open content URI")
+                return
+            }
+            val fd = pfd.detachFd()
+            val res = JSObject()
+            res.put("fd", fd)
+            invoke.resolve(res)
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to open content URI")
+        }
+    }
+
+    @Command
+    fun getContentUriMeta(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(OpenContentUriArgs::class.java)
+            if (!args.uri.startsWith("content://")) {
+                invoke.reject("Only content:// URIs are supported")
+                return
+            }
+            val parsed = Uri.parse(args.uri)
+            var name: String? = null
+            var sizeBytes = -1L
+            activity.contentResolver.query(
+                parsed,
+                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (nameIdx >= 0) name = cursor.getString(nameIdx)
+                    if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) sizeBytes = cursor.getLong(sizeIdx)
+                }
+            }
+            if (sizeBytes < 0L) {
+                sizeBytes = runCatching {
+                    activity.contentResolver.openFileDescriptor(parsed, "r")?.use { it.statSize } ?: 0L
+                }.getOrDefault(0L)
+            }
+            val mimeType = activity.contentResolver.getType(parsed) ?: "application/octet-stream"
+            val res = JSObject()
+            res.put("name", name ?: "file")
+            res.put("sizeBytes", sizeBytes.coerceAtLeast(0L))
+            res.put("mimeType", mimeType)
+            invoke.resolve(res)
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to query content URI metadata")
+        }
+    }
+
+    @Command
+    fun openFileExternal(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(OpenContentUriArgs::class.java)
+            val target = args.uri.trim()
+            if (target.isEmpty()) {
+                invoke.reject("Empty path")
+                return
+            }
+            val intent = if (target.startsWith("content://")) {
+                val parsed = Uri.parse(target)
+                val mime = activity.contentResolver.getType(parsed) ?: "*/*"
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(parsed, mime)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            } else {
+                val file = File(target).canonicalFile
+                if (!file.exists() || !file.isFile) {
+                    invoke.reject("File not found")
+                    return
+                }
+                val uri = FileProvider.getUriForFile(
+                    activity,
+                    "${activity.packageName}.fileprovider",
+                    file
+                )
+                val ext = file.extension.lowercase()
+                val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, mime)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+            activity.startActivity(intent)
+            invoke.resolve()
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "No app found to open this file")
+        }
+    }
+
+    private data class SafFileEntry(
+        val uri: String,
+        val relativePath: String,
+        val sizeBytes: Long
+    )
+
+    private fun collectSafTreeFiles(treeUri: Uri): List<SafFileEntry> {
+        val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        val rootDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId)
+        val rawRootName = queryDisplayName(rootDocUri) ?: "folder"
+        val rootName = sanitizeSegment(rawRootName).ifEmpty { "folder" }
+
+        val out = mutableListOf<SafFileEntry>()
+        walkSafDirectory(treeUri, rootDocId, rootName, 0, out)
+        return out
+    }
+
+    private fun walkSafDirectory(
+        treeUri: Uri,
+        parentDocId: String,
+        prefixPath: String,
+        depth: Int,
+        out: MutableList<SafFileEntry>
+    ) {
+        if (depth > MAX_FOLDER_DEPTH || out.size >= MAX_FOLDER_FILES) {
+            return
+        }
+
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_FLAGS
+        )
+
+        activity.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+            val flagsIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
+
+            while (cursor.moveToNext() && out.size < MAX_FOLDER_FILES) {
+                if (idIdx < 0) continue
+                val docId = cursor.getString(idIdx) ?: continue
+                val rawName = if (nameIdx >= 0) cursor.getString(nameIdx) else null
+                val safeName = sanitizeSegment(rawName ?: "item")
+                if (safeName.isEmpty()) continue
+
+                val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else null
+                val flags = if (flagsIdx >= 0 && !cursor.isNull(flagsIdx)) cursor.getInt(flagsIdx) else 0
+                val isVirtual = (flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) != 0
+                if (isVirtual) continue
+
+                val nextRel = "$prefixPath/$safeName"
+                if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                    walkSafDirectory(treeUri, docId, nextRel, depth + 1, out)
+                } else {
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                    var size = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                        cursor.getLong(sizeIdx)
+                    } else {
+                        -1L
+                    }
+                    if (size < 0L) {
+                        size = runCatching {
+                            activity.contentResolver.openFileDescriptor(docUri, "r")?.use { it.statSize } ?: -1L
+                        }.getOrDefault(-1L)
+                    }
+                    if (size < 0L) continue
+                    out.add(
+                        SafFileEntry(
+                            uri = docUri.toString(),
+                            relativePath = nextRel,
+                            sizeBytes = size
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private fun sanitizeSegment(raw: String): String {
+        val cleaned = raw.trim()
+            .replace('/', '_')
+            .replace('\\', '_')
+            .replace('\u0000', '_')
+        return if (cleaned == "." || cleaned == "..") "" else cleaned
     }
 
     @Command

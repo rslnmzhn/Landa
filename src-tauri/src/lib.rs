@@ -3,6 +3,7 @@ mod android_bridge;
 mod commands;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod desktop;
+mod preview;
 mod updater;
 
 use std::sync::Arc;
@@ -91,6 +92,9 @@ pub fn run() {
                 engine.set_receive_publish_hook(android_bridge::make_publish_hook(
                     app.handle().clone(),
                 ));
+                engine.set_open_source_hook(android_bridge::make_open_source_hook(
+                    app.handle().clone(),
+                ));
             }
 
             // Start background discovery & QUIC accept loops inside Tauri's async runtime
@@ -151,6 +155,17 @@ pub fn run() {
                 desktop::setup_tray_and_window(app.handle(), Arc::clone(&engine))?;
             }
 
+            let preview_server = tauri::async_runtime::block_on(preview::PreviewServer::start(
+                app.handle().clone(),
+            ))
+            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error>)?;
+            app.manage(preview_server);
+
+            let app_for_sweep = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                preview::sweep_old_preview_cache(&app_for_sweep).await;
+            });
+
             app.manage(AppState {
                 engine,
                 #[cfg(feature = "mod-shares")]
@@ -171,6 +186,7 @@ pub fn run() {
             commands::respond_friend_request,
             commands::unfriend,
             commands::send_files,
+            commands::send_folder_android,
             commands::respond_transfer_offer,
             commands::cancel_transfer,
             commands::list_history,
@@ -188,6 +204,8 @@ pub fn run() {
             commands::shares_browse_remote_roots,
             commands::shares_browse_remote_dir,
             commands::shares_download_remote_file,
+            commands::shares_preview_remote_file,
+            commands::shares_get_remote_thumbnail,
             commands::clipboard_list_local,
             commands::clipboard_push_local_text,
             commands::clipboard_delete_local,
@@ -200,6 +218,8 @@ pub fn run() {
             commands::check_for_updates,
             commands::download_update,
             commands::install_update,
+            commands::prepare_file_preview,
+            commands::open_file_external,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Landa");

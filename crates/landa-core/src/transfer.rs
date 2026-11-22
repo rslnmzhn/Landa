@@ -29,11 +29,13 @@ const OFFER_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug, Clone)]
 pub struct OutgoingFileItem {
     pub source_path: PathBuf,
+    pub source_uri: Option<String>,
     pub relative_path: String,
     pub size_bytes: u64,
 }
 
 pub type ReceivePublishHook = Arc<dyn Fn(&Path, &Path) -> Option<String> + Send + Sync>;
+pub type OpenSourceHook = Arc<dyn Fn(&str) -> Option<std::fs::File> + Send + Sync>;
 
 pub struct TransferManager {
     storage: Arc<Storage>,
@@ -42,6 +44,7 @@ pub struct TransferManager {
     pending_offers: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     active_cancellations: Mutex<HashMap<String, CancellationToken>>,
     publish_hook: RwLock<Option<ReceivePublishHook>>,
+    open_source_hook: RwLock<Option<OpenSourceHook>>,
 }
 
 impl TransferManager {
@@ -57,11 +60,19 @@ impl TransferManager {
             pending_offers: Mutex::new(HashMap::new()),
             active_cancellations: Mutex::new(HashMap::new()),
             publish_hook: RwLock::new(None),
+            open_source_hook: RwLock::new(None),
         }
     }
 
     pub fn set_publish_hook(&self, hook: ReceivePublishHook) {
         *self.publish_hook.write().expect("publish_hook lock poisoned") = Some(hook);
+    }
+
+    pub fn set_open_source_hook(&self, hook: OpenSourceHook) {
+        *self
+            .open_source_hook
+            .write()
+            .expect("open_source_hook lock poisoned") = Some(hook);
     }
 
     pub fn respond_to_offer(&self, transfer_id: &str, accept: bool) -> Result<(), CoreError> {
@@ -104,6 +115,7 @@ impl TransferManager {
                 let meta = std::fs::metadata(path)?;
                 items.push(OutgoingFileItem {
                     source_path: path.clone(),
+                    source_uri: None,
                     relative_path: rel.to_string_lossy().replace('\\', "/"),
                     size_bytes: meta.len(),
                 });
@@ -246,7 +258,24 @@ impl TransferManager {
         let mut buf = vec![0u8; CHUNK_SIZE];
 
         for (idx, item) in items.iter().enumerate() {
-            let mut file = tokio::fs::File::open(&item.source_path).await?;
+            let mut file = if let Some(ref uri) = item.source_uri {
+                let hook = self
+                    .open_source_hook
+                    .read()
+                    .expect("open_source_hook lock poisoned")
+                    .clone()
+                    .ok_or_else(|| {
+                        CoreError::InvalidInput("content URI source hook not configured".into())
+                    })?;
+                let uri_owned = uri.clone();
+                let std_file = tokio::task::spawn_blocking(move || hook(&uri_owned))
+                    .await
+                    .map_err(|e| CoreError::Io(std::io::Error::other(e)))?
+                    .ok_or_else(|| CoreError::NotFound(format!("unable to open {uri}")))?;
+                tokio::fs::File::from_std(std_file)
+            } else {
+                tokio::fs::File::open(&item.source_path).await?
+            };
             let mut hasher = blake3::Hasher::new();
             let mut remaining = item.size_bytes;
 
@@ -666,6 +695,7 @@ fn collect_dir_recursive(
             let meta = entry.metadata()?;
             out.push(OutgoingFileItem {
                 source_path: path,
+                source_uri: None,
                 relative_path: sanitized.to_string_lossy().replace('\\', "/"),
                 size_bytes: meta.len(),
             });

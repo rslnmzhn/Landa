@@ -1,7 +1,11 @@
+import { useState } from "react";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   ArrowDownLeft,
   ArrowUpRight,
+  ChevronDown,
+  Eye,
+  File as FileIcon,
   FolderOpen,
   Trash2,
   X,
@@ -22,6 +26,7 @@ interface ActivityViewProps {
   t: TranslationDict;
   activeTransfers: TransferProgressInfo[];
   history: TransferHistoryRecord[];
+  onPreviewPath: (pathOrUri: string) => void;
   onError: (msg: string) => void;
 }
 
@@ -29,12 +34,17 @@ export function ActivityView({
   t,
   activeTransfers,
   history,
+  onPreviewPath,
   onError,
 }: ActivityViewProps) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+
   const handleOpenSaved = async (paths: string[]) => {
     if (paths.length === 0) return;
     try {
-      if (paths.length === 1) {
+      if (paths[0].startsWith("content://")) {
+        await api.openFileExternal(paths[0]);
+      } else if (paths.length === 1) {
         await revealItemInDir(paths[0]);
       } else {
         await openPath(paths[0]);
@@ -42,6 +52,12 @@ export function ActivityView({
     } catch (e) {
       onError(String(e));
     }
+  };
+
+  const extractFileName = (pathOrUri: string) => {
+    const clean = pathOrUri.split("?")[0];
+    const parts = clean.split(/[/\\]/);
+    return decodeURIComponent(parts[parts.length - 1] || pathOrUri);
   };
 
   const statusLabel = (status: string) => {
@@ -158,59 +174,127 @@ export function ActivityView({
           </p>
         ) : (
           <div className="space-y-2">
-            {history.map((item) => (
-              <div
-                key={item.id}
-                className="flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-3"
-              >
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/25 dark:bg-white/10">
-                    {item.direction === "send" ? (
-                      <ArrowUpRight className="h-5 w-5 text-indigo-500 dark:text-indigo-300" />
-                    ) : (
-                      <ArrowDownLeft className="h-5 w-5 text-emerald-500 dark:text-emerald-300" />
+            {history.map((item) => {
+              const canPreview =
+                item.direction === "receive" &&
+                item.status === "completed" &&
+                item.savedPaths.length > 0;
+              const isMulti = item.savedPaths.length > 1;
+              const isExpanded = expandedId === item.id;
+
+              return (
+                <div
+                  key={item.id}
+                  className="rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-3 space-y-2"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      disabled={!canPreview}
+                      onClick={() => {
+                        if (!canPreview) return;
+                        if (isMulti) {
+                          setExpandedId(isExpanded ? null : item.id);
+                        } else {
+                          onPreviewPath(item.savedPaths[0]);
+                        }
+                      }}
+                      className={`flex flex-1 items-center gap-3 min-w-0 text-left ${
+                        canPreview ? "cursor-pointer" : "cursor-default"
+                      }`}
+                    >
+                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/25 dark:bg-white/10">
+                        {item.direction === "send" ? (
+                          <ArrowUpRight className="h-5 w-5 text-indigo-500 dark:text-indigo-300" />
+                        ) : (
+                          <ArrowDownLeft className="h-5 w-5 text-emerald-500 dark:text-emerald-300" />
+                        )}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
+                            {item.peerName}
+                          </span>
+                          <GlassBadge
+                            tone={
+                              item.status === "completed"
+                                ? "success"
+                                : item.status === "failed"
+                                ? "warning"
+                                : "neutral"
+                            }
+                          >
+                            {statusLabel(item.status)}
+                          </GlassBadge>
+                        </div>
+                        <div className="font-mono text-xs text-slate-700/65 dark:text-white/50">
+                          {item.fileCount} {t.activity.filesUnit} ·{" "}
+                          {formatBytes(item.totalBytes)}
+                        </div>
+                      </div>
+                    </button>
+
+                    {canPreview && (
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <GlassButton
+                          size="sm"
+                          variant="glass"
+                          onClick={() => {
+                            if (isMulti) {
+                              setExpandedId(isExpanded ? null : item.id);
+                            } else {
+                              onPreviewPath(item.savedPaths[0]);
+                            }
+                          }}
+                          className="px-3"
+                        >
+                          {isMulti ? (
+                            <ChevronDown
+                              className={`h-4 w-4 transition-transform duration-200 ${
+                                isExpanded ? "rotate-180" : ""
+                              }`}
+                            />
+                          ) : (
+                            <Eye className="h-4 w-4" />
+                          )}
+                        </GlassButton>
+                        <GlassButton
+                          size="sm"
+                          variant="glass"
+                          onClick={() => handleOpenSaved(item.savedPaths)}
+                        >
+                          <FolderOpen className="h-4 w-4" />
+                          <span className="hidden sm:inline">
+                            {t.activity.openFolder}
+                          </span>
+                        </GlassButton>
+                      </div>
                     )}
                   </div>
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
-                        {item.peerName}
-                      </span>
-                      <GlassBadge
-                        tone={
-                          item.status === "completed"
-                            ? "success"
-                            : item.status === "failed"
-                            ? "warning"
-                            : "neutral"
-                        }
-                      >
-                        {statusLabel(item.status)}
-                      </GlassBadge>
-                    </div>
-                    <div className="font-mono text-xs text-slate-700/65 dark:text-white/50">
-                      {item.fileCount} {t.activity.filesUnit} ·{" "}
-                      {formatBytes(item.totalBytes)}
-                    </div>
-                  </div>
-                </div>
 
-                {item.direction === "receive" &&
-                  item.status === "completed" &&
-                  item.savedPaths.length > 0 && (
-                    <GlassButton
-                      size="sm"
-                      variant="glass"
-                      onClick={() => handleOpenSaved(item.savedPaths)}
-                    >
-                      <FolderOpen className="h-4 w-4" />
-                      <span className="hidden sm:inline">
-                        {t.activity.openFolder}
-                      </span>
-                    </GlassButton>
+                  {canPreview && isMulti && isExpanded && (
+                    <div className="space-y-1 border-t border-white/15 pt-2">
+                      {item.savedPaths.map((savedPath) => (
+                        <button
+                          key={savedPath}
+                          type="button"
+                          onClick={() => onPreviewPath(savedPath)}
+                          className="flex min-h-[44px] w-full items-center justify-between gap-2 rounded-xl bg-white/15 dark:bg-white/5 px-3 py-2 text-left text-xs transition hover:bg-white/25 dark:hover:bg-white/10"
+                        >
+                          <span className="flex items-center gap-2 min-w-0">
+                            <FileIcon className="h-3.5 w-3.5 shrink-0 text-slate-700/70 dark:text-white/60" />
+                            <span className="truncate font-mono text-slate-900/90 dark:text-white/85">
+                              {extractFileName(savedPath)}
+                            </span>
+                          </span>
+                          <Eye className="h-3.5 w-3.5 shrink-0 text-slate-700/65 dark:text-white/55" />
+                        </button>
+                      ))}
+                    </div>
                   )}
-              </div>
-            ))}
+                </div>
+              );
+            })}
           </div>
         )}
       </GlassCard>

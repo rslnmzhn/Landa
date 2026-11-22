@@ -8,7 +8,7 @@ use landa_core::{
 #[cfg(feature = "mod-clipboard")]
 use landa_mod_clipboard::{ClipboardItem, ClipboardModule};
 #[cfg(feature = "mod-shares")]
-use landa_mod_shares::{LocalShareRoot, ShareEntry, ShareRootInfo, SharesModule};
+use landa_mod_shares::{LocalShareRoot, ShareEntry, ShareRootInfo, ShareThumbnail, SharesModule};
 use tauri::State;
 
 pub struct AppState {
@@ -97,6 +97,38 @@ pub async fn send_files(
         .send_files(&peer_id, path_bufs)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn send_folder_android(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    peer_id: String,
+) -> Result<Option<TransferHistoryRecord>, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        let bridge = app
+            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+            .ok_or_else(|| "Android bridge unavailable".to_string())?;
+        let Some(items) = bridge.pick_folder_for_send_async().await? else {
+            return Ok(None);
+        };
+        if items.is_empty() {
+            return Err("Selected folder is empty".into());
+        }
+        let record = state
+            .engine
+            .send_items(&peer_id, items)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Some(record))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, state, peer_id);
+        Err("send_folder_android is only supported on Android".into())
+    }
 }
 
 #[tauri::command]
@@ -304,6 +336,75 @@ pub async fn shares_download_remote_file(
     Err("shares module is not compiled".into())
 }
 
+#[cfg(feature = "mod-shares")]
+#[tauri::command]
+pub async fn shares_preview_remote_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    server: State<'_, Arc<crate::preview::PreviewServer>>,
+    peer_id: String,
+    root_id: String,
+    rel_path: String,
+) -> Result<crate::preview::PreviewDescriptor, String> {
+    let cache_dir = crate::preview::resolve_preview_cache_dir(&app)?;
+    let cached_path = state
+        .shares
+        .preview_remote_file(
+            &state.engine,
+            &peer_id,
+            &root_id,
+            &rel_path,
+            &cache_dir,
+            crate::preview::MAX_REMOTE_PREVIEW_BYTES,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    crate::preview::prepare_file_preview(&app, &state, &server, &cached_path).await
+}
+
+#[cfg(not(feature = "mod-shares"))]
+#[tauri::command]
+pub async fn shares_preview_remote_file(
+    _peer_id: String,
+    _root_id: String,
+    _rel_path: String,
+) -> Result<crate::preview::PreviewDescriptor, String> {
+    Err("shares module is not compiled".into())
+}
+
+#[cfg(feature = "mod-shares")]
+#[tauri::command]
+pub async fn shares_get_remote_thumbnail(
+    state: State<'_, AppState>,
+    peer_id: String,
+    root_id: String,
+    rel_path: String,
+    max_size: Option<u32>,
+) -> Result<ShareThumbnail, String> {
+    state
+        .shares
+        .get_remote_thumbnail(
+            &state.engine,
+            &peer_id,
+            &root_id,
+            &rel_path,
+            max_size.unwrap_or(160),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "mod-shares"))]
+#[tauri::command]
+pub async fn shares_get_remote_thumbnail(
+    _peer_id: String,
+    _root_id: String,
+    _rel_path: String,
+    _max_size: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    Err("shares module is not compiled".into())
+}
+
 // --- Optional Module: Clipboard ---
 
 #[cfg(feature = "mod-clipboard")]
@@ -457,4 +558,24 @@ pub async fn download_update(
 #[tauri::command]
 pub async fn install_update(app: tauri::AppHandle, file_path: String) -> Result<(), String> {
     crate::updater::install_update(&app, &file_path).await
+}
+
+// --- In-App File Preview ---
+
+#[tauri::command]
+pub async fn prepare_file_preview(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    server: State<'_, Arc<crate::preview::PreviewServer>>,
+    path_or_uri: String,
+) -> Result<crate::preview::PreviewDescriptor, String> {
+    crate::preview::prepare_file_preview(&app, &state, &server, &path_or_uri).await
+}
+
+#[tauri::command]
+pub async fn open_file_external(
+    app: tauri::AppHandle,
+    path_or_uri: String,
+) -> Result<(), String> {
+    crate::preview::open_file_external(&app, &path_or_uri).await
 }

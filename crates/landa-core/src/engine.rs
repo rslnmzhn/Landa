@@ -16,7 +16,7 @@ use crate::events::{
 };
 use crate::module::{LandaModule, ModuleRegistry, ModuleStatus, PeerContext};
 use crate::storage::{AppSettings, Storage};
-use crate::transfer::{ReceivePublishHook, TransferManager};
+use crate::transfer::{OpenSourceHook, OutgoingFileItem, ReceivePublishHook, TransferManager};
 use crate::transport::{QuicTransport, TransportHandlerCtx};
 
 #[derive(Debug, Clone)]
@@ -33,6 +33,7 @@ pub struct LocalIdentityInfo {
     pub public_key_hex: String,
     pub device_name: String,
     pub quic_port: u16,
+    pub os: landa_proto::DeviceOs,
 }
 
 pub struct LandaEngine {
@@ -164,6 +165,10 @@ impl LandaEngine {
         self.transfers.set_publish_hook(hook);
     }
 
+    pub fn set_open_source_hook(&self, hook: OpenSourceHook) {
+        self.transfers.set_open_source_hook(hook);
+    }
+
     pub fn local_identity_info(&self) -> LocalIdentityInfo {
         let device_name = self
             .settings
@@ -176,6 +181,7 @@ impl LandaEngine {
             public_key_hex: hex_encode(&self.identity.public_key_bytes()),
             device_name,
             quic_port: self.transport.local_port(),
+            os: current_os(),
         }
     }
 
@@ -319,9 +325,17 @@ impl LandaEngine {
         peer_id_hex: &str,
         paths: Vec<PathBuf>,
     ) -> Result<TransferHistoryRecord, CoreError> {
+        let items = TransferManager::collect_outgoing_items(&paths)?;
+        self.send_items(peer_id_hex, items).await
+    }
+
+    pub async fn send_items(
+        &self,
+        peer_id_hex: &str,
+        items: Vec<OutgoingFileItem>,
+    ) -> Result<TransferHistoryRecord, CoreError> {
         let peer_id = parse_peer_id(peer_id_hex)?;
         let (peer_ctx, addr) = self.resolve_peer_endpoint(&peer_id)?;
-        let items = TransferManager::collect_outgoing_items(&paths)?;
         let (send, recv) = self
             .transport
             .open_stream(addr, peer_id, StreamKind::FileTransfer)

@@ -13,6 +13,7 @@ export interface LocalIdentityInfo {
   publicKeyHex: string;
   deviceName: string;
   quicPort: number;
+  os: DeviceOs;
 }
 
 export interface PeerInfo {
@@ -123,6 +124,11 @@ export interface ShareEntry {
   modifiedMs: number;
 }
 
+export interface ShareThumbnail {
+  mimeType: string;
+  dataUrl: string;
+}
+
 export interface ClipboardItem {
   id: string;
   text: string;
@@ -158,6 +164,19 @@ export interface UpdateProgressEvent {
   totalBytes: number;
   filePath: string | null;
   error: string | null;
+}
+
+export type PreviewKind = "image" | "video" | "audio" | "text" | "unsupported";
+
+export interface PreviewDescriptor {
+  kind: PreviewKind;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  url: string | null;
+  textContent: string | null;
+  truncated: boolean;
+  sourcePath: string;
 }
 
 export type CoreEvent =

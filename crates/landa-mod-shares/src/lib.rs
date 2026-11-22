@@ -1,10 +1,15 @@
+use std::collections::{HashMap, VecDeque};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::Utc;
+use image::codecs::jpeg::JpegEncoder;
+use image::ImageFormat;
 use landa_core::{
     CoreError, CoreEvent, LandaEngine, LandaModule, PeerContext, Storage, TransferHistoryRecord,
 };
@@ -18,6 +23,9 @@ use uuid::Uuid;
 const SHARES_SETTING_KEY: &str = "shares_roots";
 const MAX_DIR_ENTRIES: usize = 5_000;
 const CHUNK_SIZE: usize = 64 * 1024;
+const THUMB_CACHE_MAX_BYTES: usize = 50 * 1024 * 1024;
+const MAX_THUMB_SOURCE_BYTES: u64 = 50 * 1024 * 1024;
+const DEFAULT_THUMB_SIZE: u32 = 160;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,11 +54,19 @@ pub struct ShareEntry {
     pub modified_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareThumbnail {
+    pub mime_type: String,
+    pub data_url: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 enum ShareRequest {
     ListRoots,
     ListDir { root_id: String, rel_path: String },
     DownloadFile { root_id: String, rel_path: String },
+    GetThumbnail { root_id: String, rel_path: String, max_size: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,12 +74,80 @@ enum ShareResponse {
     Roots(Vec<ShareRootInfo>),
     Entries(Vec<ShareEntry>),
     FileHeader { file_name: String, size_bytes: u64 },
+    Thumbnail { mime_type: String, bytes: Vec<u8> },
     Error(String),
+}
+
+#[derive(Clone)]
+struct CachedThumb {
+    mime_type: String,
+    bytes: Vec<u8>,
+}
+
+struct ThumbnailCacheInner {
+    map: HashMap<String, CachedThumb>,
+    order: VecDeque<String>,
+    total_bytes: usize,
+}
+
+struct ThumbnailLruCache {
+    max_bytes: usize,
+    inner: Mutex<ThumbnailCacheInner>,
+}
+
+impl ThumbnailLruCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            inner: Mutex::new(ThumbnailCacheInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                total_bytes: 0,
+            }),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<CachedThumb> {
+        let mut guard = self.inner.lock().expect("thumb cache lock poisoned");
+        let val = guard.map.get(key).cloned()?;
+        if let Some(pos) = guard.order.iter().position(|k| k == key) {
+            guard.order.remove(pos);
+        }
+        guard.order.push_back(key.to_string());
+        Some(val)
+    }
+
+    fn insert(&self, key: String, value: CachedThumb) {
+        let entry_size = value.bytes.len();
+        if entry_size > self.max_bytes {
+            return;
+        }
+        let mut guard = self.inner.lock().expect("thumb cache lock poisoned");
+        if let Some(old) = guard.map.remove(&key) {
+            guard.total_bytes = guard.total_bytes.saturating_sub(old.bytes.len());
+            if let Some(pos) = guard.order.iter().position(|k| k == &key) {
+                guard.order.remove(pos);
+            }
+        }
+        while guard.total_bytes + entry_size > self.max_bytes {
+            let Some(oldest_key) = guard.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = guard.map.remove(&oldest_key) {
+                guard.total_bytes = guard.total_bytes.saturating_sub(removed.bytes.len());
+            }
+        }
+        guard.total_bytes += entry_size;
+        guard.order.push_back(key.clone());
+        guard.map.insert(key, value);
+    }
 }
 
 pub struct SharesModule {
     storage: Arc<Storage>,
     enabled: AtomicBool,
+    local_thumb_cache: ThumbnailLruCache,
+    remote_thumb_cache: ThumbnailLruCache,
 }
 
 impl SharesModule {
@@ -71,6 +155,8 @@ impl SharesModule {
         Arc::new(Self {
             storage,
             enabled: AtomicBool::new(true),
+            local_thumb_cache: ThumbnailLruCache::new(THUMB_CACHE_MAX_BYTES),
+            remote_thumb_cache: ThumbnailLruCache::new(THUMB_CACHE_MAX_BYTES),
         })
     }
 
@@ -277,6 +363,156 @@ impl SharesModule {
         Ok(saved_str)
     }
 
+    pub async fn preview_remote_file(
+        &self,
+        engine: &LandaEngine,
+        peer_id: &str,
+        root_id: &str,
+        rel_path: &str,
+        cache_dir: &Path,
+        max_bytes: u64,
+    ) -> Result<String, CoreError> {
+        if !self.is_enabled() {
+            return Err(CoreError::ModuleDisabled("shares".into()));
+        }
+        let (_, mut send, mut recv) = engine
+            .open_trusted_module_stream(peer_id, StreamKind::Shares)
+            .await?;
+        write_frame(
+            &mut send,
+            &ShareRequest::DownloadFile {
+                root_id: root_id.to_string(),
+                rel_path: rel_path.to_string(),
+            },
+        )
+        .await?;
+        let _ = send.finish();
+
+        let resp: ShareResponse = read_frame(&mut recv, MAX_CONTROL_FRAME_BYTES).await?;
+        let (file_name, size_bytes) = match resp {
+            ShareResponse::FileHeader {
+                file_name,
+                size_bytes,
+            } => (file_name, size_bytes),
+            ShareResponse::Error(msg) => return Err(CoreError::InvalidInput(msg)),
+            _ => return Err(CoreError::InvalidInput("unexpected share response".into())),
+        };
+
+        if size_bytes > max_bytes {
+            return Err(CoreError::InvalidInput(format!(
+                "File exceeds preview limit ({} MB)",
+                max_bytes / (1024 * 1024)
+            )));
+        }
+
+        let safe_rel = validate_relative_path(&file_name)?;
+        let safe_name = safe_rel
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("preview.bin");
+
+        let mut key_hasher = blake3::Hasher::new();
+        key_hasher.update(peer_id.as_bytes());
+        key_hasher.update(b"\0");
+        key_hasher.update(root_id.as_bytes());
+        key_hasher.update(b"\0");
+        key_hasher.update(rel_path.as_bytes());
+        let key_hex = &key_hasher.finalize().to_hex()[..16];
+
+        tokio::fs::create_dir_all(cache_dir).await?;
+        let cache_path = cache_dir.join(format!("{key_hex}_{safe_name}"));
+        if let Ok(meta) = tokio::fs::metadata(&cache_path).await {
+            if meta.is_file() && meta.len() == size_bytes {
+                return Ok(cache_path.to_string_lossy().to_string());
+            }
+        }
+
+        let temp_path = cache_dir.join(format!(".preview-part-{}", Uuid::new_v4()));
+        let mut file = tokio::fs::File::create(&temp_path).await?;
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = size_bytes;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            let n = recv
+                .read(&mut buf[..to_read])
+                .await?
+                .ok_or_else(|| CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "share preview truncated",
+                )))?;
+            hasher.update(&buf[..n]);
+            file.write_all(&buf[..n]).await?;
+            remaining -= n as u64;
+        }
+        file.flush().await?;
+        drop(file);
+
+        let mut expected_digest = [0u8; 32];
+        if let Err(err) = recv.read_exact(&mut expected_digest).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                err,
+            )));
+        }
+        if hasher.finalize().as_bytes() != &expected_digest {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(CoreError::IntegrityMismatch(file_name));
+        }
+
+        if tokio::fs::rename(&temp_path, &cache_path).await.is_err() {
+            tokio::fs::copy(&temp_path, &cache_path).await?;
+            let _ = tokio::fs::remove_file(&temp_path).await;
+        }
+
+        Ok(cache_path.to_string_lossy().to_string())
+    }
+
+    pub async fn get_remote_thumbnail(
+        &self,
+        engine: &LandaEngine,
+        peer_id: &str,
+        root_id: &str,
+        rel_path: &str,
+        max_size: u32,
+    ) -> Result<ShareThumbnail, CoreError> {
+        if !self.is_enabled() {
+            return Err(CoreError::ModuleDisabled("shares".into()));
+        }
+        let clamped_size = max_size.clamp(64, 320);
+        let cache_key = format!("{peer_id}:{root_id}:{rel_path}:{clamped_size}");
+        if let Some(cached) = self.remote_thumb_cache.get(&cache_key) {
+            return Ok(to_share_thumbnail(&cached));
+        }
+
+        let (_, mut send, mut recv) = engine
+            .open_trusted_module_stream(peer_id, StreamKind::Shares)
+            .await?;
+        write_frame(
+            &mut send,
+            &ShareRequest::GetThumbnail {
+                root_id: root_id.to_string(),
+                rel_path: rel_path.to_string(),
+                max_size: clamped_size,
+            },
+        )
+        .await?;
+        let _ = send.finish();
+
+        let resp: ShareResponse = read_frame(&mut recv, MAX_CONTROL_FRAME_BYTES).await?;
+        match resp {
+            ShareResponse::Thumbnail { mime_type, bytes } => {
+                let entry = CachedThumb { mime_type, bytes };
+                self.remote_thumb_cache.insert(cache_key, entry.clone());
+                Ok(to_share_thumbnail(&entry))
+            }
+            ShareResponse::Error(msg) => Err(CoreError::InvalidInput(msg)),
+            _ => Err(CoreError::InvalidInput("unexpected share response".into())),
+        }
+    }
+
     fn resolve_root_target(&self, root_id: &str, rel_path: &str) -> Result<(LocalShareRoot, PathBuf), CoreError> {
         let roots = self.list_local_shares()?;
         let root = roots
@@ -408,10 +644,137 @@ impl LandaModule for SharesModule {
                     }
                 }
             }
+            ShareRequest::GetThumbnail {
+                root_id,
+                rel_path,
+                max_size,
+            } => {
+                let target_size = if max_size == 0 {
+                    DEFAULT_THUMB_SIZE
+                } else {
+                    max_size.clamp(64, 320)
+                };
+                match self.resolve_root_target(&root_id, &rel_path) {
+                    Ok((_, target)) if target.is_file() => {
+                        if !is_supported_thumb_image(&target) {
+                            send_response(
+                                &mut send,
+                                &ShareResponse::Error("unsupported thumbnail format".into()),
+                            )
+                            .await?;
+                        } else {
+                            let meta = tokio::fs::metadata(&target).await?;
+                            if meta.len() > MAX_THUMB_SOURCE_BYTES {
+                                send_response(
+                                    &mut send,
+                                    &ShareResponse::Error("image too large for thumbnail".into()),
+                                )
+                                .await?;
+                            } else {
+                                let mod_ms = modified_ms(&meta);
+                                let cache_key =
+                                    format!("{root_id}:{rel_path}:{mod_ms}:{target_size}");
+                                if let Some(cached) = self.local_thumb_cache.get(&cache_key) {
+                                    send_response(
+                                        &mut send,
+                                        &ShareResponse::Thumbnail {
+                                            mime_type: cached.mime_type,
+                                            bytes: cached.bytes,
+                                        },
+                                    )
+                                    .await?;
+                                } else {
+                                    let target_clone = target.clone();
+                                    let gen_res = tokio::task::spawn_blocking(move || {
+                                        generate_image_thumbnail(&target_clone, target_size)
+                                    })
+                                    .await
+                                    .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
+
+                                    match gen_res {
+                                        Ok((mime_type, bytes)) => {
+                                            self.local_thumb_cache.insert(
+                                                cache_key,
+                                                CachedThumb {
+                                                    mime_type: mime_type.clone(),
+                                                    bytes: bytes.clone(),
+                                                },
+                                            );
+                                            send_response(
+                                                &mut send,
+                                                &ShareResponse::Thumbnail { mime_type, bytes },
+                                            )
+                                            .await?;
+                                        }
+                                        Err(err) => {
+                                            send_response(
+                                                &mut send,
+                                                &ShareResponse::Error(err.to_string()),
+                                            )
+                                            .await?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        send_response(
+                            &mut send,
+                            &ShareResponse::Error("target is not a file".into()),
+                        )
+                        .await?;
+                    }
+                    Err(err) => {
+                        send_response(&mut send, &ShareResponse::Error(err.to_string())).await?;
+                    }
+                }
+            }
         }
 
         let _ = send.finish();
         Ok(())
+    }
+}
+
+fn to_share_thumbnail(entry: &CachedThumb) -> ShareThumbnail {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&entry.bytes);
+    ShareThumbnail {
+        mime_type: entry.mime_type.clone(),
+        data_url: format!("data:{};base64,{b64}", entry.mime_type),
+    }
+}
+
+fn is_supported_thumb_image(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif")
+}
+
+fn generate_image_thumbnail(path: &Path, max_size: u32) -> Result<(String, Vec<u8>), CoreError> {
+    let reader = image::ImageReader::open(path)?
+        .with_guessed_format()
+        .map_err(|e| CoreError::InvalidInput(format!("image format error: {e}")))?;
+    let img = reader
+        .decode()
+        .map_err(|e| CoreError::InvalidInput(format!("image decode error: {e}")))?;
+    let thumb = img.thumbnail(max_size, max_size);
+
+    let mut out = Vec::new();
+    if thumb.color().has_alpha() {
+        thumb
+            .write_to(&mut Cursor::new(&mut out), ImageFormat::WebP)
+            .map_err(|e| CoreError::InvalidInput(format!("webp encode error: {e}")))?;
+        Ok(("image/webp".to_string(), out))
+    } else {
+        let rgb = thumb.to_rgb8();
+        let encoder = JpegEncoder::new_with_quality(&mut out, 80);
+        rgb.write_with_encoder(encoder)
+            .map_err(|e| CoreError::InvalidInput(format!("jpeg encode error: {e}")))?;
+        Ok(("image/jpeg".to_string(), out))
     }
 }
 

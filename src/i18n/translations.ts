@@ -50,6 +50,8 @@ export const translations = {
       download: "Скачать",
       downloadedTo: "Сохранено",
       back: "Назад",
+      viewList: "Список",
+      viewGrid: "Плитка",
       disabledNotice: "Модуль отключён в настройках.",
     },
     shareIntent: {
@@ -123,6 +125,15 @@ export const translations = {
       noAsset: "Файл для этой платформы не найден в релизе.",
       close: "Закрыть",
     },
+    preview: {
+      loading: "Загрузка предпросмотра...",
+      openExternal: "Открыть в приложении",
+      copyText: "Копировать",
+      copied: "Скопировано",
+      truncated: "Показаны первые 512 КБ файла",
+      unsupported: "Предпросмотр этого формата не поддерживается.",
+      zoomReset: "Сбросить масштаб",
+    },
   },
   en: {
     appTitle: "Landa",
@@ -173,6 +184,8 @@ export const translations = {
       download: "Download",
       downloadedTo: "Saved",
       back: "Back",
+      viewList: "List",
+      viewGrid: "Grid",
       disabledNotice: "Module disabled in Settings.",
     },
     shareIntent: {
@@ -245,6 +258,15 @@ export const translations = {
       permissionHint: "Allow installing from this source, then tap Install again.",
       noAsset: "No package found for this platform in the release.",
       close: "Close",
+    },
+    preview: {
+      loading: "Loading preview...",
+      openExternal: "Open externally",
+      copyText: "Copy",
+      copied: "Copied",
+      truncated: "Showing first 512 KB",
+      unsupported: "Preview is not supported for this file type.",
+      zoomReset: "Reset zoom",
     },
   },
 } as const;

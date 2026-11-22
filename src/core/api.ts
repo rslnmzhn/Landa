@@ -10,8 +10,10 @@ import type {
   ManualTarget,
   ModuleStatus,
   PeerInfo,
+  PreviewDescriptor,
   ShareEntry,
   ShareRootInfo,
+  ShareThumbnail,
   TransferHistoryRecord,
   UpdateAssetInfo,
   UpdateCheckResult,
@@ -34,6 +36,8 @@ export const api = {
 
   sendFiles: (peerId: string, paths: string[]) =>
     invoke<TransferHistoryRecord>("send_files", { peerId, paths }),
+  sendFolderAndroid: (peerId: string) =>
+    invoke<TransferHistoryRecord | null>("send_folder_android", { peerId }),
   respondTransferOffer: (transferId: string, accept: boolean) =>
     invoke<void>("respond_transfer_offer", { transferId, accept }),
   cancelTransfer: (transferId: string) =>
@@ -77,6 +81,24 @@ export const api = {
       rootId,
       relPath,
     }),
+  sharesPreviewRemoteFile: (peerId: string, rootId: string, relPath: string) =>
+    invoke<PreviewDescriptor>("shares_preview_remote_file", {
+      peerId,
+      rootId,
+      relPath,
+    }),
+  sharesGetRemoteThumbnail: (
+    peerId: string,
+    rootId: string,
+    relPath: string,
+    maxSize = 160
+  ) =>
+    invoke<ShareThumbnail>("shares_get_remote_thumbnail", {
+      peerId,
+      rootId,
+      relPath,
+      maxSize,
+    }),
 
   // Clipboard module
   clipboardListLocal: () => invoke<ClipboardItem[]>("clipboard_list_local"),
@@ -101,6 +123,12 @@ export const api = {
     invoke<string>("download_update", { asset }),
   installUpdate: (filePath: string) =>
     invoke<void>("install_update", { filePath }),
+
+  // In-App File Preview
+  prepareFilePreview: (pathOrUri: string) =>
+    invoke<PreviewDescriptor>("prepare_file_preview", { pathOrUri }),
+  openFileExternal: (pathOrUri: string) =>
+    invoke<void>("open_file_external", { pathOrUri }),
 
   onCoreEvent: (handler: (event: CoreEvent) => void): Promise<UnlistenFn> =>
     listen<CoreEvent>("landa://event", (ev) => handler(ev.payload)),

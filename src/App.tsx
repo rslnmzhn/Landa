@@ -14,6 +14,7 @@ import type {
   LocalIdentityInfo,
   ModuleStatus,
   PeerInfo,
+  PreviewDescriptor,
   TransferHistoryRecord,
   TransferProgressInfo,
   UpdateCheckResult,
@@ -32,6 +33,7 @@ import { SharesView } from "./features/shares/SharesView";
 import { ClipboardView } from "./features/clipboard/ClipboardView";
 import { ActivityView } from "./features/activity/ActivityView";
 import { SettingsView } from "./features/settings/SettingsView";
+import { FilePreviewModal } from "./features/preview/FilePreviewModal";
 
 type TabId = "devices" | "shares" | "clipboard" | "activity" | "settings";
 
@@ -54,6 +56,10 @@ export function App() {
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
   const [updateProgress, setUpdateProgress] =
     useState<UpdateProgressEvent | null>(null);
+  const [previewData, setPreviewData] = useState<PreviewDescriptor | null>(
+    null
+  );
+  const [previewLoading, setPreviewLoading] = useState(false);
   const [toast, setToast] = useState<{
     kind: "error" | "notice";
     text: string;
@@ -267,6 +273,36 @@ export function App() {
     }
   };
 
+  const openLocalPreview = async (pathOrUri: string) => {
+    setPreviewData(null);
+    setPreviewLoading(true);
+    try {
+      const desc = await api.prepareFilePreview(pathOrUri);
+      setPreviewData(desc);
+    } catch (e) {
+      showToast("error", String(e));
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const openRemoteSharePreview = async (
+    peerId: string,
+    rootId: string,
+    relPath: string
+  ) => {
+    setPreviewData(null);
+    setPreviewLoading(true);
+    try {
+      const desc = await api.sharesPreviewRemoteFile(peerId, rootId, relPath);
+      setPreviewData(desc);
+    } catch (e) {
+      showToast("error", String(e));
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
   return (
     <div className="relative min-h-screen w-full text-slate-900/90 dark:text-white/90">
       <MeshCanvas />
@@ -292,6 +328,8 @@ export function App() {
               t={t}
               peers={peers}
               enabled={sharesEnabled}
+              onPreviewRemoteFile={openRemoteSharePreview}
+              onPreviewLocalPath={openLocalPreview}
               onError={(m) => showToast("error", m)}
               onNotice={(m) => showToast("notice", m)}
             />
@@ -311,6 +349,7 @@ export function App() {
               t={t}
               activeTransfers={activeTransferList}
               history={history}
+              onPreviewPath={openLocalPreview}
               onError={(m) => showToast("error", m)}
             />
           )}
@@ -454,6 +493,19 @@ export function App() {
           </div>
         </div>
       </GlassModal>
+
+      {/* In-App File Preview Modal */}
+      <FilePreviewModal
+        t={t}
+        preview={previewData}
+        loading={previewLoading}
+        onClose={() => {
+          setPreviewData(null);
+          setPreviewLoading(false);
+        }}
+        onError={(m) => showToast("error", m)}
+        onNotice={(m) => showToast("notice", m)}
+      />
     </div>
   );
 }

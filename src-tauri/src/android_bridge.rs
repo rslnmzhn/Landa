@@ -1,10 +1,12 @@
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use landa_core::{
-    LanInterface, LanInterfaceHook, ReceivePublishHook, SocketBindHook, TransferProgressInfo,
+    LanInterface, LanInterfaceHook, OpenSourceHook, OutgoingFileItem, ReceivePublishHook,
+    SocketBindHook, TransferProgressInfo,
 };
+use landa_proto::path_policy::sanitize_relative_path;
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder, PluginHandle, TauriPlugin};
 use tauri::{Manager, Runtime};
@@ -93,6 +95,41 @@ struct TransferFailedNotifArgs {
 #[serde(rename_all = "camelCase")]
 struct InstallApkArgs {
     apk_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickedFolderItem {
+    pub uri: String,
+    pub relative_path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PickFolderResponse {
+    cancelled: bool,
+    items: Vec<PickedFolderItem>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenContentUriArgs {
+    uri: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenContentUriResponse {
+    fd: i32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentUriMeta {
+    pub name: String,
+    pub size_bytes: u64,
+    pub mime_type: String,
 }
 
 pub struct AndroidBridge<R: Runtime> {
@@ -241,6 +278,108 @@ impl<R: Runtime> AndroidBridge<R> {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+
+    pub async fn pick_folder_for_send_async(&self) -> Result<Option<Vec<OutgoingFileItem>>, String> {
+        let res = self
+            .handle
+            .run_mobile_plugin_async::<PickFolderResponse>("pickFolderForSend", ())
+            .await
+            .map_err(|e| e.to_string())?;
+        if res.cancelled {
+            return Ok(None);
+        }
+        let items = res
+            .items
+            .into_iter()
+            .map(|item| {
+                let clean_rel = sanitize_relative_path(&item.relative_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                OutgoingFileItem {
+                    source_path: PathBuf::from(&item.uri),
+                    source_uri: Some(item.uri),
+                    relative_path: clean_rel,
+                    size_bytes: item.size_bytes,
+                }
+            })
+            .collect();
+        Ok(Some(items))
+    }
+
+    pub fn open_content_uri_file(&self, uri: &str) -> Option<std::fs::File> {
+        let res = self
+            .handle
+            .run_mobile_plugin::<OpenContentUriResponse>(
+                "openContentUriFd",
+                OpenContentUriArgs {
+                    uri: uri.to_string(),
+                },
+            )
+            .ok()?;
+        if res.fd < 0 {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            // SAFETY: `detachFd()` in Kotlin transfers ownership of a valid open fd to Rust.
+            Some(unsafe { std::fs::File::from_raw_fd(res.fd) })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    pub async fn open_content_uri_file_async(&self, uri: &str) -> Option<std::fs::File> {
+        let res = self
+            .handle
+            .run_mobile_plugin_async::<OpenContentUriResponse>(
+                "openContentUriFd",
+                OpenContentUriArgs {
+                    uri: uri.to_string(),
+                },
+            )
+            .await
+            .ok()?;
+        if res.fd < 0 {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            Some(unsafe { std::fs::File::from_raw_fd(res.fd) })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    pub async fn get_content_uri_meta_async(&self, uri: &str) -> Result<ContentUriMeta, String> {
+        self.handle
+            .run_mobile_plugin_async::<ContentUriMeta>(
+                "getContentUriMeta",
+                OpenContentUriArgs {
+                    uri: uri.to_string(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn open_file_external_async(&self, path_or_uri: &str) -> Result<(), String> {
+        self.handle
+            .run_mobile_plugin_async::<serde_json::Value>(
+                "openFileExternal",
+                OpenContentUriArgs {
+                    uri: path_or_uri.to_string(),
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
@@ -273,5 +412,12 @@ pub fn make_socket_bind_hook<R: Runtime>(app: tauri::AppHandle<R>) -> SocketBind
         if let Some(bridge) = app.try_state::<AndroidBridge<R>>() {
             bridge.bind_socket_to_lan(fd);
         }
+    })
+}
+
+pub fn make_open_source_hook<R: Runtime>(app: tauri::AppHandle<R>) -> OpenSourceHook {
+    Arc::new(move |uri: &str| {
+        app.try_state::<AndroidBridge<R>>()
+            .and_then(|bridge| bridge.open_content_uri_file(uri))
     })
 }
