@@ -14,6 +14,7 @@ import type {
   LocalIdentityInfo,
   ModuleStatus,
   PeerInfo,
+  PendingFocusTarget,
   PreviewDescriptor,
   TransferHistoryRecord,
   TransferProgressInfo,
@@ -49,6 +50,9 @@ export function App() {
   const [pendingOffers, setPendingOffers] = useState<
     IncomingTransferOfferInfo[]
   >([]);
+  const [focusedFriendPeerId, setFocusedFriendPeerId] = useState<string | null>(
+    null
+  );
   const [pendingSharedPaths, setPendingSharedPaths] = useState<string[]>([]);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [modules, setModules] = useState<ModuleStatus[]>([]);
@@ -76,6 +80,33 @@ export function App() {
     let unlisten: (() => void) | undefined;
     let unlistenIdentity: (() => void) | undefined;
     let unlistenUpdate: (() => void) | undefined;
+    let unlistenFocus: (() => void) | undefined;
+
+    const applyFocusTarget = (focus: PendingFocusTarget | null) => {
+      if (!focus) return;
+      if (focus.target === "activity") {
+        setActiveTab("activity");
+        return;
+      }
+      if (focus.target === "transfer_offer") {
+        setActiveTab("devices");
+        if (focus.transferId) {
+          setPendingOffers((prev) => {
+            const idx = prev.findIndex((o) => o.transferId === focus.transferId);
+            if (idx <= 0) return prev;
+            const targetOffer = prev[idx];
+            return [targetOffer, ...prev.slice(0, idx), ...prev.slice(idx + 1)];
+          });
+        }
+        return;
+      }
+      if (focus.target === "friend_requests") {
+        setActiveTab("devices");
+        api.listFriendRequests().then(setFriendRequests).catch(() => {});
+        setFocusedFriendPeerId(focus.peerId ?? "__latest__");
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      }
+    };
 
     const bootstrap = async () => {
       try {
@@ -101,6 +132,8 @@ export function App() {
         if (shared.length > 0) {
           setPendingSharedPaths((prev) => [...prev, ...shared]);
         }
+        const focus = await api.takePendingFocusTarget().catch(() => null);
+        applyFocusTarget(focus);
       } catch (e) {
         showToast("error", String(e));
       }
@@ -112,6 +145,10 @@ export function App() {
 
       unlistenUpdate = await api.onUpdateProgress((ev) => {
         setUpdateProgress(ev);
+      });
+
+      unlistenFocus = await api.onFocusTarget((focus) => {
+        applyFocusTarget(focus);
       });
 
       unlisten = await api.onCoreEvent((ev) => {
@@ -169,23 +206,36 @@ export function App() {
           }
         })
         .catch(() => {});
+      api
+        .takePendingFocusTarget()
+        .then((focus) => applyFocusTarget(focus))
+        .catch(() => {});
+    };
+    const handleFocusIntentEvent = () => {
+      api
+        .takePendingFocusTarget()
+        .then((focus) => applyFocusTarget(focus))
+        .catch(() => {});
     };
     const handleNetworkChanged = () => {
       api.triggerScan().catch(() => {});
     };
     window.addEventListener("focus", checkSharedAndScan);
     window.addEventListener("landa-share-intent", checkSharedAndScan);
+    window.addEventListener("landa-focus-target", handleFocusIntentEvent);
     window.addEventListener("landa-network-changed", handleNetworkChanged);
     document.addEventListener("visibilitychange", checkSharedAndScan);
 
     return () => {
       window.removeEventListener("focus", checkSharedAndScan);
       window.removeEventListener("landa-share-intent", checkSharedAndScan);
+      window.removeEventListener("landa-focus-target", handleFocusIntentEvent);
       window.removeEventListener("landa-network-changed", handleNetworkChanged);
       document.removeEventListener("visibilitychange", checkSharedAndScan);
       if (unlisten) unlisten();
       if (unlistenIdentity) unlistenIdentity();
       if (unlistenUpdate) unlistenUpdate();
+      if (unlistenFocus) unlistenFocus();
     };
   }, []);
 
@@ -261,6 +311,26 @@ export function App() {
   ]);
 
   const currentOffer = pendingOffers[0] ?? null;
+
+  const focusedFriendRequest = useMemo(() => {
+    if (!focusedFriendPeerId) return null;
+    const incoming = friendRequests.filter((r) => r.direction === "incoming");
+    if (focusedFriendPeerId === "__latest__") {
+      return incoming[0] ?? null;
+    }
+    return incoming.find((r) => r.peerId === focusedFriendPeerId) ?? null;
+  }, [focusedFriendPeerId, friendRequests]);
+
+  const handleFocusedFriendDecision = async (accept: boolean) => {
+    if (!focusedFriendRequest) return;
+    const peerId = focusedFriendRequest.peerId;
+    setFocusedFriendPeerId(null);
+    try {
+      await api.respondFriendRequest(peerId, accept);
+    } catch (e) {
+      showToast("error", String(e));
+    }
+  };
 
   const handleOfferDecision = async (accept: boolean) => {
     if (!currentOffer) return;
@@ -431,6 +501,41 @@ export function App() {
                 onClick={() => handleOfferDecision(true)}
               >
                 {t.offer.accept}
+              </GlassButton>
+            </div>
+          </div>
+        )}
+      </GlassModal>
+
+      {/* Focused Friend Request Modal (opened from notification tap) */}
+      <GlassModal
+        open={focusedFriendRequest !== null}
+        onClose={() => setFocusedFriendPeerId(null)}
+        title={t.devices.incomingReq}
+      >
+        {focusedFriendRequest && (
+          <div className="space-y-4">
+            <div className="space-y-1 text-sm">
+              <div className="font-semibold text-slate-900/95 dark:text-white/95">
+                {focusedFriendRequest.deviceName}
+              </div>
+              <div className="font-mono text-xs text-slate-700/75 dark:text-white/60">
+                {t.devices.sasLabel}: {focusedFriendRequest.sasCode}
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <GlassButton
+                variant="danger"
+                onClick={() => handleFocusedFriendDecision(false)}
+              >
+                {t.devices.decline}
+              </GlassButton>
+              <GlassButton
+                variant="primary"
+                onClick={() => handleFocusedFriendDecision(true)}
+              >
+                {t.devices.accept}
               </GlassButton>
             </div>
           </div>

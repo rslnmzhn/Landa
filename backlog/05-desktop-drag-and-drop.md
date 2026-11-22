@@ -1,6 +1,6 @@
 # 05. Drag & Drop файлов на карточку устройства (Desktop)
 
-**Status:** Done  
+**Status:** [x] DONE
 **Приоритет:** Средний  
 **Платформы:** Windows, Linux
 

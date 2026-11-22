@@ -65,10 +65,19 @@ pub async fn send_friend_request(
 
 #[tauri::command]
 pub async fn respond_friend_request(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     peer_id: String,
     accept: bool,
 ) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
+            bridge.cancel_friend_request_notification_async(&peer_id).await;
+        }
+    }
+    let _ = app;
     state
         .engine
         .respond_friend_request(&peer_id, accept)
@@ -132,11 +141,22 @@ pub async fn send_folder_android(
 }
 
 #[tauri::command]
-pub fn respond_transfer_offer(
+pub async fn respond_transfer_offer(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     transfer_id: String,
     accept: bool,
 ) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
+            bridge
+                .cancel_transfer_offer_notification_async(&transfer_id)
+                .await;
+        }
+    }
+    let _ = app;
     state
         .engine
         .respond_transfer_offer(&transfer_id, accept)
@@ -487,6 +507,35 @@ pub async fn clipboard_fetch_remote(_peer_id: String) -> Result<Vec<serde_json::
 }
 
 // --- Platform / Android Bridge ---
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingFocusTargetDto {
+    pub target: String,
+    pub transfer_id: Option<String>,
+    pub peer_id: Option<String>,
+}
+
+#[tauri::command]
+pub fn take_pending_focus_target(
+    app: tauri::AppHandle,
+) -> Result<Option<PendingFocusTargetDto>, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
+            return bridge.take_pending_focus_target().map(|opt| {
+                opt.map(|f| PendingFocusTargetDto {
+                    target: f.target,
+                    transfer_id: f.transfer_id,
+                    peer_id: f.peer_id,
+                })
+            });
+        }
+    }
+    let _ = app;
+    Ok(None)
+}
 
 #[tauri::command]
 pub fn take_pending_shared_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {

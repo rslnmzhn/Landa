@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use landa_core::{
-    LanInterface, LanInterfaceHook, OpenSourceHook, OutgoingFileItem, ReceivePublishHook,
-    SocketBindHook, TransferProgressInfo,
+    FriendRequestInfo, IncomingTransferOfferInfo, LanInterface, LanInterfaceHook, OpenSourceHook,
+    OutgoingFileItem, ReceivePublishHook, SocketBindHook, TransferProgressInfo,
 };
 use landa_proto::path_policy::sanitize_relative_path;
 use serde::{Deserialize, Serialize};
@@ -65,17 +65,6 @@ struct LanInterfacesResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TransferProgressNotifArgs {
-    transfer_id: String,
-    peer_name: String,
-    current_file: String,
-    files_done: usize,
-    file_count: usize,
-    percent: u32,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TransferCompletedNotifArgs {
     transfer_id: String,
     peer_name: String,
@@ -132,6 +121,68 @@ pub struct ContentUriMeta {
     pub mime_type: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingFocusTarget {
+    pub target: String,
+    pub transfer_id: Option<String>,
+    pub peer_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingFocusResponse {
+    focus: Option<PendingFocusTarget>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForegroundStateResponse {
+    in_foreground: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferForegroundArgs {
+    active_count: usize,
+    direction: String,
+    peer_name: String,
+    current_file: String,
+    files_done: usize,
+    file_count: usize,
+    percent: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferOfferNotifArgs {
+    transfer_id: String,
+    peer_name: String,
+    file_count: usize,
+    total_bytes: u64,
+    file_names: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelTransferOfferNotifArgs {
+    transfer_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FriendRequestNotifArgs {
+    peer_id: String,
+    device_name: String,
+    sas_code: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelFriendRequestNotifArgs {
+    peer_id: String,
+}
+
 pub struct AndroidBridge<R: Runtime> {
     handle: PluginHandle<R>,
 }
@@ -183,26 +234,6 @@ impl<R: Runtime> AndroidBridge<R> {
             .collect()
     }
 
-    pub async fn show_transfer_progress_async(&self, info: &TransferProgressInfo) {
-        let percent = if info.total_bytes > 0 {
-            ((info.bytes_transferred.saturating_mul(100)) / info.total_bytes).min(100) as u32
-        } else {
-            0
-        };
-        let args = TransferProgressNotifArgs {
-            transfer_id: info.transfer_id.clone(),
-            peer_name: info.peer_name.clone(),
-            current_file: info.current_file.clone(),
-            files_done: info.files_done,
-            file_count: info.file_count,
-            percent,
-        };
-        let _ = self
-            .handle
-            .run_mobile_plugin_async::<serde_json::Value>("showTransferProgress", args)
-            .await;
-    }
-
     pub async fn show_transfer_completed_async(&self, info: &TransferProgressInfo) {
         let args = TransferCompletedNotifArgs {
             transfer_id: info.transfer_id.clone(),
@@ -214,6 +245,103 @@ impl<R: Runtime> AndroidBridge<R> {
             .handle
             .run_mobile_plugin_async::<serde_json::Value>("showTransferCompleted", args)
             .await;
+    }
+
+    pub async fn is_app_in_foreground_async(&self) -> bool {
+        self.handle
+            .run_mobile_plugin_async::<ForegroundStateResponse>("isAppInForeground", ())
+            .await
+            .map(|r| r.in_foreground)
+            .unwrap_or(true)
+    }
+
+    pub async fn update_transfer_foreground_async(
+        &self,
+        active_count: usize,
+        info: &TransferProgressInfo,
+    ) {
+        let percent = if info.total_bytes > 0 {
+            ((info.bytes_transferred.saturating_mul(100)) / info.total_bytes).min(100) as u32
+        } else {
+            0
+        };
+        let args = TransferForegroundArgs {
+            active_count,
+            direction: info.direction.clone(),
+            peer_name: info.peer_name.clone(),
+            current_file: info.current_file.clone(),
+            files_done: info.files_done,
+            file_count: info.file_count,
+            percent,
+        };
+        let _ = self
+            .handle
+            .run_mobile_plugin_async::<serde_json::Value>("updateTransferForeground", args)
+            .await;
+    }
+
+    pub async fn stop_transfer_foreground_async(&self) {
+        let _ = self
+            .handle
+            .run_mobile_plugin_async::<serde_json::Value>("stopTransferForeground", ())
+            .await;
+    }
+
+    pub async fn show_transfer_offer_notification_async(&self, offer: &IncomingTransferOfferInfo) {
+        let args = TransferOfferNotifArgs {
+            transfer_id: offer.transfer_id.clone(),
+            peer_name: offer.peer_name.clone(),
+            file_count: offer.file_count,
+            total_bytes: offer.total_bytes,
+            file_names: offer.file_names.clone(),
+        };
+        let _ = self
+            .handle
+            .run_mobile_plugin_async::<serde_json::Value>("showTransferOfferNotification", args)
+            .await;
+    }
+
+    pub async fn cancel_transfer_offer_notification_async(&self, transfer_id: &str) {
+        let _ = self
+            .handle
+            .run_mobile_plugin_async::<serde_json::Value>(
+                "cancelTransferOfferNotification",
+                CancelTransferOfferNotifArgs {
+                    transfer_id: transfer_id.to_string(),
+                },
+            )
+            .await;
+    }
+
+    pub async fn show_friend_request_notification_async(&self, req: &FriendRequestInfo) {
+        let args = FriendRequestNotifArgs {
+            peer_id: req.peer_id.clone(),
+            device_name: req.device_name.clone(),
+            sas_code: req.sas_code.clone(),
+        };
+        let _ = self
+            .handle
+            .run_mobile_plugin_async::<serde_json::Value>("showFriendRequestNotification", args)
+            .await;
+    }
+
+    pub async fn cancel_friend_request_notification_async(&self, peer_id: &str) {
+        let _ = self
+            .handle
+            .run_mobile_plugin_async::<serde_json::Value>(
+                "cancelFriendRequestNotification",
+                CancelFriendRequestNotifArgs {
+                    peer_id: peer_id.to_string(),
+                },
+            )
+            .await;
+    }
+
+    pub fn take_pending_focus_target(&self) -> Result<Option<PendingFocusTarget>, String> {
+        self.handle
+            .run_mobile_plugin::<PendingFocusResponse>("takePendingFocusTarget", ())
+            .map(|r| r.focus)
+            .map_err(|e| e.to_string())
     }
 
     pub async fn show_transfer_failed_async(&self, info: &TransferProgressInfo) {

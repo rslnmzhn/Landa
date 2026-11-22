@@ -6,6 +6,7 @@ mod desktop;
 mod preview;
 mod updater;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use commands::AppState;
@@ -15,6 +16,8 @@ use landa_mod_clipboard::ClipboardModule;
 #[cfg(feature = "mod-shares")]
 use landa_mod_shares::SharesModule;
 use tauri::{Emitter, Manager};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use tauri_plugin_notification::NotificationExt;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -120,32 +123,170 @@ pub fn run() {
                 });
             }
 
-            // Forward CoreEvents to the WebView (and Android notifications)
+            // Forward CoreEvents to the WebView (and Android/Desktop notifications)
             let mut rx = engine.subscribe_events();
             let handle = app.handle().clone();
+            let engine_for_events = Arc::clone(&engine);
+            let mut known_incoming_requests: HashSet<String> = engine
+                .list_friend_requests()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| r.direction == "incoming")
+                .map(|r| r.peer_id)
+                .collect();
+            let mut active_transfers: HashMap<String, landa_core::TransferProgressInfo> =
+                HashMap::new();
+
             tauri::async_runtime::spawn(async move {
                 while let Ok(event) = rx.recv().await {
-                    #[cfg(target_os = "android")]
-                    if let landa_core::CoreEvent::TransferProgress(ref info) = event {
-                        if info.direction == "receive" {
+                    match &event {
+                        landa_core::CoreEvent::TransferProgress(info) => {
+                            let is_active = info.status == "waiting_approval"
+                                || info.status == "transferring";
+                            if is_active {
+                                active_transfers.insert(info.transfer_id.clone(), info.clone());
+                            } else {
+                                active_transfers.remove(&info.transfer_id);
+                            }
+
+                            #[cfg(target_os = "android")]
                             if let Some(bridge) =
                                 handle.try_state::<android_bridge::AndroidBridge<tauri::Wry>>()
                             {
-                                match info.status.as_str() {
-                                    "transferring" => {
-                                        bridge.show_transfer_progress_async(info).await;
+                                if is_active {
+                                    bridge
+                                        .update_transfer_foreground_async(
+                                            active_transfers.len(),
+                                            info,
+                                        )
+                                        .await;
+                                } else {
+                                    bridge
+                                        .cancel_transfer_offer_notification_async(&info.transfer_id)
+                                        .await;
+                                    if active_transfers.is_empty() {
+                                        bridge.stop_transfer_foreground_async().await;
+                                    } else if let Some(next_active) =
+                                        active_transfers.values().next()
+                                    {
+                                        bridge
+                                            .update_transfer_foreground_async(
+                                                active_transfers.len(),
+                                                next_active,
+                                            )
+                                            .await;
                                     }
-                                    "completed" => {
-                                        bridge.show_transfer_completed_async(info).await;
+
+                                    if info.direction == "receive" {
+                                        match info.status.as_str() {
+                                            "completed" => {
+                                                bridge.show_transfer_completed_async(info).await;
+                                            }
+                                            "failed" | "cancelled" => {
+                                                bridge.show_transfer_failed_async(info).await;
+                                            }
+                                            _ => {}
+                                        }
                                     }
-                                    "failed" | "cancelled" => {
-                                        bridge.show_transfer_failed_async(info).await;
-                                    }
-                                    _ => {}
                                 }
                             }
                         }
+                        landa_core::CoreEvent::IncomingTransferOffer(offer) => {
+                            #[cfg(target_os = "android")]
+                            if let Some(bridge) =
+                                handle.try_state::<android_bridge::AndroidBridge<tauri::Wry>>()
+                            {
+                                if !bridge.is_app_in_foreground_async().await {
+                                    bridge.show_transfer_offer_notification_async(offer).await;
+                                }
+                            }
+
+                            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                            if should_notify_desktop(&handle) {
+                                let lang = engine_for_events.get_settings().language;
+                                let size_str = format_bytes_human(offer.total_bytes);
+                                let body = if lang == "en" {
+                                    format!(
+                                        "Incoming transfer: {} file(s) ({})",
+                                        offer.file_count, size_str
+                                    )
+                                } else {
+                                    format!(
+                                        "Входящая передача: {} ф. ({})",
+                                        offer.file_count, size_str
+                                    )
+                                };
+                                let _ = handle
+                                    .notification()
+                                    .builder()
+                                    .title(format!("Landa · {}", offer.peer_name))
+                                    .body(body)
+                                    .extra("target", "transfer_offer")
+                                    .extra("transferId", offer.transfer_id.clone())
+                                    .show();
+                            }
+                        }
+                        landa_core::CoreEvent::FriendRequestsChanged => {
+                            let current_incoming = engine_for_events
+                                .list_friend_requests()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|r| r.direction == "incoming")
+                                .collect::<Vec<_>>();
+                            let current_ids: HashSet<String> =
+                                current_incoming.iter().map(|r| r.peer_id.clone()).collect();
+
+                            for req in &current_incoming {
+                                if !known_incoming_requests.contains(&req.peer_id) {
+                                    #[cfg(target_os = "android")]
+                                    if let Some(bridge) = handle
+                                        .try_state::<android_bridge::AndroidBridge<tauri::Wry>>()
+                                    {
+                                        if !bridge.is_app_in_foreground_async().await {
+                                            bridge
+                                                .show_friend_request_notification_async(req)
+                                                .await;
+                                        }
+                                    }
+
+                                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                                    if should_notify_desktop(&handle) {
+                                        let lang = engine_for_events.get_settings().language;
+                                        let body = if lang == "en" {
+                                            format!("Friend request · Code {}", req.sas_code)
+                                        } else {
+                                            format!("Запрос в друзья · Код {}", req.sas_code)
+                                        };
+                                        let _ = handle
+                                            .notification()
+                                            .builder()
+                                            .title(format!("Landa · {}", req.device_name))
+                                            .body(body)
+                                            .extra("target", "friend_requests")
+                                            .extra("peerId", req.peer_id.clone())
+                                            .show();
+                                    }
+                                }
+                            }
+
+                            #[cfg(target_os = "android")]
+                            if let Some(bridge) =
+                                handle.try_state::<android_bridge::AndroidBridge<tauri::Wry>>()
+                            {
+                                for old_id in &known_incoming_requests {
+                                    if !current_ids.contains(old_id) {
+                                        bridge
+                                            .cancel_friend_request_notification_async(old_id)
+                                            .await;
+                                    }
+                                }
+                            }
+
+                            known_incoming_requests = current_ids;
+                        }
+                        _ => {}
                     }
+
                     let _ = handle.emit("landa://event", &event);
                 }
             });
@@ -153,6 +294,21 @@ pub fn run() {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             {
                 desktop::setup_tray_and_window(app.handle(), Arc::clone(&engine))?;
+                let app_for_notif = app.handle().clone();
+                let _ = app.notification().on_action(move |performed| {
+                    desktop::show_main_window(&app_for_notif);
+                    if let Some(notif) = performed.notification() {
+                        let extra = notif.extra();
+                        if let Some(target) = extra.get("target").and_then(|v| v.as_str()) {
+                            let payload = serde_json::json!({
+                                "target": target,
+                                "transferId": extra.get("transferId").and_then(|v| v.as_str()),
+                                "peerId": extra.get("peerId").and_then(|v| v.as_str()),
+                            });
+                            let _ = app_for_notif.emit("landa://focus-target", payload);
+                        }
+                    }
+                });
             }
 
             let preview_server = tauri::async_runtime::block_on(preview::PreviewServer::start(
@@ -212,6 +368,7 @@ pub fn run() {
             commands::clipboard_send_to_peer,
             commands::clipboard_fetch_remote,
             commands::take_pending_shared_files,
+            commands::take_pending_focus_target,
             commands::has_all_files_access,
             commands::request_all_files_access,
             commands::ensure_startup_permissions,
@@ -241,5 +398,35 @@ fn resolve_default_device_name() -> String {
     #[cfg(not(target_os = "android"))]
     {
         "Landa Device".to_string()
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn should_notify_desktop(app: &tauri::AppHandle) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        return true;
+    };
+    let visible = window.is_visible().unwrap_or(true);
+    let minimized = window.is_minimized().unwrap_or(false);
+    let focused = window.is_focused().unwrap_or(true);
+    !visible || minimized || !focused
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn format_bytes_human(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    let mut val = bytes as f64 / 1024.0;
+    let mut idx = 0;
+    while val >= 1024.0 && idx < UNITS.len() - 1 {
+        val /= 1024.0;
+        idx += 1;
+    }
+    if val >= 100.0 {
+        format!("{:.0} {}", val, UNITS[idx])
+    } else {
+        format!("{:.1} {}", val, UNITS[idx])
     }
 }

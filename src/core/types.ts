@@ -179,6 +179,12 @@ export interface PreviewDescriptor {
   sourcePath: string;
 }
 
+export interface PendingFocusTarget {
+  target: string;
+  transferId?: string | null;
+  peerId?: string | null;
+}
+
 export type CoreEvent =
   | { type: "peersChanged" }
   | { type: "friendRequestsChanged" }

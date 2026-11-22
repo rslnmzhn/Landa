@@ -93,20 +93,64 @@ class OpenContentUriArgs {
     lateinit var uri: String
 }
 
+@InvokeArg
+class TransferForegroundArgs {
+    var activeCount: Int = 0
+    lateinit var direction: String
+    lateinit var peerName: String
+    lateinit var currentFile: String
+    var filesDone: Int = 0
+    var fileCount: Int = 1
+    var percent: Int = 0
+}
+
+@InvokeArg
+class TransferOfferNotifArgs {
+    lateinit var transferId: String
+    lateinit var peerName: String
+    var fileCount: Int = 1
+    var totalBytes: Long = 0L
+    var fileNames: List<String> = emptyList()
+}
+
+@InvokeArg
+class CancelTransferOfferNotifArgs {
+    lateinit var transferId: String
+}
+
+@InvokeArg
+class FriendRequestNotifArgs {
+    lateinit var peerId: String
+    lateinit var deviceName: String
+    lateinit var sasCode: String
+}
+
+@InvokeArg
+class CancelFriendRequestNotifArgs {
+    lateinit var peerId: String
+}
+
 @TauriPlugin
 class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var webViewRef: WebView? = null
     private val pendingSharedPaths = mutableListOf<String>()
+    private var pendingFocusTarget: JSObject? = null
     private val lock = Any()
     private val publishedUris = ConcurrentHashMap<String, Pair<Uri, String>>()
     private val lastProgressNotifMs = ConcurrentHashMap<String, Long>()
+    private var lastFgUpdateMs: Long = 0L
+    private var lastFgActiveCount: Int = 0
+    private var fgServiceRunning: Boolean = false
+    @Volatile
+    private var appInForeground: Boolean = true
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var permissionsRequestedThisSession = false
 
     companion object {
         private const val CHANNEL_PROGRESS = "landa_transfer_progress"
         private const val CHANNEL_DONE = "landa_transfer_done"
+        private const val CHANNEL_REQUESTS = "landa_incoming_requests"
         private const val REQ_STARTUP_PERMS = 1002
         private const val MAX_FOLDER_FILES = 10_000
         private const val MAX_FOLDER_DEPTH = 32
@@ -121,18 +165,30 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     override fun load(webView: WebView) {
         super.load(webView)
         webViewRef = webView
+        appInForeground = true
         acquireMulticastLock()
         sweepOldShareCache()
-        activity.intent?.let { handleShareIntent(it) }
+        activity.intent?.let {
+            handleShareIntent(it)
+            handleFocusIntent(it)
+        }
     }
 
     override fun onResume(activity: AppCompatActivity) {
         super.onResume(activity)
+        appInForeground = true
         acquireMulticastLock()
         dispatchWebEvent("landa-network-changed")
     }
 
+    override fun onPause(activity: AppCompatActivity) {
+        appInForeground = false
+        super.onPause(activity)
+    }
+
     override fun onDestroy(activity: AppCompatActivity) {
+        appInForeground = false
+        stopTransferForegroundInternal()
         unregisterWifiNetworkCallback()
         releaseMulticastLock()
         super.onDestroy(activity)
@@ -141,6 +197,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleShareIntent(intent)
+        handleFocusIntent(intent)
     }
 
     @Command
@@ -427,6 +484,205 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (_: Exception) {
             invoke.resolve()
         }
+    }
+
+    @Command
+    fun isAppInForeground(invoke: Invoke) {
+        val res = JSObject()
+        res.put("inForeground", appInForeground)
+        invoke.resolve(res)
+    }
+
+    @Command
+    fun updateTransferForeground(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(TransferForegroundArgs::class.java)
+            if (args.activeCount <= 0) {
+                stopTransferForegroundInternal()
+                invoke.resolve()
+                return
+            }
+
+            val now = System.currentTimeMillis()
+            if (fgServiceRunning &&
+                lastFgActiveCount == args.activeCount &&
+                now - lastFgUpdateMs < 350L &&
+                args.percent < 100
+            ) {
+                invoke.resolve()
+                return
+            }
+            lastFgUpdateMs = now
+            lastFgActiveCount = args.activeCount
+
+            val serviceIntent = Intent(activity, TransferForegroundService::class.java).apply {
+                action = TransferForegroundService.ACTION_START_OR_UPDATE
+                putExtra(TransferForegroundService.EXTRA_ACTIVE_COUNT, args.activeCount)
+                putExtra(TransferForegroundService.EXTRA_DIRECTION, args.direction)
+                putExtra(TransferForegroundService.EXTRA_PEER_NAME, args.peerName)
+                putExtra(TransferForegroundService.EXTRA_CURRENT_FILE, args.currentFile)
+                putExtra(TransferForegroundService.EXTRA_FILES_DONE, args.filesDone)
+                putExtra(TransferForegroundService.EXTRA_FILE_COUNT, args.fileCount)
+                putExtra(TransferForegroundService.EXTRA_PERCENT, args.percent)
+            }
+
+            try {
+                ContextCompat.startForegroundService(activity, serviceIntent)
+                fgServiceRunning = true
+            } catch (_: Exception) {
+                // Android 12+ may restrict starting a foreground service from background;
+                // fall back to a regular progress notification without crashing.
+                if (canPostNotifications()) {
+                    val nm = activity.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                    val notif = TransferForegroundService.buildTransferNotification(
+                        context = activity,
+                        activeCount = args.activeCount,
+                        direction = args.direction,
+                        peerName = args.peerName,
+                        currentFile = args.currentFile,
+                        filesDone = args.filesDone,
+                        fileCount = args.fileCount,
+                        percent = args.percent
+                    )
+                    nm?.notify(TransferForegroundService.FG_NOTIFICATION_ID, notif)
+                }
+            }
+            invoke.resolve()
+        } catch (_: Exception) {
+            invoke.resolve()
+        }
+    }
+
+    @Command
+    fun stopTransferForeground(invoke: Invoke) {
+        stopTransferForegroundInternal()
+        invoke.resolve()
+    }
+
+    @Command
+    fun showTransferOfferNotification(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(TransferOfferNotifArgs::class.java)
+            if (appInForeground || !canPostNotifications()) {
+                invoke.resolve()
+                return
+            }
+
+            ensureNotificationChannels()
+            val nm = activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val id = offerNotifId(args.transferId)
+
+            val tapIntent = Intent(activity, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra("landa_focus_target", "transfer_offer")
+                putExtra("landa_transfer_id", args.transferId)
+            }
+            val pendingIntent = PendingIntent.getActivity(
+                activity,
+                id,
+                tapIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val firstFile = args.fileNames.firstOrNull()
+                ?.substringAfterLast('/')
+                ?.substringAfterLast('\\')
+            val sizeLabel = formatBytesCompact(args.totalBytes)
+            val contentText = when {
+                args.fileCount > 1 -> "${args.fileCount} files · $sizeLabel"
+                !firstFile.isNullOrEmpty() -> "$firstFile · $sizeLabel"
+                else -> sizeLabel
+            }
+
+            val builder = NotificationCompat.Builder(activity, CHANNEL_REQUESTS)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setContentTitle("Landa · ${args.peerName}")
+                .setContentText(contentText)
+                .setAutoCancel(true)
+                .setContentIntent(pendingIntent)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+
+            nm.notify(id, builder.build())
+            invoke.resolve()
+        } catch (_: Exception) {
+            invoke.resolve()
+        }
+    }
+
+    @Command
+    fun cancelTransferOfferNotification(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(CancelTransferOfferNotifArgs::class.java)
+            val nm = activity.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            nm?.cancel(offerNotifId(args.transferId))
+        } catch (_: Exception) {
+        }
+        invoke.resolve()
+    }
+
+    @Command
+    fun showFriendRequestNotification(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(FriendRequestNotifArgs::class.java)
+            if (appInForeground || !canPostNotifications()) {
+                invoke.resolve()
+                return
+            }
+
+            ensureNotificationChannels()
+            val nm = activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val id = friendNotifId(args.peerId)
+
+            val tapIntent = Intent(activity, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra("landa_focus_target", "friend_requests")
+                putExtra("landa_peer_id", args.peerId)
+            }
+            val pendingIntent = PendingIntent.getActivity(
+                activity,
+                id,
+                tapIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val builder = NotificationCompat.Builder(activity, CHANNEL_REQUESTS)
+                .setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setContentTitle("Landa · ${args.deviceName}")
+                .setContentText("Friend request · Code ${args.sasCode}")
+                .setAutoCancel(true)
+                .setContentIntent(pendingIntent)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setCategory(NotificationCompat.CATEGORY_SOCIAL)
+
+            nm.notify(id, builder.build())
+            invoke.resolve()
+        } catch (_: Exception) {
+            invoke.resolve()
+        }
+    }
+
+    @Command
+    fun cancelFriendRequestNotification(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(CancelFriendRequestNotifArgs::class.java)
+            val nm = activity.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            nm?.cancel(friendNotifId(args.peerId))
+        } catch (_: Exception) {
+        }
+        invoke.resolve()
+    }
+
+    @Command
+    fun takePendingFocusTarget(invoke: Invoke) {
+        val focus: JSObject?
+        synchronized(lock) {
+            focus = pendingFocusTarget
+            pendingFocusTarget = null
+        }
+        val res = JSObject()
+        res.put("focus", focus)
+        invoke.resolve(res)
     }
 
     @Command
@@ -959,6 +1215,21 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    private fun stopTransferForegroundInternal() {
+        lastFgUpdateMs = 0L
+        lastFgActiveCount = 0
+        fgServiceRunning = false
+        try {
+            activity.stopService(Intent(activity, TransferForegroundService::class.java))
+        } catch (_: Exception) {
+        }
+        try {
+            val nm = activity.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            nm?.cancel(TransferForegroundService.FG_NOTIFICATION_ID)
+        } catch (_: Exception) {
+        }
+    }
+
     private fun ensureNotificationChannels() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = activity.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
@@ -980,6 +1251,14 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             )
             nm.createNotificationChannel(ch)
         }
+        if (nm.getNotificationChannel(CHANNEL_REQUESTS) == null) {
+            val ch = NotificationChannel(
+                CHANNEL_REQUESTS,
+                "Incoming Requests",
+                NotificationManager.IMPORTANCE_HIGH
+            )
+            nm.createNotificationChannel(ch)
+        }
     }
 
     private fun canPostNotifications(): Boolean {
@@ -994,6 +1273,30 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun notifIdFor(transferId: String): Int {
         return 20000 + (transferId.hashCode() and 0x7FFF)
+    }
+
+    private fun offerNotifId(transferId: String): Int {
+        return 30000 + (transferId.hashCode() and 0x7FFF)
+    }
+
+    private fun friendNotifId(peerId: String): Int {
+        return 40000 + (peerId.hashCode() and 0x7FFF)
+    }
+
+    private fun formatBytesCompact(bytes: Long): String {
+        if (bytes < 1024L) return "$bytes B"
+        val units = arrayOf("KB", "MB", "GB", "TB")
+        var value = bytes.toDouble() / 1024.0
+        var idx = 0
+        while (value >= 1024.0 && idx < units.size - 1) {
+            value /= 1024.0
+            idx++
+        }
+        return if (value >= 100.0) {
+            "${value.toInt()} ${units[idx]}"
+        } else {
+            String.format(java.util.Locale.US, "%.1f %s", value, units[idx])
+        }
     }
 
     private fun resolveSystemDeviceName(): String {
@@ -1104,6 +1407,25 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         } finally {
             multicastLock = null
         }
+    }
+
+    private fun handleFocusIntent(intent: Intent) {
+        val target = intent.getStringExtra("landa_focus_target") ?: return
+        val transferId = intent.getStringExtra("landa_transfer_id")
+        val peerId = intent.getStringExtra("landa_peer_id")
+        intent.removeExtra("landa_focus_target")
+        intent.removeExtra("landa_transfer_id")
+        intent.removeExtra("landa_peer_id")
+
+        val obj = JSObject().apply {
+            put("target", target)
+            if (transferId != null) put("transferId", transferId)
+            if (peerId != null) put("peerId", peerId)
+        }
+        synchronized(lock) {
+            pendingFocusTarget = obj
+        }
+        dispatchWebEvent("landa-focus-target")
     }
 
     private fun handleShareIntent(intent: Intent) {

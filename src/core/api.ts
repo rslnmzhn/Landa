@@ -10,6 +10,7 @@ import type {
   ManualTarget,
   ModuleStatus,
   PeerInfo,
+  PendingFocusTarget,
   PreviewDescriptor,
   ShareEntry,
   ShareRootInfo,
@@ -113,6 +114,8 @@ export const api = {
 
   // Platform / Android bridge
   takePendingSharedFiles: () => invoke<string[]>("take_pending_shared_files"),
+  takePendingFocusTarget: () =>
+    invoke<PendingFocusTarget | null>("take_pending_focus_target"),
   hasAllFilesAccess: () => invoke<boolean>("has_all_files_access"),
   requestAllFilesAccess: () => invoke<void>("request_all_files_access"),
   ensureStartupPermissions: () => invoke<void>("ensure_startup_permissions"),
@@ -138,6 +141,12 @@ export const api = {
     handler: (event: UpdateProgressEvent) => void
   ): Promise<UnlistenFn> =>
     listen<UpdateProgressEvent>("landa://update-progress", (ev) =>
+      handler(ev.payload)
+    ),
+  onFocusTarget: (
+    handler: (target: PendingFocusTarget) => void
+  ): Promise<UnlistenFn> =>
+    listen<PendingFocusTarget>("landa://focus-target", (ev) =>
       handler(ev.payload)
     ),
 };
