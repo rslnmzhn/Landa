@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 landa-core = { path = "../landa-core" }
 landa-proto = { path = "../landa-proto" }
 quinn.workspace = true

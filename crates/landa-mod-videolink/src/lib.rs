@@ -1,10 +1,25 @@
+use std::convert::Infallible;
 use std::io::SeekFrom;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Empty, Full, Limited};
+use hyper::body::{Body, Frame, Incoming};
+use hyper::header::{
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE, LOCATION,
+    RANGE, SET_COOKIE,
+};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use landa_core::network::enumerate_lan_interfaces;
 use landa_core::{CoreError, LandaModule, OpenSourceHook, PeerContext};
 use landa_proto::wire::StreamKind;
@@ -12,10 +27,9 @@ use quinn::{RecvStream, SendStream};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -26,6 +40,8 @@ const MAX_PASSWORD_BYTES: usize = 256;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const SESSION_COOKIE_NAME: &str = "landa_vl_session";
+
+type RespBody = BoxBody<Bytes, std::io::Error>;
 
 #[derive(Debug, Clone)]
 pub enum VideoSource {
@@ -406,11 +422,27 @@ async fn run_http_server(
                 let st = Arc::clone(&state);
                 let conn_cancel = cancel.clone();
                 tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let mut builder = http1::Builder::new();
+                    builder
+                        .timer(TokioTimer::new())
+                        .max_header_size(MAX_HTTP_HEADER_BYTES)
+                        .max_buf_size(MAX_HTTP_HEADER_BYTES)
+                        .keep_alive(true);
+
+                    let svc = service_fn(move |req| {
+                        let st = Arc::clone(&st);
+                        async move { handle_http_request(req, st).await }
+                    });
+
+                    let mut conn = builder.serve_connection(io, svc);
                     tokio::select! {
-                        _ = conn_cancel.cancelled() => {}
-                        res = handle_http_connection(stream, st) => {
+                        _ = conn_cancel.cancelled() => {
+                            Pin::new(&mut conn).graceful_shutdown();
+                        }
+                        res = &mut conn => {
                             if let Err(err) = res {
-                                debug!("videolink connection error: {err}");
+                                debug!("videolink hyper connection error: {err}");
                             }
                         }
                     }
@@ -421,107 +453,91 @@ async fn run_http_server(
     drop(listener);
 }
 
-enum HeaderReadError {
-    TooLarge,
-    Io(std::io::Error),
+struct ChannelBody {
+    rx: mpsc::Receiver<Result<Frame<Bytes>, std::io::Error>>,
 }
 
-async fn read_bounded_line(
-    reader: &mut BufReader<OwnedReadHalf>,
-    remaining_budget: &mut usize,
-) -> Result<Option<String>, HeaderReadError> {
-    let mut line_buf = Vec::new();
-    loop {
-        let available = reader.fill_buf().await.map_err(HeaderReadError::Io)?;
-        if available.is_empty() {
-            if line_buf.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(String::from_utf8_lossy(&line_buf).into_owned()));
-        }
+impl Body for ChannelBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
 
-        let newline_pos = available.iter().position(|&b| b == b'\n');
-        let take = match newline_pos {
-            Some(pos) => pos + 1,
-            None => available.len(),
-        };
-
-        if take > *remaining_budget {
-            return Err(HeaderReadError::TooLarge);
-        }
-
-        *remaining_budget -= take;
-        line_buf.extend_from_slice(&available[..take]);
-        reader.consume(take);
-
-        if newline_pos.is_some() {
-            return Ok(Some(String::from_utf8_lossy(&line_buf).into_owned()));
-        }
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.rx.poll_recv(cx)
     }
 }
 
-async fn handle_http_connection(
-    stream: TcpStream,
-    state: Arc<ServerSessionState>,
-) -> Result<(), String> {
-    let (reader_half, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader_half);
-    let mut remaining_header_budget = MAX_HTTP_HEADER_BYTES;
+fn full_body(data: impl Into<Bytes>) -> RespBody {
+    Full::new(data.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
 
-    let request_line = match read_bounded_line(&mut reader, &mut remaining_header_budget).await {
-        Ok(Some(line)) => line,
-        Ok(None) => return Ok(()),
-        Err(HeaderReadError::TooLarge) => {
-            write_text_response(
-                &mut writer,
-                "431 Request Header Fields Too Large",
-                "Header too large",
-            )
-            .await;
-            return Ok(());
-        }
-        Err(HeaderReadError::Io(e)) => return Err(e.to_string()),
+fn empty_body() -> RespBody {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+fn text_response(status: StatusCode, body: &'static str) -> Response<RespBody> {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(CACHE_CONTROL, "no-store")
+        .body(full_body(body))
+        .expect("valid text response")
+}
+
+fn html_response(status: StatusCode, html: String, head_only: bool) -> Response<RespBody> {
+    let len = html.len();
+    let body = if head_only {
+        empty_body()
+    } else {
+        full_body(html)
     };
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(CONTENT_LENGTH, len.to_string())
+        .header(CACHE_CONTROL, "no-store")
+        .body(body)
+        .expect("valid html response")
+}
 
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let raw_path = parts.next().unwrap_or("");
-    let path_only = raw_path.split('?').next().unwrap_or("");
-
-    let mut range_header: Option<String> = None;
-    let mut cookie_header: Option<String> = None;
-    let mut content_length: usize = 0;
-
-    loop {
-        let line = match read_bounded_line(&mut reader, &mut remaining_header_budget).await {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
-            Err(HeaderReadError::TooLarge) => {
-                write_text_response(
-                    &mut writer,
-                    "431 Request Header Fields Too Large",
-                    "Header too large",
-                )
-                .await;
-                return Ok(());
-            }
-            Err(HeaderReadError::Io(e)) => return Err(e.to_string()),
-        };
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim();
-            let val = v.trim();
-            if key.eq_ignore_ascii_case("range") {
-                range_header = Some(val.to_string());
-            } else if key.eq_ignore_ascii_case("cookie") {
-                cookie_header = Some(val.to_string());
-            } else if key.eq_ignore_ascii_case("content-length") {
-                content_length = val.parse::<usize>().unwrap_or(usize::MAX);
-            }
-        }
+fn redirect_response(
+    status: StatusCode,
+    location: &'static str,
+    set_cookie: Option<&str>,
+) -> Response<RespBody> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header(LOCATION, location)
+        .header(CACHE_CONTROL, "no-store");
+    if let Some(cookie) = set_cookie {
+        builder = builder.header(SET_COOKIE, cookie);
     }
+    builder.body(empty_body()).expect("valid redirect response")
+}
+
+async fn handle_http_request(
+    req: Request<Incoming>,
+    state: Arc<ServerSessionState>,
+) -> Result<Response<RespBody>, Infallible> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+
+    let cookie_header = req
+        .headers()
+        .get(COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let range_header = req
+        .headers()
+        .get(RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
     let is_authenticated = cookie_header
         .as_deref()
@@ -529,30 +545,32 @@ async fn handle_http_connection(
         .map(|token| verify_session_token(&state.cookie_secret, token))
         .unwrap_or(false);
 
-    match (method, path_only) {
-        ("GET", "/") | ("HEAD", "/") => {
-            write_redirect(&mut writer, "302 Found", "/watch", None).await;
-        }
-        ("GET", "/watch") | ("HEAD", "/watch") => {
+    let resp = match (method.clone(), path.as_str()) {
+        (Method::GET | Method::HEAD, "/") => redirect_response(StatusCode::FOUND, "/watch", None),
+        (Method::GET | Method::HEAD, "/watch") => {
+            let head_only = method == Method::HEAD;
             if is_authenticated {
-                let html = render_player_html(&state.file_name);
-                write_html_response(&mut writer, "200 OK", &html, method == "HEAD").await;
+                html_response(StatusCode::OK, render_player_html(&state.file_name), head_only)
             } else {
-                let html = render_login_html(&state.file_name, false);
-                write_html_response(&mut writer, "200 OK", &html, method == "HEAD").await;
+                html_response(
+                    StatusCode::OK,
+                    render_login_html(&state.file_name, false),
+                    head_only,
+                )
             }
         }
-        ("POST", "/login") => {
-            if content_length > MAX_FORM_BODY_BYTES {
-                write_text_response(&mut writer, "413 Payload Too Large", "Payload too large").await;
-                return Ok(());
-            }
-            let mut body = vec![0u8; content_length];
-            if content_length > 0 && reader.read_exact(&mut body).await.is_err() {
-                write_text_response(&mut writer, "400 Bad Request", "Invalid request body").await;
-                return Ok(());
-            }
-            let body_str = String::from_utf8_lossy(&body);
+        (Method::POST, "/login") => {
+            let limited = Limited::new(req.into_body(), MAX_FORM_BODY_BYTES);
+            let collected = match limited.collect().await {
+                Ok(c) => c.to_bytes(),
+                Err(_) => {
+                    return Ok(text_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Payload too large",
+                    ));
+                }
+            };
+            let body_str = String::from_utf8_lossy(&collected);
             let submitted = extract_form_field(&body_str, "password").unwrap_or_default();
             let submitted_hash = *blake3::hash(submitted.as_bytes()).as_bytes();
 
@@ -561,60 +579,49 @@ async fn handle_http_connection(
                 let cookie = format!(
                     "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECS}"
                 );
-                write_redirect(&mut writer, "303 See Other", "/watch", Some(&cookie)).await;
+                redirect_response(StatusCode::SEE_OTHER, "/watch", Some(&cookie))
             } else {
-                let html = render_login_html(&state.file_name, true);
-                write_html_response(&mut writer, "401 Unauthorized", &html, false).await;
+                html_response(
+                    StatusCode::UNAUTHORIZED,
+                    render_login_html(&state.file_name, true),
+                    false,
+                )
             }
         }
-        ("POST", "/logout") => {
+        (Method::POST, "/logout") => {
             let clear_cookie =
                 format!("{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
-            write_redirect(&mut writer, "303 See Other", "/watch", Some(&clear_cookie)).await;
+            redirect_response(StatusCode::SEE_OTHER, "/watch", Some(&clear_cookie))
         }
-        ("GET", "/stream") | ("HEAD", "/stream") => {
+        (Method::GET | Method::HEAD, "/stream") => {
             if !is_authenticated {
-                write_text_response(&mut writer, "401 Unauthorized", "Unauthorized").await;
-                return Ok(());
+                text_response(StatusCode::UNAUTHORIZED, "Unauthorized")
+            } else {
+                serve_video_stream(&state, range_header.as_deref(), method == Method::HEAD).await
             }
-            serve_video_stream(
-                &mut writer,
-                &state,
-                range_header.as_deref(),
-                method == "HEAD",
-            )
-            .await;
         }
-        ("GET", _) | ("HEAD", _) | ("POST", _) => {
-            write_text_response(&mut writer, "404 Not Found", "Not found").await;
+        (Method::GET | Method::HEAD | Method::POST, _) => {
+            text_response(StatusCode::NOT_FOUND, "Not found")
         }
-        _ => {
-            write_text_response(&mut writer, "405 Method Not Allowed", "Method not allowed").await;
-        }
-    }
+        _ => text_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed"),
+    };
 
-    Ok(())
+    Ok(resp)
 }
 
 async fn serve_video_stream(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
     state: &ServerSessionState,
     range_header: Option<&str>,
     head_only: bool,
-) {
+) -> Response<RespBody> {
     let mut file = match &state.source {
         VideoSource::File(path) => match tokio::fs::File::open(path).await {
             Ok(f) => f,
-            Err(_) => {
-                write_text_response(writer, "404 Not Found", "Video file unavailable").await;
-                return;
-            }
+            Err(_) => return text_response(StatusCode::NOT_FOUND, "Video file unavailable"),
         },
         VideoSource::ContentUri { uri, .. } => {
             let Some(ref hook) = state.open_source_hook else {
-                write_text_response(writer, "500 Internal Server Error", "Source hook missing")
-                    .await;
-                return;
+                return text_response(StatusCode::INTERNAL_SERVER_ERROR, "Source hook missing");
             };
             let uri_owned = uri.clone();
             let hook_clone = Arc::clone(hook);
@@ -623,8 +630,7 @@ async fn serve_video_stream(
                 .ok()
                 .flatten();
             let Some(std_file) = std_file else {
-                write_text_response(writer, "404 Not Found", "Video URI unavailable").await;
-                return;
+                return text_response(StatusCode::NOT_FOUND, "Video URI unavailable");
             };
             tokio::fs::File::from_std(std_file)
         }
@@ -637,112 +643,77 @@ async fn serve_video_stream(
     };
 
     if total == 0 {
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-            state.mime_type
-        );
-        let _ = writer.write_all(headers.as_bytes()).await;
-        return;
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, state.mime_type.as_str())
+            .header(CONTENT_LENGTH, "0")
+            .header(ACCEPT_RANGES, "bytes")
+            .header(CACHE_CONTROL, "no-store")
+            .body(empty_body())
+            .expect("valid empty stream response");
     }
 
-    let (status_line, start, end) = if let Some(range_val) = range_header {
+    let (status, start, end) = if let Some(range_val) = range_header {
         match parse_byte_range(range_val, total) {
-            Some((s, e)) => ("206 Partial Content", s, e),
+            Some((s, e)) => (StatusCode::PARTIAL_CONTENT, s, e),
             None => {
-                let resp = format!(
-                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nConnection: close\r\n\r\n"
-                );
-                let _ = writer.write_all(resp.as_bytes()).await;
-                return;
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(CONTENT_RANGE, format!("bytes */{total}"))
+                    .header(CACHE_CONTROL, "no-store")
+                    .body(empty_body())
+                    .expect("valid 416 response");
             }
         }
     } else {
-        ("200 OK", 0, total - 1)
+        (StatusCode::OK, 0, total - 1)
     };
 
     let content_len = end - start + 1;
-    let mut headers = format!(
-        "HTTP/1.1 {status_line}\r\nContent-Type: {}\r\nContent-Length: {content_len}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nConnection: close\r\n",
-        state.mime_type
-    );
-    if status_line.starts_with("206") {
-        headers.push_str(&format!("Content-Range: bytes {start}-{end}/{total}\r\n"));
-    }
-    headers.push_str("\r\n");
+    let mut builder = Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, state.mime_type.as_str())
+        .header(CONTENT_LENGTH, content_len.to_string())
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CACHE_CONTROL, "no-store");
 
-    if writer.write_all(headers.as_bytes()).await.is_err() {
-        return;
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
     }
+
     if head_only {
-        return;
+        return builder.body(empty_body()).expect("valid HEAD stream response");
     }
 
     if start > 0 && file.seek(SeekFrom::Start(start)).await.is_err() {
-        return;
+        return text_response(StatusCode::INTERNAL_SERVER_ERROR, "Seek failed");
     }
 
-    let mut remaining = content_len;
-    let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
-    while remaining > 0 {
-        let to_read = (remaining as usize).min(buf.len());
-        let Ok(n) = file.read(&mut buf[..to_read]).await else {
-            break;
-        };
-        if n == 0 {
-            break;
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
+    tokio::spawn(async move {
+        let mut remaining = content_len;
+        let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            match file.read(&mut buf[..to_read]).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    remaining -= n as u64;
+                    let chunk = Bytes::copy_from_slice(&buf[..n]);
+                    if tx.send(Ok(Frame::data(chunk))).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
+                    break;
+                }
+            }
         }
-        if writer.write_all(&buf[..n]).await.is_err() {
-            break;
-        }
-        remaining -= n as u64;
-    }
-    let _ = writer.flush().await;
-}
+    });
 
-async fn write_text_response(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    status: &str,
-    body: &str,
-) {
-    let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = writer.write_all(resp.as_bytes()).await;
-}
-
-async fn write_html_response(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    status: &str,
-    html: &str,
-    head_only: bool,
-) {
-    let headers = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        html.len()
-    );
-    if writer.write_all(headers.as_bytes()).await.is_err() {
-        return;
-    }
-    if !head_only {
-        let _ = writer.write_all(html.as_bytes()).await;
-    }
-}
-
-async fn write_redirect(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    status: &str,
-    location: &str,
-    set_cookie: Option<&str>,
-) {
-    let mut resp = format!(
-        "HTTP/1.1 {status}\r\nLocation: {location}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n"
-    );
-    if let Some(cookie) = set_cookie {
-        resp.push_str(&format!("Set-Cookie: {cookie}\r\n"));
-    }
-    resp.push_str("\r\n");
-    let _ = writer.write_all(resp.as_bytes()).await;
+    let body = ChannelBody { rx }.boxed();
+    builder.body(body).expect("valid stream response")
 }
 
 fn issue_session_token(secret: &[u8; 32]) -> String {

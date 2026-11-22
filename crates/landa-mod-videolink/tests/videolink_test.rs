@@ -131,8 +131,9 @@ async fn videolink_auth_range_streaming_and_stop() {
     )
     .await;
     assert!(hdrs.starts_with("HTTP/1.1 206 Partial Content"), "{hdrs}");
-    assert!(hdrs.contains("Content-Range: bytes 10-24/256"), "{hdrs}");
-    assert!(hdrs.contains("Accept-Ranges: bytes"), "{hdrs}");
+    let hdrs_lower = hdrs.to_ascii_lowercase();
+    assert!(hdrs_lower.contains("content-range: bytes 10-24/256"), "{hdrs}");
+    assert!(hdrs_lower.contains("accept-ranges: bytes"), "{hdrs}");
     assert_eq!(body, &payload[10..=24]);
 
     // 7. Out-of-bounds Range returns 416
