@@ -1,8 +1,7 @@
 use std::io::SeekFrom;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -14,13 +13,14 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 pub const DEFAULT_VIDEOLINK_PORT: u16 = 40444;
-const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
+pub const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_FORM_BODY_BYTES: usize = 4 * 1024;
 const MAX_PASSWORD_BYTES: usize = 256;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -65,22 +65,34 @@ struct ActiveServer {
     bound_addr: SocketAddr,
 }
 
+struct LifecycleState {
+    enabled: bool,
+    active_cancel: Option<CancellationToken>,
+    status: VideoLinkStatus,
+}
+
+impl Default for LifecycleState {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            active_cancel: None,
+            status: VideoLinkStatus::default(),
+        }
+    }
+}
+
 pub struct VideoLinkModule {
-    enabled: AtomicBool,
     open_source_hook: RwLock<Option<OpenSourceHook>>,
     active: Mutex<Option<ActiveServer>>,
-    active_cancel: RwLock<Option<CancellationToken>>,
-    status_snapshot: RwLock<VideoLinkStatus>,
+    lifecycle: StdMutex<LifecycleState>,
 }
 
 impl Default for VideoLinkModule {
     fn default() -> Self {
         Self {
-            enabled: AtomicBool::new(true),
             open_source_hook: RwLock::new(None),
             active: Mutex::new(None),
-            active_cancel: RwLock::new(None),
-            status_snapshot: RwLock::new(VideoLinkStatus::default()),
+            lifecycle: StdMutex::new(LifecycleState::default()),
         }
     }
 }
@@ -98,9 +110,10 @@ impl VideoLinkModule {
     }
 
     pub fn status(&self) -> VideoLinkStatus {
-        self.status_snapshot
-            .read()
-            .expect("videolink status lock poisoned")
+        self.lifecycle
+            .lock()
+            .expect("videolink lifecycle lock poisoned")
+            .status
             .clone()
     }
 
@@ -120,10 +133,6 @@ impl VideoLinkModule {
         source: VideoSource,
         password: String,
     ) -> Result<VideoLinkStatus, CoreError> {
-        if !self.is_enabled() {
-            return Err(CoreError::ModuleDisabled("videolink".into()));
-        }
-
         if password.trim().is_empty() {
             return Err(CoreError::InvalidInput(
                 "video link password cannot be empty".into(),
@@ -133,6 +142,30 @@ impl VideoLinkModule {
             return Err(CoreError::InvalidInput(
                 "video link password is too long".into(),
             ));
+        }
+
+        // Serialize all start/stop transitions so concurrent starts can never orphan a listener.
+        let mut active_guard = self.active.lock().await;
+
+        if !self.is_enabled() {
+            return Err(CoreError::ModuleDisabled("videolink".into()));
+        }
+
+        // Stop any previously running server before binding a new one.
+        if let Some(prev) = active_guard.take() {
+            prev.cancel.cancel();
+            let _ = prev.task.await;
+        }
+        {
+            let mut lc = self
+                .lifecycle
+                .lock()
+                .expect("videolink lifecycle lock poisoned");
+            lc.active_cancel = None;
+            lc.status = VideoLinkStatus::default();
+            if !lc.enabled {
+                return Err(CoreError::ModuleDisabled("videolink".into()));
+            }
         }
 
         let (file_name, mime_type, size_bytes, resolved_source) = match source {
@@ -183,8 +216,9 @@ impl VideoLinkModule {
             }
         };
 
-        // Stop any previously running server before binding a new one.
-        self.stop().await;
+        if !self.is_enabled() {
+            return Err(CoreError::ModuleDisabled("videolink".into()));
+        }
 
         let listener = match TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
             bind_ip,
@@ -221,12 +255,6 @@ impl VideoLinkModule {
             open_source_hook: hook,
         });
 
-        let cancel = CancellationToken::new();
-        let loop_cancel = cancel.clone();
-        let task = tokio::spawn(async move {
-            run_http_server(listener, session_state, loop_cancel).await;
-        });
-
         let host_ip = if bind_ip.is_unspecified() {
             resolve_lan_ipv4().unwrap_or(Ipv4Addr::LOCALHOST)
         } else {
@@ -242,47 +270,50 @@ impl VideoLinkModule {
             size_bytes: Some(size_bytes),
         };
 
+        let cancel = CancellationToken::new();
         {
-            let mut active_guard = self.active.lock().await;
-            *active_guard = Some(ActiveServer {
-                cancel: cancel.clone(),
-                task,
-                bound_addr,
-            });
+            let mut lc = self
+                .lifecycle
+                .lock()
+                .expect("videolink lifecycle lock poisoned");
+            if !lc.enabled {
+                drop(listener);
+                return Err(CoreError::ModuleDisabled("videolink".into()));
+            }
+            lc.active_cancel = Some(cancel.clone());
+            lc.status = status.clone();
         }
-        *self
-            .active_cancel
-            .write()
-            .expect("active_cancel lock poisoned") = Some(cancel);
-        *self
-            .status_snapshot
-            .write()
-            .expect("videolink status lock poisoned") = status.clone();
+
+        let loop_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            run_http_server(listener, session_state, loop_cancel).await;
+        });
+
+        *active_guard = Some(ActiveServer {
+            cancel,
+            task,
+            bound_addr,
+        });
 
         Ok(status)
     }
 
     pub async fn stop(&self) -> VideoLinkStatus {
-        let prev = {
-            let mut active_guard = self.active.lock().await;
-            active_guard.take()
-        };
-        *self
-            .active_cancel
-            .write()
-            .expect("active_cancel lock poisoned") = None;
-
-        if let Some(server) = prev {
+        let mut active_guard = self.active.lock().await;
+        if let Some(server) = active_guard.take() {
             server.cancel.cancel();
             let _ = server.task.await;
         }
 
-        let stopped = VideoLinkStatus::default();
-        *self
-            .status_snapshot
-            .write()
-            .expect("videolink status lock poisoned") = stopped.clone();
-        stopped
+        let mut lc = self
+            .lifecycle
+            .lock()
+            .expect("videolink lifecycle lock poisoned");
+        if let Some(cancel) = lc.active_cancel.take() {
+            cancel.cancel();
+        }
+        lc.status = VideoLinkStatus::default();
+        lc.status.clone()
     }
 
     pub async fn bound_addr(&self) -> Option<SocketAddr> {
@@ -296,12 +327,11 @@ impl VideoLinkModule {
 
 impl Drop for VideoLinkModule {
     fn drop(&mut self) {
-        if let Some(cancel) = self
-            .active_cancel
-            .write()
-            .expect("active_cancel lock poisoned")
-            .take()
-        {
+        let mut lc = self
+            .lifecycle
+            .lock()
+            .expect("videolink lifecycle lock poisoned");
+        if let Some(cancel) = lc.active_cancel.take() {
             cancel.cancel();
         }
     }
@@ -322,24 +352,23 @@ impl LandaModule for VideoLinkModule {
     }
 
     fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
+        self.lifecycle
+            .lock()
+            .expect("videolink lifecycle lock poisoned")
+            .enabled
     }
 
     fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
+        let mut lc = self
+            .lifecycle
+            .lock()
+            .expect("videolink lifecycle lock poisoned");
+        lc.enabled = enabled;
         if !enabled {
-            if let Some(cancel) = self
-                .active_cancel
-                .write()
-                .expect("active_cancel lock poisoned")
-                .take()
-            {
+            if let Some(cancel) = lc.active_cancel.take() {
                 cancel.cancel();
             }
-            *self
-                .status_snapshot
-                .write()
-                .expect("videolink status lock poisoned") = VideoLinkStatus::default();
+            lc.status = VideoLinkStatus::default();
         }
     }
 
@@ -392,40 +421,57 @@ async fn run_http_server(
     drop(listener);
 }
 
+enum HeaderReadError {
+    TooLarge,
+    Io(std::io::Error),
+}
+
+async fn read_bounded_line(
+    reader: &mut BufReader<OwnedReadHalf>,
+    remaining_budget: &mut usize,
+) -> Result<Option<String>, HeaderReadError> {
+    let mut line_buf = Vec::new();
+    loop {
+        let available = reader.fill_buf().await.map_err(HeaderReadError::Io)?;
+        if available.is_empty() {
+            if line_buf.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(String::from_utf8_lossy(&line_buf).into_owned()));
+        }
+
+        let newline_pos = available.iter().position(|&b| b == b'\n');
+        let take = match newline_pos {
+            Some(pos) => pos + 1,
+            None => available.len(),
+        };
+
+        if take > *remaining_budget {
+            return Err(HeaderReadError::TooLarge);
+        }
+
+        *remaining_budget -= take;
+        line_buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+
+        if newline_pos.is_some() {
+            return Ok(Some(String::from_utf8_lossy(&line_buf).into_owned()));
+        }
+    }
+}
+
 async fn handle_http_connection(
     stream: TcpStream,
     state: Arc<ServerSessionState>,
 ) -> Result<(), String> {
     let (reader_half, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader_half);
+    let mut remaining_header_budget = MAX_HTTP_HEADER_BYTES;
 
-    let mut request_line = String::new();
-    let n = reader
-        .read_line(&mut request_line)
-        .await
-        .map_err(|e| e.to_string())?;
-    if n == 0 {
-        return Ok(());
-    }
-
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let raw_path = parts.next().unwrap_or("");
-    let path_only = raw_path.split('?').next().unwrap_or("");
-
-    let mut header_bytes = n;
-    let mut range_header: Option<String> = None;
-    let mut cookie_header: Option<String> = None;
-    let mut content_length: usize = 0;
-
-    loop {
-        let mut line = String::new();
-        let read_n = reader.read_line(&mut line).await.map_err(|e| e.to_string())?;
-        if read_n == 0 || line == "\r\n" || line == "\n" {
-            break;
-        }
-        header_bytes += read_n;
-        if header_bytes > MAX_HTTP_HEADER_BYTES {
+    let request_line = match read_bounded_line(&mut reader, &mut remaining_header_budget).await {
+        Ok(Some(line)) => line,
+        Ok(None) => return Ok(()),
+        Err(HeaderReadError::TooLarge) => {
             write_text_response(
                 &mut writer,
                 "431 Request Header Fields Too Large",
@@ -433,6 +479,36 @@ async fn handle_http_connection(
             )
             .await;
             return Ok(());
+        }
+        Err(HeaderReadError::Io(e)) => return Err(e.to_string()),
+    };
+
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let raw_path = parts.next().unwrap_or("");
+    let path_only = raw_path.split('?').next().unwrap_or("");
+
+    let mut range_header: Option<String> = None;
+    let mut cookie_header: Option<String> = None;
+    let mut content_length: usize = 0;
+
+    loop {
+        let line = match read_bounded_line(&mut reader, &mut remaining_header_budget).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(HeaderReadError::TooLarge) => {
+                write_text_response(
+                    &mut writer,
+                    "431 Request Header Fields Too Large",
+                    "Header too large",
+                )
+                .await;
+                return Ok(());
+            }
+            Err(HeaderReadError::Io(e)) => return Err(e.to_string()),
+        };
+        if line == "\r\n" || line == "\n" {
+            break;
         }
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim();

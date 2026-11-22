@@ -1,12 +1,14 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
 
 use landa_core::LandaModule;
-use landa_mod_videolink::{VideoLinkModule, VideoSource};
+use landa_mod_videolink::{VideoLinkModule, VideoSource, MAX_HTTP_HEADER_BYTES};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
-async fn send_raw_http(addr: std::net::SocketAddr, req: &str) -> (String, Vec<u8>) {
+async fn send_raw_http(addr: SocketAddr, req: &str) -> (String, Vec<u8>) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.write_all(req.as_bytes()).await.unwrap();
     stream.flush().await.unwrap();
@@ -161,5 +163,163 @@ async fn videolink_auth_range_streaming_and_stop() {
         .await;
     assert!(disabled_res.is_err());
 
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn videolink_concurrent_starts_never_orphan_listeners() {
+    let temp_dir = std::env::temp_dir().join(format!("landa-vl-conc-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let video_path = temp_dir.join("video.mp4");
+    std::fs::write(&video_path, b"0123456789abcdef").unwrap();
+
+    let module = VideoLinkModule::new();
+    let mut handles = Vec::new();
+    for i in 0..6 {
+        let m = Arc::clone(&module);
+        let p = video_path.clone();
+        handles.push(tokio::spawn(async move {
+            m.start_with_bind(
+                Ipv4Addr::LOCALHOST,
+                0,
+                VideoSource::File(p),
+                format!("pass-{i}"),
+            )
+            .await
+        }));
+    }
+
+    let mut issued_ports = Vec::new();
+    for h in handles {
+        let status = h.await.unwrap().unwrap();
+        assert!(status.running);
+        if let Some(port) = status.port {
+            issued_ports.push(port);
+        }
+    }
+    assert_eq!(issued_ports.len(), 6);
+
+    let stopped = module.stop().await;
+    assert!(!stopped.running);
+    assert!(!module.status().running);
+
+    for port in issued_ports {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        assert!(
+            TcpStream::connect(addr).await.is_err(),
+            "port {port} remained open after stop()"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn videolink_disable_during_start_leaves_no_open_port() {
+    let temp_dir = std::env::temp_dir().join(format!("landa-vl-dis-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let video_path = temp_dir.join("video.mp4");
+    std::fs::write(&video_path, b"0123456789abcdef").unwrap();
+
+    for _ in 0..10 {
+        let module = VideoLinkModule::new();
+        let m_start = Arc::clone(&module);
+        let p = video_path.clone();
+        let start_task = tokio::spawn(async move {
+            m_start
+                .start_with_bind(
+                    Ipv4Addr::LOCALHOST,
+                    0,
+                    VideoSource::File(p),
+                    "pass-123".into(),
+                )
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        module.set_enabled(false);
+
+        let res = start_task.await.unwrap();
+        // Give the cancelled server task a moment to drop its listener if it started right before set_enabled(false).
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(!module.status().running);
+        if let Ok(status) = res {
+            if let Some(port) = status.port {
+                let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+                assert!(
+                    TcpStream::connect(addr).await.is_err(),
+                    "port {port} accepted connections after set_enabled(false)"
+                );
+            }
+        }
+        let _ = module.stop().await;
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn videolink_rejects_oversized_header_without_waiting_for_newline() {
+    let temp_dir = std::env::temp_dir().join(format!("landa-vl-hdr-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let video_path = temp_dir.join("video.mp4");
+    std::fs::write(&video_path, b"0123456789abcdef").unwrap();
+
+    let module = VideoLinkModule::new();
+    module
+        .start_with_bind(
+            Ipv4Addr::LOCALHOST,
+            0,
+            VideoSource::File(video_path),
+            "secret".into(),
+        )
+        .await
+        .unwrap();
+    let addr = module.bound_addr().await.unwrap();
+
+    // Case 1: Oversized request line with NO newline and write half kept open
+    {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut payload = Vec::with_capacity(MAX_HTTP_HEADER_BYTES + 1024);
+        payload.extend_from_slice(b"GET /");
+        payload.resize(MAX_HTTP_HEADER_BYTES + 1024, b'A');
+        stream.write_all(&payload).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut resp))
+            .await
+            .expect("server must respond 431 immediately without waiting for newline")
+            .unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 431 Request Header Fields Too Large"),
+            "{resp_str}"
+        );
+    }
+
+    // Case 2: Valid request line followed by oversized header line with NO newline and write half kept open
+    {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut payload = Vec::with_capacity(MAX_HTTP_HEADER_BYTES + 1024);
+        payload.extend_from_slice(b"GET /watch HTTP/1.1\r\nX-Huge: ");
+        payload.resize(MAX_HTTP_HEADER_BYTES + 1024, b'B');
+        stream.write_all(&payload).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut resp))
+            .await
+            .expect("server must respond 431 immediately without waiting for newline")
+            .unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 431 Request Header Fields Too Large"),
+            "{resp_str}"
+        );
+    }
+
+    module.stop().await;
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
