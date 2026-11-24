@@ -65,6 +65,7 @@ export interface TransferProgressInfo {
   etaSecs: number | null;
   status: "waiting_approval" | "transferring" | "completed" | "cancelled" | "rejected" | "failed";
   error: string | null;
+  savedPaths?: string[];
 }
 
 export interface TransferHistoryRecord {
@@ -75,6 +76,7 @@ export interface TransferHistoryRecord {
   fileCount: number;
   totalBytes: number;
   savedPaths: string[];
+  relativePaths?: string[];
   status: string;
   errorMessage: string | null;
   createdAt: number;
@@ -137,6 +139,14 @@ export interface ShareEntry {
 export interface ShareThumbnail {
   mimeType: string;
   dataUrl: string;
+}
+
+export interface ShareFolderDownloadResult {
+  folderName: string;
+  fileCount: number;
+  totalBytes: number;
+  savedPaths: string[];
+  destination: string;
 }
 
 export interface VideoLinkStatus {

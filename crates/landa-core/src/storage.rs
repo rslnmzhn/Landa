@@ -109,6 +109,7 @@ impl Storage {
                 file_count INTEGER NOT NULL,
                 total_bytes INTEGER NOT NULL,
                 saved_paths_json TEXT NOT NULL,
+                relative_paths_json TEXT NOT NULL DEFAULT '[]',
                 status TEXT NOT NULL,
                 error_message TEXT,
                 created_at INTEGER NOT NULL
@@ -129,6 +130,7 @@ impl Storage {
             );
             ",
         )?;
+        ensure_transfer_history_columns(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -313,13 +315,15 @@ impl Storage {
     pub fn insert_transfer_history(&self, record: &TransferHistoryRecord) -> Result<(), CoreError> {
         let paths_json = serde_json::to_string(&record.saved_paths)
             .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
+        let rel_paths_json = serde_json::to_string(&record.relative_paths)
+            .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
         let conn = self.conn.lock().expect("db lock poisoned");
         conn.execute(
             "
             INSERT INTO transfer_history (
                 id, direction, peer_id, peer_name, file_count, total_bytes,
-                saved_paths_json, status, error_message, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                saved_paths_json, relative_paths_json, status, error_message, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ",
             params![
                 record.id,
@@ -329,6 +333,7 @@ impl Storage {
                 record.file_count as i64,
                 record.total_bytes as i64,
                 paths_json,
+                rel_paths_json,
                 record.status,
                 record.error_message,
                 record.created_at,
@@ -337,16 +342,22 @@ impl Storage {
         Ok(())
     }
 
-    pub fn list_transfer_history(&self, limit: usize) -> Result<Vec<TransferHistoryRecord>, CoreError> {
+    pub fn list_transfer_history(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<TransferHistoryRecord>, CoreError> {
         let conn = self.conn.lock().expect("db lock poisoned");
         let mut stmt = conn.prepare(
             "SELECT id, direction, peer_id, peer_name, file_count, total_bytes,
-                    saved_paths_json, status, error_message, created_at
+                    saved_paths_json, relative_paths_json, status, error_message, created_at
              FROM transfer_history ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
             let paths_json: String = row.get(6)?;
+            let rel_paths_json: String = row.get(7)?;
             let saved_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+            let relative_paths: Vec<String> =
+                serde_json::from_str(&rel_paths_json).unwrap_or_default();
             Ok(TransferHistoryRecord {
                 id: row.get(0)?,
                 direction: row.get(1)?,
@@ -355,9 +366,10 @@ impl Storage {
                 file_count: row.get::<_, i64>(4)?.max(0) as usize,
                 total_bytes: row.get::<_, i64>(5)?.max(0) as u64,
                 saved_paths,
-                status: row.get(7)?,
-                error_message: row.get(8)?,
-                created_at: row.get(9)?,
+                relative_paths,
+                status: row.get(8)?,
+                error_message: row.get(9)?,
+                created_at: row.get(10)?,
             })
         })?;
         let mut out = Vec::new();
@@ -389,8 +401,8 @@ impl Storage {
     }
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<(), CoreError> {
-        let json = serde_json::to_string(settings)
-            .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
+        let json =
+            serde_json::to_string(settings).map_err(|e| CoreError::InvalidInput(e.to_string()))?;
         let conn = self.conn.lock().expect("db lock poisoned");
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)
@@ -416,8 +428,8 @@ impl Storage {
     }
 
     pub fn set_setting_json<T: Serialize>(&self, key: &str, value: &T) -> Result<(), CoreError> {
-        let json = serde_json::to_string(value)
-            .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
+        let json =
+            serde_json::to_string(value).map_err(|e| CoreError::InvalidInput(e.to_string()))?;
         let conn = self.conn.lock().expect("db lock poisoned");
         conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -429,9 +441,8 @@ impl Storage {
 
     pub fn list_manual_targets(&self) -> Result<Vec<ManualTarget>, CoreError> {
         let conn = self.conn.lock().expect("db lock poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT ip, label FROM manual_targets ORDER BY created_at DESC",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT ip, label FROM manual_targets ORDER BY created_at DESC")?;
         let rows = stmt.query_map([], |row| {
             Ok(ManualTarget {
                 ip: row.get(0)?,
@@ -461,6 +472,25 @@ impl Storage {
         conn.execute("DELETE FROM manual_targets WHERE ip = ?1", params![ip])?;
         Ok(())
     }
+}
+
+fn ensure_transfer_history_columns(conn: &Connection) -> Result<(), CoreError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(transfer_history)")?;
+    let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_relative_paths = false;
+    for col in cols {
+        if col? == "relative_paths_json" {
+            has_relative_paths = true;
+            break;
+        }
+    }
+    if !has_relative_paths {
+        conn.execute(
+            "ALTER TABLE transfer_history ADD COLUMN relative_paths_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn row_to_stored_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPeer> {
@@ -558,7 +588,10 @@ mod tests {
         storage.save_settings(&settings).unwrap();
 
         let loaded = storage
-            .load_settings(AppSettings::default_with("Fallback".into(), temp_dir.clone()))
+            .load_settings(AppSettings::default_with(
+                "Fallback".into(),
+                temp_dir.clone(),
+            ))
             .unwrap();
         assert_eq!(
             loaded.excluded_subnets,
@@ -637,6 +670,75 @@ mod tests {
         let reqs = storage.list_friend_requests().unwrap();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].peer_id, peer_b.to_hex());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn storage_migrates_legacy_transfer_history_and_persists_relative_paths() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("landa-hist-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("landa.sqlite");
+
+        // Create legacy transfer_history table without relative_paths_json
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE transfer_history (
+                    id TEXT PRIMARY KEY,
+                    direction TEXT NOT NULL,
+                    peer_id TEXT NOT NULL,
+                    peer_name TEXT NOT NULL,
+                    file_count INTEGER NOT NULL,
+                    total_bytes INTEGER NOT NULL,
+                    saved_paths_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error_message TEXT,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO transfer_history (
+                    id, direction, peer_id, peer_name, file_count, total_bytes,
+                    saved_paths_json, status, error_message, created_at
+                ) VALUES (
+                    'legacy-1', 'send', 'peer-1', 'LegacyPeer', 1, 100,
+                    '[\"/tmp/old.txt\"]', 'completed', NULL, 1000
+                );
+                ",
+            )
+            .unwrap();
+        }
+
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .insert_transfer_history(&TransferHistoryRecord {
+                id: "new-1".into(),
+                direction: "send".into(),
+                peer_id: "peer-2".into(),
+                peer_name: "AndroidPeer".into(),
+                file_count: 2,
+                total_bytes: 200,
+                saved_paths: vec![
+                    "content://provider/doc/1".into(),
+                    "content://provider/doc/2".into(),
+                ],
+                relative_paths: vec!["a/report.pdf".into(), "b/report.pdf".into()],
+                status: "completed".into(),
+                error_message: None,
+                created_at: 2000,
+            })
+            .unwrap();
+
+        let history = storage.list_transfer_history(10).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].id, "new-1");
+        assert_eq!(
+            history[0].relative_paths,
+            vec!["a/report.pdf".to_string(), "b/report.pdf".to_string()]
+        );
+        assert_eq!(history[1].id, "legacy-1");
+        assert!(history[1].relative_paths.is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -72,6 +72,9 @@ export function App() {
     null
   );
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [downloadingShareKey, setDownloadingShareKey] = useState<string | null>(
+    null
+  );
   const [toast, setToast] = useState<{
     kind: "error" | "notice";
     text: string;
@@ -418,6 +421,9 @@ export function App() {
               identity={identity}
               peers={peers}
               enabled={sharesEnabled}
+              activeTransfers={activeTransferList}
+              downloadingKey={downloadingShareKey}
+              onDownloadingKeyChange={setDownloadingShareKey}
               onPreviewRemoteFile={openRemoteSharePreview}
               onPreviewLocalPath={openLocalPreview}
               onError={(m) => showToast("error", m)}
@@ -484,7 +490,7 @@ export function App() {
 
       {/* Toast Notification */}
       {toast && (
-        <div className="safe-top fixed right-4 top-4 z-50 max-w-sm">
+        <div className="safe-top fixed right-4 top-4 z-[60] max-w-sm">
           <div
             className={`liquid-glass-elevated rounded-2xl px-4 py-3 text-sm font-medium ${
               toast.kind === "error"

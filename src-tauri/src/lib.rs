@@ -94,9 +94,7 @@ pub fn run() {
             let videolink = {
                 let m = VideoLinkModule::new();
                 #[cfg(target_os = "android")]
-                m.set_open_source_hook(android_bridge::make_open_source_hook(
-                    app.handle().clone(),
-                ));
+                m.set_open_source_hook(android_bridge::make_open_source_hook(app.handle().clone()));
                 engine.register_module(m.clone());
                 m
             };
@@ -158,8 +156,8 @@ pub fn run() {
                 while let Ok(event) = rx.recv().await {
                     match &event {
                         landa_core::CoreEvent::TransferProgress(info) => {
-                            let is_active = info.status == "waiting_approval"
-                                || info.status == "transferring";
+                            let is_active =
+                                info.status == "waiting_approval" || info.status == "transferring";
                             if is_active {
                                 active_transfers.insert(info.transfer_id.clone(), info.clone());
                             } else {
@@ -328,10 +326,11 @@ pub fn run() {
                 });
             }
 
-            let preview_server = tauri::async_runtime::block_on(preview::PreviewServer::start(
-                app.handle().clone(),
-            ))
-            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error>)?;
+            let preview_server =
+                tauri::async_runtime::block_on(preview::PreviewServer::start(app.handle().clone()))
+                    .map_err(|e| {
+                        Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error>
+                    })?;
             app.manage(preview_server);
 
             let app_for_sweep = app.handle().clone();
@@ -387,6 +386,7 @@ pub fn run() {
             commands::shares_browse_remote_roots,
             commands::shares_browse_remote_dir,
             commands::shares_download_remote_file,
+            commands::shares_download_remote_folder,
             commands::shares_preview_remote_file,
             commands::shares_get_remote_thumbnail,
             commands::clipboard_list_local,

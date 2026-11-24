@@ -55,6 +55,21 @@ internal object DownloadsPublisher {
         return "Downloads/Landa/$displayRel"
     }
 
+    fun formatResolvedMediaStorePath(
+        relativePath: String?,
+        displayName: String?,
+    ): String? {
+        val cleanName = displayName?.trim()?.ifEmpty { null } ?: return null
+        val rawRel = relativePath?.replace('\\', '/')?.trim()?.trim('/')?.ifEmpty { null }
+            ?: return null
+        val normalizedRel = when {
+            rawRel == "Download" -> "Downloads"
+            rawRel.startsWith("Download/") -> "Downloads/" + rawRel.removePrefix("Download/")
+            else -> rawRel
+        }
+        return "$normalizedRel/$cleanName"
+    }
+
     fun selectMediaStorePublishedPath(
         contentUri: String,
         @Suppress("UNUSED_PARAMETER") resolvedPath: String?,

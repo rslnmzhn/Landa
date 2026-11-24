@@ -10,7 +10,10 @@ use landa_core::{
 #[cfg(feature = "mod-clipboard")]
 use landa_mod_clipboard::{ClipboardContentKind, ClipboardItem, ClipboardModule};
 #[cfg(feature = "mod-shares")]
-use landa_mod_shares::{LocalShareRoot, ShareEntry, ShareRootInfo, ShareThumbnail, SharesModule};
+use landa_mod_shares::{
+    LocalShareRoot, ShareEntry, ShareFolderDownloadResult, ShareRootInfo, ShareThumbnail,
+    SharesModule,
+};
 #[cfg(feature = "mod-videolink")]
 use landa_mod_videolink::{VideoLinkModule, VideoLinkStatus, VideoSource};
 use tauri::State;
@@ -56,12 +59,18 @@ pub fn rename_peer(
 
 #[tauri::command]
 pub fn forget_peer(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
-    state.engine.forget_peer(&peer_id).map_err(|e| e.to_string())
+    state
+        .engine
+        .forget_peer(&peer_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn list_friend_requests(state: State<'_, AppState>) -> Result<Vec<FriendRequestInfo>, String> {
-    state.engine.list_friend_requests().map_err(|e| e.to_string())
+    state
+        .engine
+        .list_friend_requests()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -87,7 +96,9 @@ pub async fn respond_friend_request(
     {
         use tauri::Manager;
         if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
-            bridge.cancel_friend_request_notification_async(&peer_id).await;
+            bridge
+                .cancel_friend_request_notification_async(&peer_id)
+                .await;
         }
     }
     let _ = app;
@@ -237,7 +248,10 @@ pub async fn set_module_enabled(
 
 #[tauri::command]
 pub fn list_manual_targets(state: State<'_, AppState>) -> Result<Vec<ManualTarget>, String> {
-    state.engine.list_manual_targets().map_err(|e| e.to_string())
+    state
+        .engine
+        .list_manual_targets()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -496,7 +510,10 @@ pub async fn shares_pick_file_android() -> Result<Option<serde_json::Value>, Str
 #[cfg(feature = "mod-shares")]
 #[tauri::command]
 pub fn shares_remove_local(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    state.shares.remove_local_share(&id).map_err(|e| e.to_string())
+    state
+        .shares
+        .remove_local_share(&id)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(not(feature = "mod-shares"))]
@@ -520,7 +537,9 @@ pub async fn shares_browse_remote_roots(
 
 #[cfg(not(feature = "mod-shares"))]
 #[tauri::command]
-pub async fn shares_browse_remote_roots(_peer_id: String) -> Result<Vec<serde_json::Value>, String> {
+pub async fn shares_browse_remote_roots(
+    _peer_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
     Err("shares module is not compiled".into())
 }
 
@@ -571,6 +590,31 @@ pub async fn shares_download_remote_file(
     _root_id: String,
     _rel_path: String,
 ) -> Result<String, String> {
+    Err("shares module is not compiled".into())
+}
+
+#[cfg(feature = "mod-shares")]
+#[tauri::command]
+pub async fn shares_download_remote_folder(
+    state: State<'_, AppState>,
+    peer_id: String,
+    root_id: String,
+    rel_path: String,
+) -> Result<ShareFolderDownloadResult, String> {
+    state
+        .shares
+        .download_remote_folder(&state.engine, &peer_id, &root_id, &rel_path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "mod-shares"))]
+#[tauri::command]
+pub async fn shares_download_remote_folder(
+    _peer_id: String,
+    _root_id: String,
+    _rel_path: String,
+) -> Result<serde_json::Value, String> {
     Err("shares module is not compiled".into())
 }
 
@@ -1171,10 +1215,7 @@ pub async fn scan_qr_and_connect_android(
 }
 
 #[tauri::command]
-pub async fn open_file_external(
-    app: tauri::AppHandle,
-    path_or_uri: String,
-) -> Result<(), String> {
+pub async fn open_file_external(app: tauri::AppHandle, path_or_uri: String) -> Result<(), String> {
     crate::preview::open_file_external(&app, &path_or_uri).await
 }
 
@@ -1187,15 +1228,20 @@ pub async fn resolve_preview_names(
     let mut out = std::collections::HashMap::new();
     #[cfg(target_os = "android")]
     {
+        use std::collections::HashSet;
         use tauri::Manager;
         if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
-            for path in paths {
-                if path.starts_with("content://") {
-                    if let Ok(meta) = bridge.get_content_uri_meta_async(&path).await {
-                        if !meta.name.trim().is_empty() {
-                            out.insert(path, meta.name);
-                        }
-                    }
+            let mut seen = HashSet::new();
+            let unique_uris: Vec<String> = paths
+                .into_iter()
+                .filter(|p| p.starts_with("content://") && seen.insert(p.clone()))
+                .collect();
+            if !unique_uris.is_empty() {
+                if let Ok(resolved) = bridge
+                    .resolve_content_uri_display_names_async(unique_uris)
+                    .await
+                {
+                    out.extend(resolved);
                 }
             }
         }

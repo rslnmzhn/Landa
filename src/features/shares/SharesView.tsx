@@ -1,14 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft,
   Download,
-  Eye,
   File,
-  FilePlus,
   Folder,
-  FolderPlus,
-  Trash2,
+  Loader2,
 } from "lucide-react";
 import { api, formatBytes } from "../../core/api";
 import type {
@@ -17,14 +14,19 @@ import type {
   PeerInfo,
   ShareEntry,
   ShareRootInfo,
+  TransferProgressInfo,
 } from "../../core/types";
 import type { TranslationDict } from "../../i18n/translations";
 import {
-  GlassBadge,
   GlassButton,
   GlassCard,
   GlassSegmented,
 } from "../../components/glass/GlassPrimitives";
+import {
+  ActiveReceiveTransfers,
+  LocalSharesSection,
+  ShareBreadcrumbs,
+} from "./SharesSections";
 
 const THUMB_EXTS = new Set(["png", "jpg", "jpeg", "webp", "gif"]);
 const thumbMemoryCache = new Map<string, string>();
@@ -56,12 +58,16 @@ function LazyShareThumbnail({
   const canThumb = !entry.isDir && isThumbImage(entry.name);
 
   useEffect(() => {
-    if (!canThumb) return;
+    if (!canThumb) {
+      setDataUrl(null);
+      return;
+    }
     const cached = thumbMemoryCache.get(cacheKey);
     if (cached) {
       setDataUrl(cached);
       return;
     }
+    setDataUrl(null);
     const el = containerRef.current;
     if (!el) return;
 
@@ -105,9 +111,15 @@ function LazyShareThumbnail({
           className="h-full w-full object-cover transition-opacity duration-200"
         />
       ) : entry.isDir ? (
-        <Folder className={`${iconClass} text-indigo-500 dark:text-indigo-300`} />
+        <Folder
+          className={`${iconClass} text-indigo-500 dark:text-indigo-300`}
+          aria-hidden="true"
+        />
       ) : (
-        <File className={`${iconClass} text-slate-600 dark:text-white/60`} />
+        <File
+          className={`${iconClass} text-slate-600 dark:text-white/60`}
+          aria-hidden="true"
+        />
       )}
     </div>
   );
@@ -118,6 +130,9 @@ interface SharesViewProps {
   identity: LocalIdentityInfo | null;
   peers: PeerInfo[];
   enabled: boolean;
+  activeTransfers?: TransferProgressInfo[];
+  downloadingKey?: string | null;
+  onDownloadingKeyChange?: Dispatch<SetStateAction<string | null>>;
   onPreviewRemoteFile: (peerId: string, rootId: string, relPath: string) => void;
   onPreviewLocalPath: (path: string) => void;
   onError: (msg: string) => void;
@@ -129,6 +144,9 @@ export function SharesView({
   identity,
   peers,
   enabled,
+  activeTransfers = [],
+  downloadingKey: controlledDownloadingKey,
+  onDownloadingKeyChange,
   onPreviewRemoteFile,
   onPreviewLocalPath,
   onError,
@@ -142,6 +160,20 @@ export function SharesView({
   const [entries, setEntries] = useState<ShareEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
+  const [localDownloadingKey, setLocalDownloadingKey] = useState<string | null>(
+    null
+  );
+
+  const downloadingKey =
+    controlledDownloadingKey !== undefined
+      ? controlledDownloadingKey
+      : localDownloadingKey;
+  const setDownloadingKey = onDownloadingKeyChange ?? setLocalDownloadingKey;
+
+  const downloadingRef = useRef(false);
+  const browseReqIdRef = useRef(0);
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
 
   const isAndroid =
     identity?.os === "android" ||
@@ -149,18 +181,52 @@ export function SharesView({
 
   const trustedOnlinePeers = peers.filter((p) => p.isTrusted && p.isOnline);
 
-  const loadLocal = async () => {
+  useEffect(() => {
+    if (
+      selectedPeerId &&
+      !peers.some((p) => p.peerId === selectedPeerId && p.isTrusted && p.isOnline)
+    ) {
+      browseReqIdRef.current++;
+      setSelectedPeerId("");
+      setRemoteRoots([]);
+      setActiveRoot(null);
+      setRelPath("");
+      setEntries([]);
+      setLoading(false);
+    }
+  }, [peers, selectedPeerId]);
+
+  const loadLocal = useCallback(async () => {
     try {
       setLocalShares(await api.sharesListLocal());
+    } catch (e) {
+      onErrorRef.current(String(e));
+    }
+  }, []);
+
+  const handleRemoveLocal = async (id: string) => {
+    try {
+      await api.sharesRemoveLocal(id);
+      await loadLocal();
     } catch (e) {
       onError(String(e));
     }
   };
 
   useEffect(() => {
-    if (enabled) {
-      loadLocal();
-    }
+    if (!enabled) return;
+    let cancelled = false;
+    api
+      .sharesListLocal()
+      .then((list) => {
+        if (!cancelled) setLocalShares(list);
+      })
+      .catch((e) => {
+        if (!cancelled) onErrorRef.current(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [enabled]);
 
   const handleAddLocal = async (directory: boolean) => {
@@ -183,57 +249,91 @@ export function SharesView({
   };
 
   const handleSelectPeer = async (peerId: string) => {
+    const reqId = ++browseReqIdRef.current;
     setSelectedPeerId(peerId);
+    setRemoteRoots([]);
     setActiveRoot(null);
     setRelPath("");
     setEntries([]);
     if (!peerId) {
-      setRemoteRoots([]);
+      setLoading(false);
       return;
     }
     setLoading(true);
     try {
-      setRemoteRoots(await api.sharesBrowseRemoteRoots(peerId));
+      const roots = await api.sharesBrowseRemoteRoots(peerId);
+      if (browseReqIdRef.current === reqId) {
+        setRemoteRoots(roots);
+      }
     } catch (e) {
-      onError(String(e));
+      if (browseReqIdRef.current === reqId) {
+        onError(String(e));
+      }
     } finally {
-      setLoading(false);
+      if (browseReqIdRef.current === reqId) {
+        setLoading(false);
+      }
     }
   };
 
   const handleOpenRoot = async (root: ShareRootInfo) => {
-    setActiveRoot(root);
-    setRelPath("");
+    if (!selectedPeerId) return;
+    const reqId = ++browseReqIdRef.current;
     setLoading(true);
     try {
-      setEntries(await api.sharesBrowseRemoteDir(selectedPeerId, root.id, ""));
+      const nextEntries = await api.sharesBrowseRemoteDir(
+        selectedPeerId,
+        root.id,
+        ""
+      );
+      if (browseReqIdRef.current === reqId) {
+        setActiveRoot(root);
+        setRelPath("");
+        setEntries(nextEntries);
+      }
     } catch (e) {
-      onError(String(e));
+      if (browseReqIdRef.current === reqId) {
+        onError(String(e));
+      }
     } finally {
-      setLoading(false);
+      if (browseReqIdRef.current === reqId) {
+        setLoading(false);
+      }
     }
   };
 
   const handleOpenDir = async (nextRel: string) => {
-    if (!activeRoot) return;
-    setRelPath(nextRel);
+    if (!activeRoot || !selectedPeerId) return;
+    const reqId = ++browseReqIdRef.current;
     setLoading(true);
     try {
-      setEntries(
-        await api.sharesBrowseRemoteDir(selectedPeerId, activeRoot.id, nextRel)
+      const nextEntries = await api.sharesBrowseRemoteDir(
+        selectedPeerId,
+        activeRoot.id,
+        nextRel
       );
+      if (browseReqIdRef.current === reqId) {
+        setRelPath(nextRel);
+        setEntries(nextEntries);
+      }
     } catch (e) {
-      onError(String(e));
+      if (browseReqIdRef.current === reqId) {
+        onError(String(e));
+      }
     } finally {
-      setLoading(false);
+      if (browseReqIdRef.current === reqId) {
+        setLoading(false);
+      }
     }
   };
 
   const handleBack = () => {
     if (!activeRoot) return;
     if (!relPath) {
+      browseReqIdRef.current++;
       setActiveRoot(null);
       setEntries([]);
+      setLoading(false);
       return;
     }
     const parts = relPath.split("/").filter(Boolean);
@@ -241,19 +341,78 @@ export function SharesView({
     handleOpenDir(parts.join("/"));
   };
 
-  const handleDownload = async (entry: ShareEntry) => {
-    if (!activeRoot) return;
+  const runDownload = async (key: string, task: () => Promise<string>) => {
+    if (downloadingRef.current || downloadingKey !== null) return;
+    downloadingRef.current = true;
+    setDownloadingKey(key);
     try {
+      const notice = await task();
+      onNotice(notice);
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      downloadingRef.current = false;
+      setDownloadingKey((prev) => (prev === key ? null : prev));
+    }
+  };
+
+  const handleDownloadFolder = (
+    peerId: string,
+    rootId: string,
+    targetRelPath: string,
+    key: string
+  ) =>
+    runDownload(key, async () => {
+      const res = await api.sharesDownloadRemoteFolder(
+        peerId,
+        rootId,
+        targetRelPath
+      );
+      return `${t.shares.downloadedTo}: ${res.destination} (${res.fileCount} ${t.activity.filesUnit})`;
+    });
+
+  const handleDownloadRoot = async (root: ShareRootInfo) => {
+    if (!selectedPeerId) return;
+    const key = `root:${selectedPeerId}:${root.id}`;
+    if (root.isDir) {
+      await handleDownloadFolder(selectedPeerId, root.id, "", key);
+      return;
+    }
+    await runDownload(key, async () => {
+      const saved = await api.sharesDownloadRemoteFile(
+        selectedPeerId,
+        root.id,
+        ""
+      );
+      return `${t.shares.downloadedTo}: ${saved}`;
+    });
+  };
+
+  const handleDownload = async (entry: ShareEntry) => {
+    if (!activeRoot || !selectedPeerId) return;
+    const key = `entry:${selectedPeerId}:${activeRoot.id}:${entry.relPath || entry.name}`;
+    if (entry.isDir) {
+      await handleDownloadFolder(
+        selectedPeerId,
+        activeRoot.id,
+        entry.relPath,
+        key
+      );
+      return;
+    }
+    await runDownload(key, async () => {
       const saved = await api.sharesDownloadRemoteFile(
         selectedPeerId,
         activeRoot.id,
         entry.relPath
       );
-      onNotice(`${t.shares.downloadedTo}: ${saved}`);
-    } catch (e) {
-      onError(String(e));
-    }
+      return `${t.shares.downloadedTo}: ${saved}`;
+    });
   };
+
+  const activeReceiveTransfers = activeTransfers.filter(
+    (tr) => tr.direction === "receive" && tr.status === "transferring"
+  );
 
   if (!enabled) {
     return (
@@ -270,66 +429,13 @@ export function SharesView({
       </h1>
 
       {/* My Shared Folders */}
-      <GlassCard className="p-5 space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
-            {t.shares.myShares}
-          </h2>
-          <div className="flex items-center gap-2">
-            <GlassButton size="sm" onClick={() => handleAddLocal(true)}>
-              <FolderPlus className="h-4 w-4" />
-              <span>{t.shares.addFolder}</span>
-            </GlassButton>
-            <GlassButton size="sm" onClick={() => handleAddLocal(false)}>
-              <FilePlus className="h-4 w-4" />
-              <span>{t.shares.addFile}</span>
-            </GlassButton>
-          </div>
-        </div>
-
-        {localShares.length === 0 ? (
-          <p className="text-sm text-slate-700/65 dark:text-white/50">
-            {t.shares.noLocalShares}
-          </p>
-        ) : (
-          <div className="space-y-2">
-            {localShares.map((root) => (
-              <div
-                key={root.id}
-                className="flex items-center justify-between gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2.5"
-              >
-                <button
-                  type="button"
-                  disabled={root.isDir}
-                  onClick={() => !root.isDir && onPreviewLocalPath(root.path)}
-                  className={`flex items-center gap-3 min-w-0 flex-1 text-left ${
-                    !root.isDir ? "cursor-pointer" : "cursor-default"
-                  }`}
-                >
-                  {root.isDir ? (
-                    <Folder className="h-5 w-5 shrink-0 text-indigo-500 dark:text-indigo-300" />
-                  ) : (
-                    <File className="h-5 w-5 shrink-0 text-sky-500 dark:text-sky-300" />
-                  )}
-                  <span className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
-                    {root.name}
-                  </span>
-                </button>
-                <GlassButton
-                  variant="ghost"
-                  size="sm"
-                  onClick={async () => {
-                    await api.sharesRemoveLocal(root.id);
-                    await loadLocal();
-                  }}
-                >
-                  <Trash2 className="h-4 w-4" />
-                </GlassButton>
-              </div>
-            ))}
-          </div>
-        )}
-      </GlassCard>
+      <LocalSharesSection
+        t={t}
+        localShares={localShares}
+        onAddLocal={handleAddLocal}
+        onRemoveLocal={handleRemoveLocal}
+        onPreviewLocalPath={onPreviewLocalPath}
+      />
 
       {/* Friends' Shares */}
       <GlassCard className="p-5 space-y-4">
@@ -349,6 +455,8 @@ export function SharesView({
           )}
         </div>
 
+        <ActiveReceiveTransfers t={t} transfers={activeReceiveTransfers} />
+
         {trustedOnlinePeers.length === 0 ? (
           <p className="text-sm text-slate-700/65 dark:text-white/50">
             {t.shares.noFriends}
@@ -363,38 +471,70 @@ export function SharesView({
           </div>
         ) : !activeRoot ? (
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            {remoteRoots.map((root) => (
-              <button
-                key={root.id}
-                type="button"
-                onClick={() => handleOpenRoot(root)}
-                className="flex min-h-[52px] items-center gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-3 text-left transition hover:bg-white/30 dark:hover:bg-white/10"
-              >
-                {root.isDir ? (
-                  <Folder className="h-5 w-5 text-indigo-500 dark:text-indigo-300" />
-                ) : (
-                  <File className="h-5 w-5 text-sky-500 dark:text-sky-300" />
-                )}
-                <span className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
-                  {root.name}
-                </span>
-              </button>
-            ))}
+            {remoteRoots.map((root) => {
+              const rootKey = `root:${selectedPeerId}:${root.id}`;
+              const isDownloading = downloadingKey === rootKey;
+              const downloadLabel = root.isDir
+                ? t.shares.downloadFolder
+                : t.shares.download;
+              return (
+                <div
+                  key={root.id}
+                  className="flex min-h-[52px] items-center justify-between gap-2 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2 transition hover:bg-white/30 dark:hover:bg-white/10"
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleOpenRoot(root)}
+                    className="flex min-h-[44px] min-w-0 flex-1 items-center gap-3 text-left"
+                  >
+                    {root.isDir ? (
+                      <Folder
+                        className="h-5 w-5 shrink-0 text-indigo-500 dark:text-indigo-300"
+                        aria-hidden="true"
+                      />
+                    ) : (
+                      <File
+                        className="h-5 w-5 shrink-0 text-sky-500 dark:text-sky-300"
+                        aria-hidden="true"
+                      />
+                    )}
+                    <span className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
+                      {root.name}
+                    </span>
+                  </button>
+                  <GlassButton
+                    size="sm"
+                    variant="glass"
+                    disabled={downloadingKey !== null}
+                    onClick={() => handleDownloadRoot(root)}
+                    aria-label={`${downloadLabel}: ${root.name}`}
+                    title={downloadLabel}
+                    className="min-w-[44px] shrink-0"
+                  >
+                    {isDownloading ? (
+                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                    ) : (
+                      <Download className="h-4 w-4" aria-hidden="true" />
+                    )}
+                  </GlassButton>
+                </div>
+              );
+            })}
           </div>
         ) : (
           <div className="space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2 min-w-0">
+              <div className="flex flex-wrap items-center gap-2 min-w-0 flex-1">
                 <GlassButton size="sm" variant="ghost" onClick={handleBack}>
-                  <ArrowLeft className="h-4 w-4" />
+                  <ArrowLeft className="h-4 w-4" aria-hidden="true" />
                   <span>{t.shares.back}</span>
                 </GlassButton>
-                <GlassBadge>
-                  <span className="font-mono text-xs truncate max-w-[180px] sm:max-w-xs">
-                    {activeRoot.name}
-                    {relPath ? `/${relPath}` : ""}
-                  </span>
-                </GlassBadge>
+                <ShareBreadcrumbs
+                  label={t.shares.breadcrumbsLabel}
+                  rootName={activeRoot.name}
+                  relPath={relPath}
+                  onNavigate={handleOpenDir}
+                />
               </div>
 
               <GlassSegmented
@@ -413,140 +553,137 @@ export function SharesView({
               </p>
             ) : viewMode === "grid" ? (
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4">
-                {entries.map((entry) => (
-                  <div
-                    key={entry.relPath || entry.name}
-                    className="flex flex-col justify-between gap-2 rounded-2xl bg-white/20 dark:bg-white/5 p-2.5 transition hover:bg-white/25 dark:hover:bg-white/10"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (entry.isDir) {
-                          handleOpenDir(entry.relPath);
-                        } else {
-                          onPreviewRemoteFile(
-                            selectedPeerId,
-                            activeRoot.id,
-                            entry.relPath
-                          );
-                        }
-                      }}
-                      className="flex flex-col gap-2 text-left"
+                {entries.map((entry) => {
+                  const entryKey = `entry:${selectedPeerId}:${activeRoot.id}:${entry.relPath || entry.name}`;
+                  const isDownloading = downloadingKey === entryKey;
+                  const downloadLabel = entry.isDir
+                    ? t.shares.downloadFolder
+                    : t.shares.download;
+                  return (
+                    <div
+                      key={entry.relPath || entry.name}
+                      className="flex flex-col justify-between gap-2 rounded-2xl bg-white/20 dark:bg-white/5 p-2.5 transition hover:bg-white/25 dark:hover:bg-white/10"
                     >
-                      <LazyShareThumbnail
-                        peerId={selectedPeerId}
-                        rootId={activeRoot.id}
-                        entry={entry}
-                        sizeClass="aspect-square w-full rounded-xl"
-                        iconClass="h-8 w-8"
-                      />
-                      <div className="min-w-0 px-0.5">
-                        <div className="truncate text-xs font-medium text-slate-900/90 dark:text-white/90">
-                          {entry.name}
-                        </div>
-                        {!entry.isDir && (
-                          <div className="font-mono text-[11px] text-slate-700/65 dark:text-white/45">
-                            {formatBytes(entry.sizeBytes)}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (entry.isDir) {
+                            handleOpenDir(entry.relPath);
+                          } else {
+                            onPreviewRemoteFile(
+                              selectedPeerId,
+                              activeRoot.id,
+                              entry.relPath
+                            );
+                          }
+                        }}
+                        className="flex flex-col gap-2 text-left"
+                      >
+                        <LazyShareThumbnail
+                          peerId={selectedPeerId}
+                          rootId={activeRoot.id}
+                          entry={entry}
+                          sizeClass="aspect-square w-full rounded-xl"
+                          iconClass="h-8 w-8"
+                        />
+                        <div className="min-w-0 px-0.5">
+                          <div className="truncate text-xs font-medium text-slate-900/90 dark:text-white/90">
+                            {entry.name}
                           </div>
-                        )}
-                      </div>
-                    </button>
-                    {!entry.isDir && (
+                          {!entry.isDir && (
+                            <div className="font-mono text-[11px] text-slate-700/65 dark:text-white/45">
+                              {formatBytes(entry.sizeBytes)}
+                            </div>
+                          )}
+                        </div>
+                      </button>
                       <div className="flex items-center justify-end gap-1">
                         <GlassButton
                           size="sm"
-                          variant="ghost"
-                          onClick={() =>
-                            onPreviewRemoteFile(
-                              selectedPeerId,
-                              activeRoot.id,
-                              entry.relPath
-                            )
-                          }
-                          className="px-2.5"
-                        >
-                          <Eye className="h-3.5 w-3.5" />
-                        </GlassButton>
-                        <GlassButton
-                          size="sm"
                           variant="glass"
+                          disabled={downloadingKey !== null}
                           onClick={() => handleDownload(entry)}
-                          className="px-2.5"
+                          aria-label={`${downloadLabel}: ${entry.name}`}
+                          title={downloadLabel}
+                          className="min-w-[44px] px-2.5"
                         >
-                          <Download className="h-3.5 w-3.5" />
+                          {isDownloading ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                          ) : (
+                            <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                          )}
                         </GlassButton>
                       </div>
-                    )}
-                  </div>
-                ))}
+                    </div>
+                  );
+                })}
               </div>
             ) : (
               <div className="space-y-1.5">
-                {entries.map((entry) => (
-                  <div
-                    key={entry.relPath || entry.name}
-                    className="flex items-center justify-between gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2.5"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (entry.isDir) {
-                          handleOpenDir(entry.relPath);
-                        } else {
-                          onPreviewRemoteFile(
-                            selectedPeerId,
-                            activeRoot.id,
-                            entry.relPath
-                          );
-                        }
-                      }}
-                      className="flex min-h-[44px] min-w-0 flex-1 items-center gap-3 text-left"
+                {entries.map((entry) => {
+                  const entryKey = `entry:${selectedPeerId}:${activeRoot.id}:${entry.relPath || entry.name}`;
+                  const isDownloading = downloadingKey === entryKey;
+                  const downloadLabel = entry.isDir
+                    ? t.shares.downloadFolder
+                    : t.shares.download;
+                  return (
+                    <div
+                      key={entry.relPath || entry.name}
+                      className="flex items-center justify-between gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2.5"
                     >
-                      <LazyShareThumbnail
-                        peerId={selectedPeerId}
-                        rootId={activeRoot.id}
-                        entry={entry}
-                        sizeClass="h-10 w-10 rounded-xl"
-                        iconClass="h-5 w-5"
-                      />
-                      <div className="min-w-0">
-                        <div className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
-                          {entry.name}
-                        </div>
-                        {!entry.isDir && (
-                          <div className="font-mono text-xs text-slate-700/65 dark:text-white/45">
-                            {formatBytes(entry.sizeBytes)}
-                          </div>
-                        )}
-                      </div>
-                    </button>
-                    {!entry.isDir && (
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <GlassButton
-                          size="sm"
-                          variant="ghost"
-                          onClick={() =>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (entry.isDir) {
+                            handleOpenDir(entry.relPath);
+                          } else {
                             onPreviewRemoteFile(
                               selectedPeerId,
                               activeRoot.id,
                               entry.relPath
-                            )
+                            );
                           }
-                          className="px-3"
-                        >
-                          <Eye className="h-4 w-4" />
-                        </GlassButton>
+                        }}
+                        className="flex min-h-[44px] min-w-0 flex-1 items-center gap-3 text-left"
+                      >
+                        <LazyShareThumbnail
+                          peerId={selectedPeerId}
+                          rootId={activeRoot.id}
+                          entry={entry}
+                          sizeClass="h-10 w-10 rounded-xl"
+                          iconClass="h-5 w-5"
+                        />
+                        <div className="min-w-0">
+                          <div className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
+                            {entry.name}
+                          </div>
+                          {!entry.isDir && (
+                            <div className="font-mono text-xs text-slate-700/65 dark:text-white/45">
+                              {formatBytes(entry.sizeBytes)}
+                            </div>
+                          )}
+                        </div>
+                      </button>
+                      <div className="flex items-center gap-1.5 shrink-0">
                         <GlassButton
                           size="sm"
                           variant="glass"
+                          disabled={downloadingKey !== null}
                           onClick={() => handleDownload(entry)}
+                          aria-label={`${downloadLabel}: ${entry.name}`}
+                          title={downloadLabel}
+                          className="min-w-[44px]"
                         >
-                          <Download className="h-4 w-4" />
+                          {isDownloading ? (
+                            <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                          ) : (
+                            <Download className="h-4 w-4" aria-hidden="true" />
+                          )}
                         </GlassButton>
                       </div>
-                    )}
-                  </div>
-                ))}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

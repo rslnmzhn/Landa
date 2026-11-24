@@ -94,7 +94,10 @@ async fn clipboard_requires_trust_and_syncs_between_friends() {
     // Pair as friends
     engine_a.send_friend_request(&info_b.peer_id).await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
-    engine_b.respond_friend_request(&info_a.peer_id, true).await.unwrap();
+    engine_b
+        .respond_friend_request(&info_a.peer_id, true)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     clip_a
@@ -102,7 +105,10 @@ async fn clipboard_requires_trust_and_syncs_between_friends() {
         .await
         .unwrap();
 
-    let remote_items = clip_a.fetch_remote_items(&engine_a, &info_b.peer_id).await.unwrap();
+    let remote_items = clip_a
+        .fetch_remote_items(&engine_a, &info_b.peer_id)
+        .await
+        .unwrap();
     assert_eq!(remote_items.len(), 1);
     assert_eq!(remote_items[0].text, "https://landa.dev");
 
@@ -119,7 +125,10 @@ async fn clipboard_requires_trust_and_syncs_between_friends() {
         .await
         .unwrap();
 
-    let remote_after_img = clip_a.fetch_remote_items(&engine_a, &info_b.peer_id).await.unwrap();
+    let remote_after_img = clip_a
+        .fetch_remote_items(&engine_a, &info_b.peer_id)
+        .await
+        .unwrap();
     assert_eq!(remote_after_img.len(), 2);
     let img_item = &remote_after_img[0];
     assert_eq!(img_item.kind, ClipboardContentKind::Image);
@@ -146,7 +155,10 @@ async fn clipboard_requires_trust_and_syncs_between_friends() {
 
     // Disabling module blocks incoming requests
     engine_b.set_module_enabled("clipboard", false).unwrap();
-    assert!(clip_a.fetch_remote_items(&engine_a, &info_b.peer_id).await.is_err());
+    assert!(clip_a
+        .fetch_remote_items(&engine_a, &info_b.peer_id)
+        .await
+        .is_err());
 
     engine_a.shutdown();
     engine_b.shutdown();

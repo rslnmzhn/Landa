@@ -280,7 +280,10 @@ mod tests {
 
         let content_after_rotate = fs::read_to_string(&log_path).unwrap();
         let rotated_lines: Vec<&str> = content_after_rotate.lines().collect();
-        assert_eq!(rotated_lines, vec!["line-7", "line-8", "line-9", "line-10", "line-11"]);
+        assert_eq!(
+            rotated_lines,
+            vec!["line-7", "line-8", "line-9", "line-10", "line-11"]
+        );
 
         for i in 12..=15 {
             sink.write_bytes(format!("line-{i}\n").as_bytes());
@@ -288,7 +291,11 @@ mod tests {
 
         let content = fs::read_to_string(&log_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert!(lines.len() <= 10, "expected <= 10 lines, got {}", lines.len());
+        assert!(
+            lines.len() <= 10,
+            "expected <= 10 lines, got {}",
+            lines.len()
+        );
         assert!(!lines.contains(&"line-1"));
         assert!(lines.contains(&"line-15"));
         assert_eq!(sink.read_tail(3), "line-13\nline-14\nline-15");

@@ -7,9 +7,8 @@ use serde::{Deserialize, Serialize};
 pub const DISCOVERY_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 40, 45);
 
 const NON_LAN_TOKENS: &[&str] = &[
-    "tun", "utun", "tap", "wg", "ppp", "pptp", "l2tp", "ipsec", "xfrm", "rmnet", "ccmni",
-    "pdp_ip", "wwan", "clat", "dummy", "ifb", "sit", "gre", "vti", "ip6tnl", "ovpn", "warp",
-    "lo",
+    "tun", "utun", "tap", "wg", "ppp", "pptp", "l2tp", "ipsec", "xfrm", "rmnet", "ccmni", "pdp_ip",
+    "wwan", "clat", "dummy", "ifb", "sit", "gre", "vti", "ip6tnl", "ovpn", "warp", "lo",
 ];
 
 const NON_LAN_HINTS: &[&str] = &[
@@ -345,8 +344,12 @@ mod tests {
         set_excluded_subnets(&["198.51.100.0/24".into()]);
 
         let active = enumerate_lan_interfaces();
-        assert!(!active.iter().any(|i| i.ip == Ipv4Addr::new(198, 51, 100, 10)));
-        assert!(active.iter().any(|i| i.ip == Ipv4Addr::new(203, 0, 113, 20)));
+        assert!(!active
+            .iter()
+            .any(|i| i.ip == Ipv4Addr::new(198, 51, 100, 10)));
+        assert!(active
+            .iter()
+            .any(|i| i.ip == Ipv4Addr::new(203, 0, 113, 20)));
         assert!(!is_ip_in_local_lan(Ipv4Addr::new(198, 51, 100, 55)));
         assert!(is_ip_in_local_lan(Ipv4Addr::new(203, 0, 113, 55)));
 
@@ -362,7 +365,9 @@ mod tests {
         // Re-enabling restores interface to active list
         set_excluded_subnets(&[]);
         let restored = enumerate_lan_interfaces();
-        assert!(restored.iter().any(|i| i.ip == Ipv4Addr::new(198, 51, 100, 10)));
+        assert!(restored
+            .iter()
+            .any(|i| i.ip == Ipv4Addr::new(198, 51, 100, 10)));
 
         *LAN_INTERFACE_HOOK.write().unwrap() = prev_hook;
         set_excluded_subnets(&prev_excluded);

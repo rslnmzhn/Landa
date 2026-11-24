@@ -72,6 +72,8 @@ pub struct TransferHistoryRecord {
     pub file_count: usize,
     pub total_bytes: u64,
     pub saved_paths: Vec<String>,
+    #[serde(default)]
+    pub relative_paths: Vec<String>,
     pub status: String,
     pub error_message: Option<String>,
     pub created_at: i64,
@@ -98,4 +100,29 @@ pub enum CoreEvent {
         event_name: String,
         data: serde_json::Value,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_history_record_deserializes_legacy_json_without_relative_paths() {
+        let legacy_json = r#"{
+            "id": "hist-1",
+            "direction": "send",
+            "peerId": "peer-1",
+            "peerName": "LegacyPeer",
+            "fileCount": 1,
+            "totalBytes": 42,
+            "savedPaths": ["/tmp/file.txt"],
+            "status": "completed",
+            "errorMessage": null,
+            "createdAt": 1000
+        }"#;
+        let parsed: TransferHistoryRecord = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.id, "hist-1");
+        assert_eq!(parsed.saved_paths, vec!["/tmp/file.txt".to_string()]);
+        assert!(parsed.relative_paths.is_empty());
+    }
 }

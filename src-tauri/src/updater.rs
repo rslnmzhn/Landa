@@ -236,7 +236,7 @@ pub async fn download_and_verify_update(
     if target_path.exists() {
         if let Ok(existing_sha) = compute_file_sha256(&target_path).await {
             if existing_sha == expected_sha {
-                let path_str = finalize_verified_update_path(app, &target_path, &safe_name).await?;
+                let path_str = target_path.to_string_lossy().to_string();
                 emit_progress(
                     app,
                     "ready",
@@ -257,15 +257,11 @@ pub async fn download_and_verify_update(
     emit_progress(app, "downloading", 0, asset.size, None, None);
 
     let client = build_http_client()?;
-    let mut resp = client
-        .get(&asset.download_url)
-        .send()
-        .await
-        .map_err(|e| {
-            let msg = format!("Download failed: {e}");
-            emit_progress(app, "failed", 0, asset.size, None, Some(msg.clone()));
-            msg
-        })?;
+    let mut resp = client.get(&asset.download_url).send().await.map_err(|e| {
+        let msg = format!("Download failed: {e}");
+        emit_progress(app, "failed", 0, asset.size, None, Some(msg.clone()));
+        msg
+    })?;
 
     if !resp.status().is_success() {
         let msg = format!("Download returned HTTP {}", resp.status());
@@ -294,7 +290,14 @@ pub async fn download_and_verify_update(
             Err(e) => {
                 let _ = tokio::fs::remove_file(&part_path).await;
                 let msg = format!("Download stream error: {e}");
-                emit_progress(app, "failed", downloaded, total_bytes, None, Some(msg.clone()));
+                emit_progress(
+                    app,
+                    "failed",
+                    downloaded,
+                    total_bytes,
+                    None,
+                    Some(msg.clone()),
+                );
                 return Err(msg);
             }
         };
@@ -303,7 +306,14 @@ pub async fn download_and_verify_update(
         if downloaded > MAX_UPDATE_FILE_BYTES {
             let _ = tokio::fs::remove_file(&part_path).await;
             let msg = "Update file exceeded maximum allowed size".to_string();
-            emit_progress(app, "failed", downloaded, total_bytes, None, Some(msg.clone()));
+            emit_progress(
+                app,
+                "failed",
+                downloaded,
+                total_bytes,
+                None,
+                Some(msg.clone()),
+            );
             return Err(msg);
         }
 
@@ -311,7 +321,14 @@ pub async fn download_and_verify_update(
         if let Err(e) = file.write_all(&chunk).await {
             let _ = tokio::fs::remove_file(&part_path).await;
             let msg = format!("Failed to write update file: {e}");
-            emit_progress(app, "failed", downloaded, total_bytes, None, Some(msg.clone()));
+            emit_progress(
+                app,
+                "failed",
+                downloaded,
+                total_bytes,
+                None,
+                Some(msg.clone()),
+            );
             return Err(msg);
         }
 
@@ -334,7 +351,14 @@ pub async fn download_and_verify_update(
             "Downloaded size mismatch: expected {} bytes, got {}",
             asset.size, downloaded
         );
-        emit_progress(app, "failed", downloaded, total_bytes, None, Some(msg.clone()));
+        emit_progress(
+            app,
+            "failed",
+            downloaded,
+            total_bytes,
+            None,
+            Some(msg.clone()),
+        );
         return Err(msg);
     }
 
@@ -342,7 +366,14 @@ pub async fn download_and_verify_update(
     if actual_sha != expected_sha {
         let _ = tokio::fs::remove_file(&part_path).await;
         let msg = "SHA-256 verification failed for downloaded update".to_string();
-        emit_progress(app, "failed", downloaded, total_bytes, None, Some(msg.clone()));
+        emit_progress(
+            app,
+            "failed",
+            downloaded,
+            total_bytes,
+            None,
+            Some(msg.clone()),
+        );
         return Err(msg);
     }
 
@@ -350,7 +381,7 @@ pub async fn download_and_verify_update(
         .await
         .map_err(|e| format!("Failed to finalize update file: {e}"))?;
 
-    let path_str = finalize_verified_update_path(app, &target_path, &safe_name).await?;
+    let path_str = target_path.to_string_lossy().to_string();
     emit_progress(
         app,
         "ready",
@@ -362,123 +393,105 @@ pub async fn download_and_verify_update(
     Ok(path_str)
 }
 
-async fn finalize_verified_update_path(
-    app: &AppHandle,
-    target_path: &Path,
-    safe_name: &str,
-) -> Result<String, String> {
-    #[cfg(target_os = "android")]
-    {
-        let bridge = app
-            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
-            .ok_or_else(|| "Android bridge unavailable".to_string())?;
-        let saved = bridge
-            .save_update_apk_to_downloads_async(&target_path.to_string_lossy(), safe_name)
-            .await?;
-        Ok(saved.display_path)
+fn resolve_verified_update_file(updates_dir: &Path, file_path: &str) -> Result<PathBuf, String> {
+    let canonical_dir = updates_dir
+        .canonicalize()
+        .map_err(|e| format!("Updates directory unavailable: {e}"))?;
+    let canonical_file = PathBuf::from(file_path)
+        .canonicalize()
+        .map_err(|e| format!("Update file not found: {e}"))?;
+
+    if !canonical_file.starts_with(&canonical_dir) || !canonical_file.is_file() {
+        return Err("Invalid update file path".into());
     }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = (app, safe_name);
-        Ok(target_path.to_string_lossy().to_string())
-    }
+    Ok(canonical_file)
 }
 
 pub async fn install_update(app: &AppHandle, file_path: &str) -> Result<(), String> {
-    #[cfg(target_os = "android")]
+    let updates_dir = resolve_updates_dir(app)?;
+    let canonical_file = resolve_verified_update_file(&updates_dir, file_path)?;
+
+    emit_progress(
+        app,
+        "installing",
+        0,
+        0,
+        Some(canonical_file.to_string_lossy().to_string()),
+        None,
+    );
+
+    #[cfg(target_os = "windows")]
     {
-        let _ = file_path;
-        let bridge = app
-            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
-            .ok_or_else(|| "Android bridge unavailable".to_string())?;
-        bridge.open_downloads_folder_async().await
+        let ext = canonical_file
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "exe" {
+            std::process::Command::new(&canonical_file)
+                .spawn()
+                .map_err(|e| format!("Failed to launch installer: {e}"))?;
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                app_handle.exit(0);
+            });
+            return Ok(());
+        }
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .reveal_item_in_dir(&canonical_file)
+            .map_err(|e| format!("Failed to open update folder: {e}"))?;
+        Ok(())
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "linux")]
     {
-        let updates_dir = resolve_updates_dir(app)?;
-        let canonical_dir = updates_dir
-            .canonicalize()
-            .map_err(|e| format!("Updates directory unavailable: {e}"))?;
-        let canonical_file = PathBuf::from(file_path)
-            .canonicalize()
-            .map_err(|e| format!("Update file not found: {e}"))?;
-
-        if !canonical_file.starts_with(&canonical_dir) || !canonical_file.is_file() {
-            return Err("Invalid update file path".into());
+        use std::os::unix::fs::PermissionsExt;
+        let ext = canonical_file
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "appimage" {
+            let perms = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&canonical_file, perms)
+                .map_err(|e| format!("Failed to mark AppImage executable: {e}"))?;
+            std::process::Command::new(&canonical_file)
+                .spawn()
+                .map_err(|e| format!("Failed to launch AppImage: {e}"))?;
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                app_handle.exit(0);
+            });
+            return Ok(());
         }
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .reveal_item_in_dir(&canonical_file)
+            .map_err(|e| format!("Failed to open update folder: {e}"))?;
+        Ok(())
+    }
 
-        emit_progress(
-            app,
-            "installing",
-            0,
-            0,
-            Some(canonical_file.to_string_lossy().to_string()),
-            None,
-        );
-
-        #[cfg(target_os = "windows")]
-        {
-            let ext = canonical_file
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if ext == "exe" {
-                std::process::Command::new(&canonical_file)
-                    .spawn()
-                    .map_err(|e| format!("Failed to launch installer: {e}"))?;
-                let app_handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(350)).await;
-                    app_handle.exit(0);
-                });
-                return Ok(());
-            }
-            use tauri_plugin_opener::OpenerExt;
-            app.opener()
-                .reveal_item_in_dir(&canonical_file)
-                .map_err(|e| format!("Failed to open update folder: {e}"))?;
-            Ok(())
+    #[cfg(target_os = "android")]
+    {
+        if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
+            bridge
+                .install_apk_update_async(&canonical_file.to_string_lossy())
+                .await
+        } else {
+            Err("Android bridge unavailable".into())
         }
+    }
 
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let ext = canonical_file
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if ext == "appimage" {
-                let perms = std::fs::Permissions::from_mode(0o755);
-                std::fs::set_permissions(&canonical_file, perms)
-                    .map_err(|e| format!("Failed to mark AppImage executable: {e}"))?;
-                std::process::Command::new(&canonical_file)
-                    .spawn()
-                    .map_err(|e| format!("Failed to launch AppImage: {e}"))?;
-                let app_handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(350)).await;
-                    app_handle.exit(0);
-                });
-                return Ok(());
-            }
-            use tauri_plugin_opener::OpenerExt;
-            app.opener()
-                .reveal_item_in_dir(&canonical_file)
-                .map_err(|e| format!("Failed to open update folder: {e}"))?;
-            Ok(())
-        }
-
-        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-        {
-            use tauri_plugin_opener::OpenerExt;
-            app.opener()
-                .reveal_item_in_dir(&canonical_file)
-                .map_err(|e| format!("Failed to open update folder: {e}"))?;
-            Ok(())
-        }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .reveal_item_in_dir(&canonical_file)
+            .map_err(|e| format!("Failed to open update folder: {e}"))?;
+        Ok(())
     }
 }
 
@@ -684,5 +697,33 @@ mod tests {
         assert!(sanitize_update_filename("../evil.exe").is_err());
         assert!(sanitize_update_filename("sub/evil.exe").is_err());
         assert!(sanitize_update_filename("landa-v0.5.1-windows-x64-setup.exe").is_ok());
+    }
+
+    #[test]
+    fn resolve_verified_update_file_enforces_updates_dir_containment() {
+        let base = std::env::temp_dir().join(format!(
+            "landa-updater-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let updates_dir = base.join("updates");
+        std::fs::create_dir_all(&updates_dir).unwrap();
+        let valid_apk = updates_dir.join("landa-v0.5.1-android-arm64-v8a.apk");
+        std::fs::write(&valid_apk, b"apk").unwrap();
+        let outside_apk = base.join("outside.apk");
+        std::fs::write(&outside_apk, b"evil").unwrap();
+
+        let resolved = resolve_verified_update_file(&updates_dir, &valid_apk.to_string_lossy());
+        assert!(resolved.is_ok());
+        assert!(
+            resolve_verified_update_file(&updates_dir, &outside_apk.to_string_lossy()).is_err()
+        );
+        assert!(
+            resolve_verified_update_file(&updates_dir, &updates_dir.to_string_lossy()).is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

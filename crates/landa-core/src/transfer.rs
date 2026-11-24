@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use landa_proto::path_policy::{resolve_within_root, sanitize_relative_path, validate_relative_path};
+use landa_proto::path_policy::{
+    resolve_within_root, sanitize_relative_path, validate_relative_path,
+};
 use landa_proto::wire::{
     read_frame, write_frame, TransferDecision, TransferFileMeta, TransferOffer, TransferResultAck,
     MAX_CONTROL_FRAME_BYTES,
@@ -65,7 +67,17 @@ impl TransferManager {
     }
 
     pub fn set_publish_hook(&self, hook: ReceivePublishHook) {
-        *self.publish_hook.write().expect("publish_hook lock poisoned") = Some(hook);
+        *self
+            .publish_hook
+            .write()
+            .expect("publish_hook lock poisoned") = Some(hook);
+    }
+
+    pub fn receive_publish_hook(&self) -> Option<ReceivePublishHook> {
+        self.publish_hook
+            .read()
+            .expect("publish_hook lock poisoned")
+            .clone()
     }
 
     pub fn set_open_source_hook(&self, hook: OpenSourceHook) {
@@ -73,6 +85,20 @@ impl TransferManager {
             .open_source_hook
             .write()
             .expect("open_source_hook lock poisoned") = Some(hook);
+    }
+
+    pub fn register_cancellation(&self, transfer_id: &str, token: CancellationToken) {
+        self.active_cancellations
+            .lock()
+            .expect("active_cancellations lock poisoned")
+            .insert(transfer_id.to_string(), token);
+    }
+
+    pub fn unregister_cancellation(&self, transfer_id: &str) {
+        self.active_cancellations
+            .lock()
+            .expect("active_cancellations lock poisoned")
+            .remove(transfer_id);
     }
 
     pub fn respond_to_offer(&self, transfer_id: &str, accept: bool) -> Result<(), CoreError> {
@@ -161,6 +187,10 @@ impl TransferManager {
             .iter()
             .map(|i| i.source_path.to_string_lossy().to_string())
             .collect();
+        let relative_paths: Vec<String> = items
+            .iter()
+            .map(|i| i.relative_path.replace('\\', "/"))
+            .collect();
 
         let (status, error_message) = match &result {
             Ok(()) => ("completed".to_string(), None),
@@ -177,6 +207,7 @@ impl TransferManager {
             file_count: items.len(),
             total_bytes,
             saved_paths,
+            relative_paths,
             status: status.clone(),
             error_message: error_message.clone(),
             created_at: Utc::now().timestamp_millis(),
@@ -184,22 +215,24 @@ impl TransferManager {
         let _ = self.storage.insert_transfer_history(&record);
         let _ = self.events.send(CoreEvent::HistoryChanged);
 
-        let _ = self.events.send(CoreEvent::TransferProgress(TransferProgressInfo {
-            transfer_id,
-            direction: "send".to_string(),
-            peer_id: peer.peer_id.to_hex(),
-            peer_name: peer.display_name.clone(),
-            current_file: String::new(),
-            files_done: if result.is_ok() { items.len() } else { 0 },
-            file_count: items.len(),
-            bytes_transferred: if result.is_ok() { total_bytes } else { 0 },
-            total_bytes,
-            speed_bps: 0,
-            eta_secs: None,
-            status,
-            error: error_message,
-            saved_paths: Vec::new(),
-        }));
+        let _ = self
+            .events
+            .send(CoreEvent::TransferProgress(TransferProgressInfo {
+                transfer_id,
+                direction: "send".to_string(),
+                peer_id: peer.peer_id.to_hex(),
+                peer_name: peer.display_name.clone(),
+                current_file: String::new(),
+                files_done: if result.is_ok() { items.len() } else { 0 },
+                file_count: items.len(),
+                bytes_transferred: if result.is_ok() { total_bytes } else { 0 },
+                total_bytes,
+                speed_bps: 0,
+                eta_secs: None,
+                status,
+                error: error_message,
+                saved_paths: Vec::new(),
+            }));
 
         result.map(|()| record)
     }
@@ -227,22 +260,27 @@ impl TransferManager {
         };
         write_frame(send, &offer).await?;
 
-        let _ = self.events.send(CoreEvent::TransferProgress(TransferProgressInfo {
-            transfer_id: transfer_id.to_string(),
-            direction: "send".to_string(),
-            peer_id: peer.peer_id.to_hex(),
-            peer_name: peer.display_name.clone(),
-            current_file: items.first().map(|i| i.relative_path.clone()).unwrap_or_default(),
-            files_done: 0,
-            file_count: items.len(),
-            bytes_transferred: 0,
-            total_bytes,
-            speed_bps: 0,
-            eta_secs: None,
-            status: "waiting_approval".to_string(),
-            error: None,
-            saved_paths: Vec::new(),
-        }));
+        let _ = self
+            .events
+            .send(CoreEvent::TransferProgress(TransferProgressInfo {
+                transfer_id: transfer_id.to_string(),
+                direction: "send".to_string(),
+                peer_id: peer.peer_id.to_hex(),
+                peer_name: peer.display_name.clone(),
+                current_file: items
+                    .first()
+                    .map(|i| i.relative_path.clone())
+                    .unwrap_or_default(),
+                files_done: 0,
+                file_count: items.len(),
+                bytes_transferred: 0,
+                total_bytes,
+                speed_bps: 0,
+                eta_secs: None,
+                status: "waiting_approval".to_string(),
+                error: None,
+                saved_paths: Vec::new(),
+            }));
 
         let decision: TransferDecision = tokio::select! {
             _ = cancel.cancelled() => return Err(CoreError::Cancelled),
@@ -317,12 +355,14 @@ impl TransferManager {
             send.write_all(digest.as_bytes()).await?;
         }
 
-        send.finish().map_err(|e| CoreError::InvalidInput(e.to_string()))?;
+        send.finish()
+            .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
 
         let ack: TransferResultAck = read_frame(recv, MAX_CONTROL_FRAME_BYTES).await?;
         if !ack.ok {
             return Err(CoreError::IntegrityMismatch(
-                ack.message.unwrap_or_else(|| "peer verification failed".into()),
+                ack.message
+                    .unwrap_or_else(|| "peer verification failed".into()),
             ));
         }
 
@@ -435,6 +475,10 @@ impl TransferManager {
                 let _ = write_frame(&mut send, &ack).await;
                 let _ = send.finish();
 
+                let relative_paths: Vec<String> = sanitized_paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .collect();
                 let record = TransferHistoryRecord {
                     id: transfer_id.clone(),
                     direction: "receive".to_string(),
@@ -443,28 +487,31 @@ impl TransferManager {
                     file_count: saved_paths.len(),
                     total_bytes: computed_total,
                     saved_paths: saved_paths.clone(),
+                    relative_paths,
                     status: "completed".to_string(),
                     error_message: None,
                     created_at: Utc::now().timestamp_millis(),
                 };
                 let _ = self.storage.insert_transfer_history(&record);
                 let _ = self.events.send(CoreEvent::HistoryChanged);
-                let _ = self.events.send(CoreEvent::TransferProgress(TransferProgressInfo {
-                    transfer_id,
-                    direction: "receive".to_string(),
-                    peer_id: peer.peer_id.to_hex(),
-                    peer_name: peer.display_name.clone(),
-                    current_file: saved_paths.first().cloned().unwrap_or_default(),
-                    files_done: saved_paths.len(),
-                    file_count: offer.files.len(),
-                    bytes_transferred: computed_total,
-                    total_bytes: computed_total,
-                    speed_bps: 0,
-                    eta_secs: None,
-                    status: "completed".to_string(),
-                    error: None,
-                    saved_paths: saved_paths.clone(),
-                }));
+                let _ = self
+                    .events
+                    .send(CoreEvent::TransferProgress(TransferProgressInfo {
+                        transfer_id,
+                        direction: "receive".to_string(),
+                        peer_id: peer.peer_id.to_hex(),
+                        peer_name: peer.display_name.clone(),
+                        current_file: saved_paths.first().cloned().unwrap_or_default(),
+                        files_done: saved_paths.len(),
+                        file_count: offer.files.len(),
+                        bytes_transferred: computed_total,
+                        total_bytes: computed_total,
+                        speed_bps: 0,
+                        eta_secs: None,
+                        status: "completed".to_string(),
+                        error: None,
+                        saved_paths: saved_paths.clone(),
+                    }));
             }
             Err(err) => {
                 let ack = TransferResultAck {
@@ -487,28 +534,31 @@ impl TransferManager {
                     file_count: offer.files.len(),
                     total_bytes: computed_total,
                     saved_paths: Vec::new(),
+                    relative_paths: Vec::new(),
                     status: status.to_string(),
                     error_message: Some(err.to_string()),
                     created_at: Utc::now().timestamp_millis(),
                 };
                 let _ = self.storage.insert_transfer_history(&record);
                 let _ = self.events.send(CoreEvent::HistoryChanged);
-                let _ = self.events.send(CoreEvent::TransferProgress(TransferProgressInfo {
-                    transfer_id,
-                    direction: "receive".to_string(),
-                    peer_id: peer.peer_id.to_hex(),
-                    peer_name: peer.display_name.clone(),
-                    current_file: String::new(),
-                    files_done: 0,
-                    file_count: offer.files.len(),
-                    bytes_transferred: 0,
-                    total_bytes: computed_total,
-                    speed_bps: 0,
-                    eta_secs: None,
-                    status: status.to_string(),
-                    error: Some(err.to_string()),
-                    saved_paths: Vec::new(),
-                }));
+                let _ = self
+                    .events
+                    .send(CoreEvent::TransferProgress(TransferProgressInfo {
+                        transfer_id,
+                        direction: "receive".to_string(),
+                        peer_id: peer.peer_id.to_hex(),
+                        peer_name: peer.display_name.clone(),
+                        current_file: String::new(),
+                        files_done: 0,
+                        file_count: offer.files.len(),
+                        bytes_transferred: 0,
+                        total_bytes: computed_total,
+                        speed_bps: 0,
+                        eta_secs: None,
+                        status: status.to_string(),
+                        error: Some(err.to_string()),
+                        saved_paths: Vec::new(),
+                    }));
             }
         }
 
@@ -567,13 +617,12 @@ impl TransferManager {
                     return Err(CoreError::Cancelled);
                 }
                 let to_read = (remaining as usize).min(buf.len());
-                let n = recv
-                    .read(&mut buf[..to_read])
-                    .await?
-                    .ok_or_else(|| CoreError::Io(std::io::Error::new(
+                let n = recv.read(&mut buf[..to_read]).await?.ok_or_else(|| {
+                    CoreError::Io(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "stream ended before file completed",
-                    )))?;
+                    ))
+                })?;
                 hasher.update(&buf[..n]);
                 file.write_all(&buf[..n]).await?;
                 remaining -= n as u64;
@@ -598,9 +647,9 @@ impl TransferManager {
             file.flush().await?;
 
             let mut expected_digest = [0u8; 32];
-            recv.read_exact(&mut expected_digest)
-                .await
-                .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e)))?;
+            recv.read_exact(&mut expected_digest).await.map_err(|e| {
+                CoreError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e))
+            })?;
             let actual_digest = hasher.finalize();
             if actual_digest.as_bytes() != &expected_digest {
                 return Err(CoreError::IntegrityMismatch(meta.relative_path.clone()));
@@ -726,7 +775,9 @@ fn allocate_unique_destination(root: &Path, rel_path: &Path) -> Result<PathBuf, 
             return Ok(next);
         }
     }
-    Err(CoreError::InvalidInput("too many filename collisions".into()))
+    Err(CoreError::InvalidInput(
+        "too many filename collisions".into(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

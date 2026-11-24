@@ -16,6 +16,7 @@ import type {
   PreviewDescriptor,
   QrConnectInfo,
   ShareEntry,
+  ShareFolderDownloadResult,
   ShareRootInfo,
   ShareThumbnail,
   TransferHistoryRecord,
@@ -91,6 +92,16 @@ export const api = {
     }),
   sharesDownloadRemoteFile: (peerId: string, rootId: string, relPath: string) =>
     invoke<string>("shares_download_remote_file", {
+      peerId,
+      rootId,
+      relPath,
+    }),
+  sharesDownloadRemoteFolder: (
+    peerId: string,
+    rootId: string,
+    relPath: string
+  ) =>
+    invoke<ShareFolderDownloadResult>("shares_download_remote_folder", {
       peerId,
       rootId,
       relPath,

@@ -42,7 +42,10 @@ enum PreviewSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolvedPreviewTarget {
-    File { canonical: PathBuf, size_bytes: u64 },
+    File {
+        canonical: PathBuf,
+        size_bytes: u64,
+    },
     #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
     ContentUri(String),
 }
@@ -75,8 +78,8 @@ impl PreviewServer {
         let opener: Option<ContentUriOpener> = Some(Arc::new(move |uri: String| {
             let app_handle = app.clone();
             Box::pin(async move {
-                let bridge = app_handle
-                    .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()?;
+                let bridge =
+                    app_handle.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()?;
                 bridge.open_content_uri_file_async(&uri).await
             })
         }));
@@ -126,7 +129,10 @@ impl PreviewServer {
 
     fn register(&self, entry: PreviewEntry) -> String {
         let token = Uuid::new_v4().to_string();
-        let mut guard = self.registry.write().expect("preview registry lock poisoned");
+        let mut guard = self
+            .registry
+            .write()
+            .expect("preview registry lock poisoned");
         while guard.order.len() >= MAX_PREVIEW_ENTRIES {
             if let Some(oldest) = guard.order.pop_front() {
                 guard.entries.remove(&oldest);
@@ -306,8 +312,8 @@ pub async fn prepare_file_preview(
         async move {
             #[cfg(target_os = "android")]
             {
-                let bridge = app_handle
-                    .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()?;
+                let bridge =
+                    app_handle.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()?;
                 bridge.resolve_content_uri_for_path_async(&path_owned).await
             }
             #[cfg(not(target_os = "android"))]
@@ -405,10 +411,7 @@ fn authorize_preview_target(
     state: &AppState,
     path_or_uri: &str,
 ) -> Result<(), String> {
-    let history = state
-        .engine
-        .list_history(500)
-        .map_err(|e| e.to_string())?;
+    let history = state.engine.list_history(500).map_err(|e| e.to_string())?;
     if history
         .iter()
         .any(|rec| rec.saved_paths.iter().any(|p| p == path_or_uri))
@@ -513,13 +516,21 @@ async fn handle_http_connection(
     let mut range_header: Option<String> = None;
     loop {
         let mut line = String::new();
-        let read_n = reader.read_line(&mut line).await.map_err(|e| e.to_string())?;
+        let read_n = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| e.to_string())?;
         if read_n == 0 || line == "\r\n" || line == "\n" {
             break;
         }
         header_bytes += read_n;
         if header_bytes > MAX_HTTP_HEADER_BYTES {
-            write_simple_response(&mut writer, "431 Request Header Fields Too Large", "Header too large").await;
+            write_simple_response(
+                &mut writer,
+                "431 Request Header Fields Too Large",
+                "Header too large",
+            )
+            .await;
             return Ok(());
         }
         if let Some((k, v)) = line.split_once(':') {
@@ -561,7 +572,12 @@ async fn handle_http_connection(
             #[cfg(target_os = "android")]
             {
                 let Some(open_fn) = opener.as_ref() else {
-                    write_simple_response(&mut writer, "500 Internal Server Error", "Bridge missing").await;
+                    write_simple_response(
+                        &mut writer,
+                        "500 Internal Server Error",
+                        "Bridge missing",
+                    )
+                    .await;
                     return Ok(());
                 };
                 let Some(std_file) = open_fn(uri.clone()).await else {
@@ -725,10 +741,10 @@ pub fn classify_file(file_name: &str, hint_mime: Option<&str>) -> (String, Strin
         "m4a" | "aac" => return ("audio".into(), "audio/mp4".into()),
         "weba" => return ("audio".into(), "audio/webm".into()),
 
-        "txt" | "log" | "md" | "markdown" | "json" | "rs" | "ts" | "tsx" | "js" | "jsx"
-        | "css" | "html" | "htm" | "xml" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf"
-        | "csv" | "sh" | "bash" | "ps1" | "kt" | "java" | "py" | "go" | "c" | "cpp" | "h"
-        | "hpp" | "sql" | "env" | "gitignore" | "lock" => {
+        "txt" | "log" | "md" | "markdown" | "json" | "rs" | "ts" | "tsx" | "js" | "jsx" | "css"
+        | "html" | "htm" | "xml" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf" | "csv"
+        | "sh" | "bash" | "ps1" | "kt" | "java" | "py" | "go" | "c" | "cpp" | "h" | "hpp"
+        | "sql" | "env" | "gitignore" | "lock" => {
             return ("text".into(), "text/plain; charset=utf-8".into());
         }
         _ => {}
@@ -752,9 +768,7 @@ pub fn classify_file(file_name: &str, hint_mime: Option<&str>) -> (String, Strin
 
     (
         "unsupported".into(),
-        hint_mime
-            .unwrap_or("application/octet-stream")
-            .to_string(),
+        hint_mime.unwrap_or("application/octet-stream").to_string(),
     )
 }
 

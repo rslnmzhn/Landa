@@ -248,11 +248,7 @@ export function DevicesView({
 
   const handleOpenUpdateModal = () => {
     setUpdateModalOpen(true);
-    if (isAndroid && downloadedPath) {
-      setUpdateHint(t.update.savedToDownloadsHint.replace("{path}", downloadedPath));
-    } else {
-      setUpdateHint(null);
-    }
+    setUpdateHint(null);
     if (!updateInfo) {
       void runUpdateCheck();
     }
@@ -261,20 +257,8 @@ export function DevicesView({
   const handleDownloadAndInstall = async () => {
     if (!updateInfo?.asset) return;
     setInstallingUpdate(true);
-    if (!isAndroid) {
-      setUpdateHint(null);
-    }
+    setUpdateHint(null);
     try {
-      if (isAndroid) {
-        if (!downloadedPath) {
-          const savedPath = await api.downloadUpdate(updateInfo.asset);
-          setDownloadedPath(savedPath);
-          setUpdateHint(t.update.savedToDownloadsHint.replace("{path}", savedPath));
-        } else {
-          await api.installUpdate(downloadedPath);
-        }
-        return;
-      }
       const path = downloadedPath ?? (await api.downloadUpdate(updateInfo.asset));
       setDownloadedPath(path);
       await api.installUpdate(path);
@@ -792,13 +776,7 @@ export function DevicesView({
                   )}
 
                   {updateHint && (
-                    <div
-                      className={`rounded-2xl border px-3 py-2 text-xs ${
-                        isAndroid && downloadedPath
-                          ? "bg-emerald-400/15 border-emerald-400/30 text-emerald-900 dark:text-emerald-200"
-                          : "bg-amber-400/15 border-amber-400/30 text-amber-900 dark:text-amber-200"
-                      }`}
-                    >
+                    <div className="rounded-2xl bg-amber-400/15 border border-amber-400/30 px-3 py-2 text-xs text-amber-900 dark:text-amber-200">
                       {updateHint}
                     </div>
                   )}
@@ -830,11 +808,7 @@ export function DevicesView({
                 disabled={installingUpdate || checkingUpdate}
                 onClick={handleDownloadAndInstall}
               >
-                {isAndroid
-                  ? downloadedPath
-                    ? t.update.openDownloads
-                    : t.update.downloadApk
-                  : downloadedPath
+                {downloadedPath
                   ? t.update.installNow
                   : t.update.downloadAndInstall}
               </GlassButton>

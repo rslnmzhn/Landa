@@ -2,7 +2,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use landa_proto::wire::{read_frame, write_frame, FriendMessage, StreamKind, MAX_CONTROL_FRAME_BYTES};
+use landa_proto::wire::{
+    read_frame, write_frame, FriendMessage, StreamKind, MAX_CONTROL_FRAME_BYTES,
+};
 use landa_proto::{DeviceIdentity, PeerId};
 use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
@@ -11,9 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::discovery::{current_category, current_os, DiscoveryService};
 use crate::error::CoreError;
-use crate::events::{
-    CoreEvent, FriendRequestInfo, ManualTarget, PeerInfo, TransferHistoryRecord,
-};
+use crate::events::{CoreEvent, FriendRequestInfo, ManualTarget, PeerInfo, TransferHistoryRecord};
 use crate::module::{LandaModule, ModuleRegistry, ModuleStatus, PeerContext};
 use crate::storage::{AppSettings, Storage};
 use crate::transfer::{OpenSourceHook, OutgoingFileItem, ReceivePublishHook, TransferManager};
@@ -68,10 +68,8 @@ impl LandaEngine {
             &config.app_data_dir.join("identity.key"),
         )?);
         let storage = Arc::new(Storage::open(&config.app_data_dir.join("landa.sqlite"))?);
-        let defaults = AppSettings::default_with(
-            config.default_device_name,
-            config.default_download_dir,
-        );
+        let defaults =
+            AppSettings::default_with(config.default_device_name, config.default_download_dir);
         let settings_val = storage.load_settings(defaults)?;
         crate::network::set_excluded_subnets(&settings_val.excluded_subnets);
         let interval = settings_val.discovery_interval_secs;
@@ -172,8 +170,20 @@ impl LandaEngine {
         self.transfers.set_publish_hook(hook);
     }
 
+    pub fn receive_publish_hook(&self) -> Option<ReceivePublishHook> {
+        self.transfers.receive_publish_hook()
+    }
+
     pub fn set_open_source_hook(&self, hook: OpenSourceHook) {
         self.transfers.set_open_source_hook(hook);
+    }
+
+    pub fn register_transfer_cancellation(&self, transfer_id: &str, token: CancellationToken) {
+        self.transfers.register_cancellation(transfer_id, token);
+    }
+
+    pub fn unregister_transfer_cancellation(&self, transfer_id: &str) {
+        self.transfers.unregister_cancellation(transfer_id);
     }
 
     pub fn local_identity_info(&self) -> LocalIdentityInfo {
@@ -357,7 +367,9 @@ impl LandaEngine {
             .transport
             .open_stream(addr, peer_id, StreamKind::FileTransfer)
             .await?;
-        self.transfers.send_files(&peer_ctx, send, recv, items).await
+        self.transfers
+            .send_files(&peer_ctx, send, recv, items)
+            .await
     }
 
     pub fn respond_transfer_offer(&self, transfer_id: &str, accept: bool) -> Result<(), CoreError> {
@@ -416,7 +428,11 @@ impl LandaEngine {
         self.modules.statuses()
     }
 
-    pub fn set_module_enabled(&self, id: &str, enabled: bool) -> Result<Vec<ModuleStatus>, CoreError> {
+    pub fn set_module_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<Vec<ModuleStatus>, CoreError> {
         if !self.modules.set_enabled(id, enabled) {
             return Err(CoreError::NotFound(format!("module {id}")));
         }
@@ -447,9 +463,8 @@ impl LandaEngine {
     }
 
     pub fn local_qr_connect_uri(&self) -> Result<(String, String, u16), CoreError> {
-        let ip = crate::qr::pick_primary_lan_ip().ok_or_else(|| {
-            CoreError::NotFound("no active LAN IPv4 interface found".into())
-        })?;
+        let ip = crate::qr::pick_primary_lan_ip()
+            .ok_or_else(|| CoreError::NotFound("no active LAN IPv4 interface found".into()))?;
         let port = self.transport.local_port();
         let device_name = self
             .settings
@@ -511,7 +526,10 @@ impl LandaEngine {
         Ok((peer_ctx, send, recv))
     }
 
-    fn resolve_peer_endpoint(&self, peer_id: &PeerId) -> Result<(PeerContext, SocketAddr), CoreError> {
+    fn resolve_peer_endpoint(
+        &self,
+        peer_id: &PeerId,
+    ) -> Result<(PeerContext, SocketAddr), CoreError> {
         let stored = self
             .storage
             .get_peer(peer_id)?

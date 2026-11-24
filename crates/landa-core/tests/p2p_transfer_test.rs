@@ -97,7 +97,9 @@ async fn quic_friend_pairing_and_file_transfer_end_to_end() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let peers_a = engine_a.list_peers().unwrap();
-    assert!(peers_a.iter().any(|p| p.peer_id == info_b.peer_id && p.is_trusted));
+    assert!(peers_a
+        .iter()
+        .any(|p| p.peer_id == info_b.peer_id && p.is_trusted));
 
     // File transfer with explicit offer acceptance
     let src_file = dir_a.join("hello-landa.txt");
@@ -163,7 +165,8 @@ async fn quic_send_items_via_open_source_hook_preserves_folder_tree() {
 
     let backing_clone = backing_file.clone();
     engine_a.set_open_source_hook(Arc::new(move |uri: &str| {
-        if uri == "content://com.android.externalstorage.documents/tree/primary%3APhotos/document/1" {
+        if uri == "content://com.android.externalstorage.documents/tree/primary%3APhotos/document/1"
+        {
             std::fs::File::open(&backing_clone).ok()
         } else {
             None
@@ -219,8 +222,13 @@ async fn quic_send_items_via_open_source_hook_preserves_folder_tree() {
     });
 
     let items = vec![OutgoingFileItem {
-        source_path: PathBuf::from("content://com.android.externalstorage.documents/tree/primary%3APhotos/document/1"),
-        source_uri: Some("content://com.android.externalstorage.documents/tree/primary%3APhotos/document/1".into()),
+        source_path: PathBuf::from(
+            "content://com.android.externalstorage.documents/tree/primary%3APhotos/document/1",
+        ),
+        source_uri: Some(
+            "content://com.android.externalstorage.documents/tree/primary%3APhotos/document/1"
+                .into(),
+        ),
         relative_path: "Photos/2026/pic.bin".into(),
         size_bytes: payload.len() as u64,
     }];
@@ -291,6 +299,145 @@ async fn qr_connect_establishes_verified_quic_without_auto_trust() {
         &info_a.device_name,
     );
     assert!(engine_a.connect_via_qr_uri(&self_uri).await.is_err());
+
+    engine_a.shutdown();
+    engine_b.shutdown();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[tokio::test]
+async fn quic_send_folder_with_opaque_uris_persists_relative_paths_in_history() {
+    let dir_a = temp_dir("opaque-a");
+    let dir_b = temp_dir("opaque-b");
+    let dl_a = dir_a.join("downloads");
+    let dl_b = dir_b.join("downloads");
+
+    let engine_a = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_a.clone(),
+        default_download_dir: dl_a,
+        default_device_name: "Android Sender".into(),
+    })
+    .unwrap();
+    let engine_b = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_b.clone(),
+        default_download_dir: dl_b.clone(),
+        default_device_name: "Desktop Receiver".into(),
+    })
+    .unwrap();
+
+    let file_a = dir_a.join("doc_101.bin");
+    let file_b = dir_a.join("doc_102.bin");
+    std::fs::write(&file_a, b"report-from-a").unwrap();
+    std::fs::write(&file_b, b"report-from-b").unwrap();
+
+    let uri_a = "content://com.android.externalstorage.documents/document/101";
+    let uri_b = "content://com.android.externalstorage.documents/document/102";
+    let file_a_clone = file_a.clone();
+    let file_b_clone = file_b.clone();
+    engine_a.set_open_source_hook(Arc::new(move |uri: &str| {
+        if uri == uri_a {
+            std::fs::File::open(&file_a_clone).ok()
+        } else if uri == uri_b {
+            std::fs::File::open(&file_b_clone).ok()
+        } else {
+            None
+        }
+    }));
+
+    engine_a.start_transport_loop();
+    engine_b.start_transport_loop();
+
+    let info_a = engine_a.local_identity_info();
+    let info_b = engine_b.local_identity_info();
+    let peer_id_a = PeerId::from_hex(&info_a.peer_id).unwrap();
+    let peer_id_b = PeerId::from_hex(&info_b.peer_id).unwrap();
+
+    engine_a
+        .storage()
+        .upsert_peer(
+            &peer_id_b,
+            &hex_decode_32(&info_b.public_key_hex),
+            "Desktop Receiver",
+            DeviceOs::Windows,
+            DeviceCategory::Desktop,
+            Some("127.0.0.1"),
+            Some(info_b.quic_port),
+        )
+        .unwrap();
+    engine_b
+        .storage()
+        .upsert_peer(
+            &peer_id_a,
+            &hex_decode_32(&info_a.public_key_hex),
+            "Android Sender",
+            DeviceOs::Android,
+            DeviceCategory::Phone,
+            Some("127.0.0.1"),
+            Some(info_a.quic_port),
+        )
+        .unwrap();
+
+    let mut rx_b = engine_b.subscribe_events();
+    let engine_b_clone = engine_b.clone();
+    let accept_task = tokio::spawn(async move {
+        while let Ok(ev) = rx_b.recv().await {
+            if let CoreEvent::IncomingTransferOffer(offer) = ev {
+                engine_b_clone
+                    .respond_transfer_offer(&offer.transfer_id, true)
+                    .unwrap();
+                break;
+            }
+        }
+    });
+
+    let items = vec![
+        OutgoingFileItem {
+            source_path: PathBuf::from(uri_a),
+            source_uri: Some(uri_a.into()),
+            relative_path: "a/report.pdf".into(),
+            size_bytes: b"report-from-a".len() as u64,
+        },
+        OutgoingFileItem {
+            source_path: PathBuf::from(uri_b),
+            source_uri: Some(uri_b.into()),
+            relative_path: "b/report.pdf".into(),
+            size_bytes: b"report-from-b".len() as u64,
+        },
+    ];
+
+    let record = engine_a.send_items(&info_b.peer_id, items).await.unwrap();
+    assert_eq!(record.status, "completed");
+    assert_eq!(
+        record.saved_paths,
+        vec![uri_a.to_string(), uri_b.to_string()]
+    );
+    assert_eq!(
+        record.relative_paths,
+        vec!["a/report.pdf".to_string(), "b/report.pdf".to_string()]
+    );
+
+    accept_task.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Reload history from SQLite on sender and receiver
+    let sender_history = engine_a.list_history(10).unwrap();
+    assert_eq!(sender_history.len(), 1);
+    assert_eq!(
+        sender_history[0].saved_paths,
+        vec![uri_a.to_string(), uri_b.to_string()]
+    );
+    assert_eq!(
+        sender_history[0].relative_paths,
+        vec!["a/report.pdf".to_string(), "b/report.pdf".to_string()]
+    );
+
+    let receiver_history = engine_b.list_history(10).unwrap();
+    assert_eq!(receiver_history.len(), 1);
+    assert_eq!(
+        receiver_history[0].relative_paths,
+        vec!["a/report.pdf".to_string(), "b/report.pdf".to_string()]
+    );
 
     engine_a.shutdown();
     engine_b.shutdown();

@@ -87,4 +87,36 @@ class DownloadsPublisherTest {
             DownloadsPublisher.parseDownloadRelativeQuery("/data/user/0/dev.landa.app/files/note.txt"),
         )
     }
+
+    @Test
+    fun formatsResolvedMediaStoreRelativePathAndDisplayName() {
+        assertEquals(
+            "Downloads/Landa/photo.jpg",
+            DownloadsPublisher.formatResolvedMediaStorePath("Download/Landa/", "photo.jpg"),
+        )
+        assertEquals(
+            "Downloads/Landa/Trip/day1/beach.png",
+            DownloadsPublisher.formatResolvedMediaStorePath("Download/Landa/Trip/day1/", "beach.png"),
+        )
+        assertEquals(
+            "Downloads/photo.jpg",
+            DownloadsPublisher.formatResolvedMediaStorePath("Download", "photo.jpg"),
+        )
+        assertEquals(
+            null,
+            DownloadsPublisher.formatResolvedMediaStorePath(null, "photo.jpg"),
+        )
+        assertEquals(
+            null,
+            DownloadsPublisher.formatResolvedMediaStorePath("   ", "photo.jpg"),
+        )
+        assertEquals(
+            null,
+            DownloadsPublisher.formatResolvedMediaStorePath("Download/Landa/", null),
+        )
+        assertEquals(
+            null,
+            DownloadsPublisher.formatResolvedMediaStorePath("Download/Landa/", "   "),
+        )
+    }
 }

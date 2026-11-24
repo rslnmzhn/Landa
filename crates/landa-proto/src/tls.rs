@@ -22,7 +22,9 @@ pub struct CertifiedIdentity {
     pub key_der: PrivateKeyDer<'static>,
 }
 
-pub fn build_certified_identity(identity: &DeviceIdentity) -> Result<CertifiedIdentity, ProtoError> {
+pub fn build_certified_identity(
+    identity: &DeviceIdentity,
+) -> Result<CertifiedIdentity, ProtoError> {
     let mut pkcs8 = Vec::with_capacity(48);
     pkcs8.extend_from_slice(&ED25519_PKCS8_PREFIX);
     pkcs8.extend_from_slice(&identity.secret_bytes());
@@ -70,7 +72,9 @@ pub fn extract_verified_peer_pubkey(cert_der: &[u8]) -> Result<[u8; 32], ProtoEr
     // Verify self-signature on the X.509 TBS certificate
     let sig_bytes = cert.signature_value.data.as_ref();
     if sig_bytes.len() != 64 {
-        return Err(ProtoError::Tls("invalid Ed25519 cert signature length".into()));
+        return Err(ProtoError::Tls(
+            "invalid Ed25519 cert signature length".into(),
+        ));
     }
     let mut sig = [0u8; 64];
     sig.copy_from_slice(sig_bytes);
@@ -82,7 +86,9 @@ pub fn extract_verified_peer_pubkey(cert_der: &[u8]) -> Result<[u8; 32], ProtoEr
 pub fn build_server_config(identity: &DeviceIdentity) -> Result<ServerConfig, ProtoError> {
     let certified = build_certified_identity(identity)?;
     let provider = Arc::new(default_provider());
-    let client_verifier = Arc::new(LandaPeerCertVerifier::any_peer(provider.signature_verification_algorithms));
+    let client_verifier = Arc::new(LandaPeerCertVerifier::any_peer(
+        provider.signature_verification_algorithms,
+    ));
 
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

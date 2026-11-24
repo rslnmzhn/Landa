@@ -138,8 +138,13 @@ impl VideoLinkModule {
         source: VideoSource,
         password: String,
     ) -> Result<VideoLinkStatus, CoreError> {
-        self.start_with_bind(Ipv4Addr::UNSPECIFIED, DEFAULT_VIDEOLINK_PORT, source, password)
-            .await
+        self.start_with_bind(
+            Ipv4Addr::UNSPECIFIED,
+            DEFAULT_VIDEOLINK_PORT,
+            source,
+            password,
+        )
+        .await
     }
 
     pub async fn start_with_bind(
@@ -236,18 +241,16 @@ impl VideoLinkModule {
             return Err(CoreError::ModuleDisabled("videolink".into()));
         }
 
-        let listener = match TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
-            bind_ip,
-            preferred_port,
-        )))
-        .await
-        {
-            Ok(l) => l,
-            Err(_) if preferred_port != 0 => {
-                TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(bind_ip, 0))).await?
-            }
-            Err(err) => return Err(CoreError::Io(err)),
-        };
+        let listener =
+            match TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(bind_ip, preferred_port)))
+                .await
+            {
+                Ok(l) => l,
+                Err(_) if preferred_port != 0 => {
+                    TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(bind_ip, 0))).await?
+                }
+                Err(err) => return Err(CoreError::Io(err)),
+            };
 
         let bound_addr = listener.local_addr()?;
         let port = bound_addr.port();
@@ -333,11 +336,7 @@ impl VideoLinkModule {
     }
 
     pub async fn bound_addr(&self) -> Option<SocketAddr> {
-        self.active
-            .lock()
-            .await
-            .as_ref()
-            .map(|s| s.bound_addr)
+        self.active.lock().await.as_ref().map(|s| s.bound_addr)
     }
 }
 
@@ -550,7 +549,11 @@ async fn handle_http_request(
         (Method::GET | Method::HEAD, "/watch") => {
             let head_only = method == Method::HEAD;
             if is_authenticated {
-                html_response(StatusCode::OK, render_player_html(&state.file_name), head_only)
+                html_response(
+                    StatusCode::OK,
+                    render_player_html(&state.file_name),
+                    head_only,
+                )
             } else {
                 html_response(
                     StatusCode::OK,
@@ -682,7 +685,9 @@ async fn serve_video_stream(
     }
 
     if head_only {
-        return builder.body(empty_body()).expect("valid HEAD stream response");
+        return builder
+            .body(empty_body())
+            .expect("valid HEAD stream response");
     }
 
     if start > 0 && file.seek(SeekFrom::Start(start)).await.is_err() {

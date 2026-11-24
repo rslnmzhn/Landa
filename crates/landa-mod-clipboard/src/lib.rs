@@ -273,7 +273,9 @@ impl ClipboardModule {
                 }
             }
             let snapshot: Vec<ClipboardItem> = guard.iter().cloned().collect();
-            let _ = self.storage.set_setting_json(CLIPBOARD_SETTING_KEY, &snapshot);
+            let _ = self
+                .storage
+                .set_setting_json(CLIPBOARD_SETTING_KEY, &snapshot);
         }
 
         for path in removed_paths {
@@ -302,7 +304,9 @@ impl ClipboardModule {
                 }
             });
             let snapshot: Vec<ClipboardItem> = guard.iter().cloned().collect();
-            let _ = self.storage.set_setting_json(CLIPBOARD_SETTING_KEY, &snapshot);
+            let _ = self
+                .storage
+                .set_setting_json(CLIPBOARD_SETTING_KEY, &snapshot);
         }
 
         for path in removed_paths {
@@ -338,7 +342,9 @@ impl ClipboardModule {
             return Err(CoreError::ModuleDisabled("clipboard".into()));
         }
         if text.trim().is_empty() || text.len() > MAX_TEXT_BYTES {
-            return Err(CoreError::InvalidInput("invalid clipboard text size".into()));
+            return Err(CoreError::InvalidInput(
+                "invalid clipboard text size".into(),
+            ));
         }
         let (_, mut send, mut recv) = engine
             .open_trusted_module_stream(peer_id, StreamKind::Clipboard)
@@ -713,27 +719,21 @@ async fn read_verified_image_stream(
 
     while remaining > 0 {
         let to_read = remaining.min(buf.len());
-        let n = recv
-            .read(&mut buf[..to_read])
-            .await?
-            .ok_or_else(|| {
-                CoreError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "clipboard image stream truncated",
-                ))
-            })?;
+        let n = recv.read(&mut buf[..to_read]).await?.ok_or_else(|| {
+            CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "clipboard image stream truncated",
+            ))
+        })?;
         hasher.update(&buf[..n]);
         out.extend_from_slice(&buf[..n]);
         remaining -= n;
     }
 
     let mut expected_digest = [0u8; 32];
-    recv.read_exact(&mut expected_digest).await.map_err(|e| {
-        CoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            e,
-        ))
-    })?;
+    recv.read_exact(&mut expected_digest)
+        .await
+        .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e)))?;
 
     let actual = hasher.finalize();
     if actual.as_bytes() != &expected_digest || actual.to_hex().as_str() != expected_hash_hex {

@@ -87,9 +87,8 @@ class TransferFailedNotifArgs {
 }
 
 @InvokeArg
-class SaveUpdateApkArgs {
+class InstallApkArgs {
     lateinit var apkPath: String
-    lateinit var fileName: String
 }
 
 @InvokeArg
@@ -97,6 +96,15 @@ class ListSafShareDirArgs {
     lateinit var rootUri: String
     var isDir: Boolean = true
     var relPath: String = ""
+}
+
+@InvokeArg
+class ListSafShareTreeArgs {
+    lateinit var rootUri: String
+    var isDir: Boolean = true
+    var relPath: String = ""
+    var maxDepth: Int = 32
+    var maxFiles: Int = 10_000
 }
 
 @InvokeArg
@@ -109,6 +117,11 @@ class OpenSafShareFileArgs {
 @InvokeArg
 class OpenContentUriArgs {
     lateinit var uri: String
+}
+
+@InvokeArg
+class ResolveContentUriDisplayNamesArgs {
+    var uris: List<String> = emptyList()
 }
 
 @InvokeArg
@@ -166,6 +179,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     private var pendingFocusTarget: JSObject? = null
     private val lock = Any()
     private val publishedUris = ConcurrentHashMap<String, Pair<Uri, String>>()
+    private val publishedDisplayPaths = ConcurrentHashMap<String, String>()
     private val lastProgressNotifMs = ConcurrentHashMap<String, Long>()
     private var lastFgUpdateMs: Long = 0L
     private var lastFgActiveCount: Int = 0
@@ -1011,6 +1025,49 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    private fun queryContentUriNameAndRelPath(parsed: Uri): Pair<String?, String?> {
+        var name: String? = null
+        var relativePath: String? = null
+        val isMediaStore = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            parsed.authority == MediaStore.AUTHORITY
+        val baseProjection = arrayOf(OpenableColumns.DISPLAY_NAME)
+        val extProjection = if (isMediaStore) {
+            arrayOf(OpenableColumns.DISPLAY_NAME, MediaStore.MediaColumns.RELATIVE_PATH)
+        } else {
+            baseProjection
+        }
+
+        val queried = runCatching {
+            activity.contentResolver.query(parsed, extProjection, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (nameIdx >= 0 && !cursor.isNull(nameIdx)) {
+                        name = cursor.getString(nameIdx)
+                    }
+                    if (isMediaStore) {
+                        val relIdx = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                        if (relIdx >= 0 && !cursor.isNull(relIdx)) {
+                            relativePath = cursor.getString(relIdx)
+                        }
+                    }
+                }
+            }
+        }
+        if (queried.isFailure && isMediaStore) {
+            runCatching {
+                activity.contentResolver.query(parsed, baseProjection, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (nameIdx >= 0 && !cursor.isNull(nameIdx)) {
+                            name = cursor.getString(nameIdx)
+                        }
+                    }
+                }
+            }
+        }
+        return Pair(name, relativePath)
+    }
+
     @Command
     fun getContentUriMeta(invoke: Invoke) {
         try {
@@ -1022,18 +1079,68 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             val parsed = Uri.parse(args.uri)
             var name: String? = null
             var sizeBytes = -1L
-            activity.contentResolver.query(
-                parsed,
-                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
-                    if (nameIdx >= 0) name = cursor.getString(nameIdx)
-                    if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) sizeBytes = cursor.getLong(sizeIdx)
+            var relativePath: String? = null
+            val isMediaStore = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                parsed.authority == MediaStore.AUTHORITY
+            val baseProjection = arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
+            val extProjection = if (isMediaStore) {
+                arrayOf(
+                    OpenableColumns.DISPLAY_NAME,
+                    OpenableColumns.SIZE,
+                    MediaStore.MediaColumns.RELATIVE_PATH
+                )
+            } else {
+                baseProjection
+            }
+
+            val queryRes = runCatching {
+                activity.contentResolver.query(
+                    parsed,
+                    extProjection,
+                    null,
+                    null,
+                    null
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                        if (nameIdx >= 0 && !cursor.isNull(nameIdx)) {
+                            name = cursor.getString(nameIdx)
+                        }
+                        if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                            sizeBytes = cursor.getLong(sizeIdx)
+                        }
+                        if (isMediaStore) {
+                            val relIdx = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                            if (relIdx >= 0 && !cursor.isNull(relIdx)) {
+                                relativePath = cursor.getString(relIdx)
+                            }
+                        }
+                    }
+                }
+            }
+            if (queryRes.isFailure) {
+                if (isMediaStore) {
+                    activity.contentResolver.query(
+                        parsed,
+                        baseProjection,
+                        null,
+                        null,
+                        null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                            if (nameIdx >= 0 && !cursor.isNull(nameIdx)) {
+                                name = cursor.getString(nameIdx)
+                            }
+                            if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                                sizeBytes = cursor.getLong(sizeIdx)
+                            }
+                        }
+                    }
+                } else {
+                    queryRes.getOrThrow()
                 }
             }
             if (sizeBytes <= 0L) {
@@ -1042,13 +1149,44 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                 }.getOrDefault(0L)
             }
             val mimeType = activity.contentResolver.getType(parsed) ?: "application/octet-stream"
+            val cleanName = name?.trim()?.ifEmpty { null } ?: "file"
+            val displayPath = DownloadsPublisher.formatResolvedMediaStorePath(relativePath, name)
+                ?: publishedDisplayPaths[args.uri]
             val res = JSObject()
-            res.put("name", name ?: "file")
+            res.put("name", cleanName)
             res.put("sizeBytes", sizeBytes.coerceAtLeast(0L))
             res.put("mimeType", mimeType)
+            if (displayPath != null) {
+                res.put("displayPath", displayPath)
+            }
             invoke.resolve(res)
         } catch (ex: Exception) {
             invoke.reject(ex.message ?: "Failed to query content URI metadata")
+        }
+    }
+
+    @Command
+    fun resolveContentUriDisplayNames(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(ResolveContentUriDisplayNamesArgs::class.java)
+            val names = JSObject()
+            val seen = HashSet<String>()
+            for (rawUri in args.uris) {
+                if (!rawUri.startsWith("content://") || !seen.add(rawUri)) continue
+                val parsed = Uri.parse(rawUri)
+                val (name, relativePath) = queryContentUriNameAndRelPath(parsed)
+                val resolved = DownloadsPublisher.formatResolvedMediaStorePath(relativePath, name)
+                    ?: publishedDisplayPaths[rawUri]
+                    ?: name?.trim()?.ifEmpty { null }
+                if (resolved != null) {
+                    names.put(rawUri, resolved)
+                }
+            }
+            val res = JSObject()
+            res.put("names", names)
+            invoke.resolve(res)
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to resolve content URI display names")
         }
     }
 
@@ -1486,6 +1624,143 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun listSafShareTree(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(ListSafShareTreeArgs::class.java)
+            if (!args.rootUri.startsWith("content://")) {
+                invoke.reject("Only content:// URIs are supported")
+                return
+            }
+            if (!args.isDir) {
+                invoke.reject("target is not a directory")
+                return
+            }
+            val rootUri = Uri.parse(args.rootUri)
+            val segments = parseSafeRelSegments(args.relPath)
+            val maxDepth = args.maxDepth.coerceIn(1, MAX_FOLDER_DEPTH)
+            val maxFiles = args.maxFiles.coerceIn(1, MAX_FOLDER_FILES)
+
+            val startDocId = resolveSafTreeDocId(rootUri, segments, expectDir = true)
+            val startPrefix = segments.joinToString("/")
+
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+                DocumentsContract.Document.COLUMN_FLAGS
+            )
+
+            data class TreeRow(
+                val name: String,
+                val relPath: String,
+                val isDir: Boolean,
+                val sizeBytes: Long,
+                val modifiedMs: Long
+            )
+
+            val rows = mutableListOf<TreeRow>()
+            val seenRelPaths = HashSet<String>()
+            var dirCount = 0
+            var fileCount = 0
+            val stack = ArrayDeque<Triple<String, String, Int>>()
+            stack.addLast(Triple(startDocId, startPrefix, 0))
+
+            while (stack.isNotEmpty()) {
+                val (docId, prefix, depth) = stack.removeLast()
+                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(rootUri, docId)
+                activity.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                    val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                    val modIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                    val flagsIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
+
+                    while (cursor.moveToNext()) {
+                        if (idIdx < 0) continue
+                        val childDocId = cursor.getString(idIdx) ?: continue
+                        val rawName = if (nameIdx >= 0) cursor.getString(nameIdx) else null
+                        val name = rawName?.trim().orEmpty()
+                        if (name.isEmpty() || name == "." || name == ".." ||
+                            name.contains('/') || name.contains('\\') || name.contains('\u0000')
+                        ) {
+                            continue
+                        }
+                        val flags = if (flagsIdx >= 0 && !cursor.isNull(flagsIdx)) cursor.getInt(flagsIdx) else 0
+                        if ((flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) != 0) {
+                            continue
+                        }
+                        val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else null
+                        val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
+                        val nextRel = if (prefix.isEmpty()) name else "$prefix/$name"
+                        if (!seenRelPaths.add(nextRel)) {
+                            invoke.reject("duplicate path in shared folder")
+                            return
+                        }
+                        val modifiedMs = if (modIdx >= 0 && !cursor.isNull(modIdx)) {
+                            cursor.getLong(modIdx).coerceAtLeast(0L)
+                        } else {
+                            0L
+                        }
+
+                        if (isDir) {
+                            if (depth >= maxDepth) {
+                                invoke.reject("folder exceeds maximum depth ($maxDepth)")
+                                return
+                            }
+                            if (dirCount >= maxFiles) {
+                                invoke.reject("folder exceeds maximum directory count ($maxFiles)")
+                                return
+                            }
+                            dirCount++
+                            rows.add(TreeRow(name, nextRel, true, 0L, modifiedMs))
+                            stack.addLast(Triple(childDocId, nextRel, depth + 1))
+                        } else {
+                            if (fileCount >= maxFiles) {
+                                invoke.reject("folder exceeds maximum file count ($maxFiles)")
+                                return
+                            }
+                            var sizeBytes = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                                cursor.getLong(sizeIdx)
+                            } else {
+                                -1L
+                            }
+                            if (sizeBytes < 0L) {
+                                val docUri = DocumentsContract.buildDocumentUriUsingTree(rootUri, childDocId)
+                                sizeBytes = runCatching {
+                                    activity.contentResolver.openFileDescriptor(docUri, "r")?.use { it.statSize } ?: -1L
+                                }.getOrDefault(-1L)
+                            }
+                            if (sizeBytes < 0L) continue
+                            fileCount++
+                            rows.add(TreeRow(name, nextRel, false, sizeBytes, modifiedMs))
+                        }
+                    }
+                }
+            }
+
+            rows.sortBy { it.relPath }
+            val arr = JSArray()
+            for (row in rows) {
+                val obj = JSObject()
+                obj.put("name", row.name)
+                obj.put("relPath", row.relPath)
+                obj.put("isDir", row.isDir)
+                obj.put("sizeBytes", row.sizeBytes)
+                obj.put("modifiedMs", row.modifiedMs)
+                arr.put(obj)
+            }
+            val res = JSObject()
+            res.put("entries", arr)
+            invoke.resolve(res)
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to traverse shared folder")
+        }
+    }
+
+    @Command
     fun openSafShareFile(invoke: Invoke) {
         try {
             val args = invoke.parseArgs(OpenSafShareFileArgs::class.java)
@@ -1650,9 +1925,9 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
-    fun saveUpdateApkToDownloads(invoke: Invoke) {
+    fun installApkUpdate(invoke: Invoke) {
         try {
-            val args = invoke.parseArgs(SaveUpdateApkArgs::class.java)
+            val args = invoke.parseArgs(InstallApkArgs::class.java)
             val apkFile = File(args.apkPath).canonicalFile
             val cacheRoot = activity.cacheDir.canonicalFile
             val filesRoot = activity.filesDir.canonicalFile
@@ -1663,35 +1938,40 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                 return
             }
 
-            val cleanName = sanitizeRelativePath(args.fileName)
-                .substringAfterLast('/')
-                .ifEmpty { "landa-update.apk" }
-            val published = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                publishViaMediaStore(apkFile, cleanName)
-            } else {
-                publishLegacyDownloads(apkFile, cleanName)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                !activity.packageManager.canRequestPackageInstalls()
+            ) {
+                val settingsIntent = Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:${activity.packageName}")
+                ).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                try {
+                    activity.startActivity(settingsIntent)
+                } catch (_: Exception) {
+                    val fallbackIntent = Intent(Settings.ACTION_SECURITY_SETTINGS).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    activity.startActivity(fallbackIntent)
+                }
+                invoke.reject("INSTALL_PERMISSION_REQUIRED")
+                return
             }
-            apkFile.delete()
 
-            val res = JSObject()
-            res.put("publishedPath", published.publishedPath)
-            res.put("displayPath", published.displayPath)
-            invoke.resolve(res)
-        } catch (ex: Exception) {
-            invoke.reject(ex.message ?: "Failed to save APK update to Downloads")
-        }
-    }
-
-    @Command
-    fun openDownloadsFolder(invoke: Invoke) {
-        try {
-            val intent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val uri = FileProvider.getUriForFile(
+                activity,
+                "${activity.packageName}.fileprovider",
+                apkFile
+            )
+            val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            activity.startActivity(intent)
+            activity.startActivity(installIntent)
             invoke.resolve()
         } catch (ex: Exception) {
-            invoke.reject(ex.message ?: "Failed to open Downloads")
+            invoke.reject(ex.message ?: "Failed to launch APK installer")
         }
     }
 
@@ -1791,6 +2071,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                 resolvedPath = resolvedPath,
                 fallbackFileName = fileName,
             )
+            publishedDisplayPaths[contentUriStr] = displayPath
             return PublishedDownload(
                 publishedPath = publishedPath,
                 displayPath = displayPath,

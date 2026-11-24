@@ -255,12 +255,16 @@ jobs:
             fi
             perms="$("${AAPT2}" dump permissions "${apk}")"
             echo "${perms}"
-            for forbidden in MANAGE_EXTERNAL_STORAGE REQUEST_INSTALL_PACKAGES READ_EXTERNAL_STORAGE; do
+            for forbidden in MANAGE_EXTERNAL_STORAGE READ_EXTERNAL_STORAGE; do
               if echo "${perms}" | grep -q "${forbidden}"; then
                 echo "::error::${apk} declares forbidden permission ${forbidden}!" >&2
                 exit 1
               fi
             done
+            if ! echo "${perms}" | grep -q "REQUEST_INSTALL_PACKAGES"; then
+              echo "::error::${apk} is missing required REQUEST_INSTALL_PACKAGES permission!" >&2
+              exit 1
+            fi
           done
 
       - name: Upload Android artifact

@@ -4,9 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
-use landa_proto::tls::{
-    build_client_config, build_server_config, extract_verified_peer_pubkey,
-};
+use landa_proto::tls::{build_client_config, build_server_config, extract_verified_peer_pubkey};
 use landa_proto::wire::{
     read_frame, write_frame, FriendMessage, StreamKind, MAX_CONTROL_FRAME_BYTES,
 };
@@ -344,7 +342,9 @@ async fn handle_connection(
                         .await
                 }
                 StreamKind::Shares | StreamKind::Clipboard => {
-                    ctx.modules.dispatch_stream(peer_ctx, kind, send, recv).await
+                    ctx.modules
+                        .dispatch_stream(peer_ctx, kind, send, recv)
+                        .await
                 }
             };
             if let Err(err) = res {

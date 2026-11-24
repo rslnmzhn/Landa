@@ -42,9 +42,9 @@ pub fn build_qr_connect_uri(
 
 pub fn parse_qr_connect_uri(raw: &str) -> Result<QrConnectPayload, CoreError> {
     let trimmed = raw.trim();
-    let rest = trimmed
-        .strip_prefix("landa2://connect?")
-        .ok_or_else(|| CoreError::InvalidInput("invalid QR link scheme (expected landa2://connect)".into()))?;
+    let rest = trimmed.strip_prefix("landa2://connect?").ok_or_else(|| {
+        CoreError::InvalidInput("invalid QR link scheme (expected landa2://connect)".into())
+    })?;
 
     let mut ip_str: Option<String> = None;
     let mut port_str: Option<String> = None;
@@ -76,7 +76,9 @@ pub fn parse_qr_connect_uri(raw: &str) -> Result<QrConnectPayload, CoreError> {
         .parse()
         .map_err(|_| CoreError::InvalidInput("QR link has invalid IPv4 address".into()))?;
     if ip.is_unspecified() || ip.is_multicast() {
-        return Err(CoreError::InvalidInput("QR link IP address is not routable".into()));
+        return Err(CoreError::InvalidInput(
+            "QR link IP address is not routable".into(),
+        ));
     }
 
     let port: u16 = port_str
@@ -85,14 +87,18 @@ pub fn parse_qr_connect_uri(raw: &str) -> Result<QrConnectPayload, CoreError> {
         .parse()
         .map_err(|_| CoreError::InvalidInput("QR link has invalid port".into()))?;
     if port == 0 {
-        return Err(CoreError::InvalidInput("QR link port must be non-zero".into()));
+        return Err(CoreError::InvalidInput(
+            "QR link port must be non-zero".into(),
+        ));
     }
 
-    let peer_hex = peer_str.ok_or_else(|| CoreError::InvalidInput("QR link missing peer".into()))?;
+    let peer_hex =
+        peer_str.ok_or_else(|| CoreError::InvalidInput("QR link missing peer".into()))?;
     let peer_id = PeerId::from_hex(&peer_hex)
         .map_err(|_| CoreError::InvalidInput("QR link has invalid peer id".into()))?;
 
-    let pk_raw = pk_str.ok_or_else(|| CoreError::InvalidInput("QR link missing public key".into()))?;
+    let pk_raw =
+        pk_str.ok_or_else(|| CoreError::InvalidInput("QR link missing public key".into()))?;
     let pk_bytes = decode_base64_32(pk_raw.trim())?;
     DeviceIdentity::validate_public_key(&pk_bytes)
         .map_err(|_| CoreError::InvalidInput("QR link has invalid Ed25519 public key".into()))?;
@@ -158,12 +164,16 @@ fn percent_decode(input: &str) -> Result<String, CoreError> {
         match bytes[i] {
             b'%' => {
                 if i + 2 >= bytes.len() {
-                    return Err(CoreError::InvalidInput("invalid percent-encoding in QR link".into()));
+                    return Err(CoreError::InvalidInput(
+                        "invalid percent-encoding in QR link".into(),
+                    ));
                 }
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
-                    .map_err(|_| CoreError::InvalidInput("invalid percent-encoding in QR link".into()))?;
-                let val = u8::from_str_radix(hex, 16)
-                    .map_err(|_| CoreError::InvalidInput("invalid percent-encoding in QR link".into()))?;
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|_| {
+                    CoreError::InvalidInput("invalid percent-encoding in QR link".into())
+                })?;
+                let val = u8::from_str_radix(hex, 16).map_err(|_| {
+                    CoreError::InvalidInput("invalid percent-encoding in QR link".into())
+                })?;
                 out.push(val);
                 i += 3;
             }
