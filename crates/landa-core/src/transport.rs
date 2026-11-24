@@ -121,6 +121,17 @@ impl QuicTransport {
         let _ = self.handler_ctx.set(ctx);
     }
 
+    pub fn disconnect_peer(&self, peer_id: &PeerId) {
+        if let Some(conn) = self
+            .connections
+            .lock()
+            .expect("connections lock poisoned")
+            .remove(peer_id)
+        {
+            conn.close(0u32.into(), b"peer forgotten");
+        }
+    }
+
     pub async fn connect_peer(
         self: &Arc<Self>,
         addr: SocketAddr,

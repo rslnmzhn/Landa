@@ -220,6 +220,16 @@ impl LandaEngine {
         Ok(())
     }
 
+    pub fn forget_peer(&self, peer_id_hex: &str) -> Result<(), CoreError> {
+        let peer_id = parse_peer_id(peer_id_hex)?;
+        self.storage.forget_peer(&peer_id)?;
+        self.discovery.remove_live_peer(&peer_id);
+        self.transport.disconnect_peer(&peer_id);
+        let _ = self.events.send(CoreEvent::PeersChanged);
+        let _ = self.events.send(CoreEvent::FriendRequestsChanged);
+        Ok(())
+    }
+
     pub fn list_friend_requests(&self) -> Result<Vec<FriendRequestInfo>, CoreError> {
         self.storage.list_friend_requests()
     }
@@ -569,4 +579,75 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use landa_proto::{DeviceCategory, DeviceOs};
+    use std::net::Ipv4Addr;
+
+    #[tokio::test]
+    async fn engine_forget_peer_clears_storage_discovery_cache_and_emits_event() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("landa-engine-forget-{}", uuid::Uuid::new_v4()));
+        let engine = LandaEngine::new_loopback(LandaConfig {
+            app_data_dir: temp_dir.clone(),
+            default_download_dir: temp_dir.join("dl"),
+            default_device_name: "LocalNode".into(),
+        })
+        .unwrap();
+
+        let pk = [7u8; 32];
+        let peer_id = PeerId::from_public_key(&pk);
+        let peer_hex = peer_id.to_hex();
+
+        engine
+            .discovery
+            .register_direct_peer(
+                peer_id,
+                pk,
+                "Remote Phone",
+                Ipv4Addr::new(127, 0, 0, 2),
+                40406,
+            )
+            .unwrap();
+        engine.storage().set_peer_trusted(&peer_id, true).unwrap();
+        engine
+            .storage()
+            .upsert_friend_request(
+                &peer_id,
+                &pk,
+                "Remote Phone",
+                DeviceOs::Android,
+                DeviceCategory::Phone,
+                "112233",
+                "incoming",
+            )
+            .unwrap();
+
+        assert_eq!(engine.list_peers().unwrap().len(), 1);
+        assert!(engine.discovery.get_live_peer(&peer_id).is_some());
+        assert_eq!(engine.list_friend_requests().unwrap().len(), 1);
+
+        let mut rx = engine.subscribe_events();
+        engine.forget_peer(&peer_hex).unwrap();
+
+        assert!(engine.list_peers().unwrap().is_empty());
+        assert!(engine.discovery.get_live_peer(&peer_id).is_none());
+        assert!(engine.list_friend_requests().unwrap().is_empty());
+
+        let mut saw_peers_changed = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, CoreEvent::PeersChanged) {
+                saw_peers_changed = true;
+            }
+        }
+        assert!(saw_peers_changed, "expected CoreEvent::PeersChanged");
+
+        assert!(engine.forget_peer("not-a-valid-peer-id").is_err());
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

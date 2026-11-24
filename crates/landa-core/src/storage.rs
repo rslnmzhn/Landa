@@ -221,6 +221,19 @@ impl Storage {
         Ok(())
     }
 
+    pub fn forget_peer(&self, peer_id: &PeerId) -> Result<(), CoreError> {
+        let hex = peer_id.to_hex();
+        let mut conn = self.conn.lock().expect("db lock poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM friend_requests WHERE peer_id = ?1",
+            params![&hex],
+        )?;
+        tx.execute("DELETE FROM peers WHERE peer_id = ?1", params![&hex])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_friend_request(
         &self,
@@ -551,6 +564,79 @@ mod tests {
             loaded.excluded_subnets,
             vec!["192.168.56.0/24".to_string(), "172.17.0.0/16".to_string()]
         );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn storage_forget_peer_removes_peer_and_friend_requests() {
+        let temp_dir = std::env::temp_dir().join(format!("landa-forget-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("landa.sqlite");
+        let storage = Storage::open(&db_path).unwrap();
+
+        let pk_a = [1u8; 32];
+        let pk_b = [2u8; 32];
+        let peer_a = PeerId::from_public_key(&pk_a);
+        let peer_b = PeerId::from_public_key(&pk_b);
+
+        storage
+            .upsert_peer(
+                &peer_a,
+                &pk_a,
+                "Device A",
+                DeviceOs::Android,
+                DeviceCategory::Phone,
+                Some("192.168.0.10"),
+                Some(40406),
+            )
+            .unwrap();
+        storage.set_peer_trusted(&peer_a, true).unwrap();
+        storage.set_peer_alias(&peer_a, Some("My Phone")).unwrap();
+        storage
+            .upsert_friend_request(
+                &peer_a,
+                &pk_a,
+                "Device A",
+                DeviceOs::Android,
+                DeviceCategory::Phone,
+                "123456",
+                "incoming",
+            )
+            .unwrap();
+
+        storage
+            .upsert_peer(
+                &peer_b,
+                &pk_b,
+                "Device B",
+                DeviceOs::Windows,
+                DeviceCategory::Desktop,
+                Some("192.168.0.11"),
+                Some(40406),
+            )
+            .unwrap();
+        storage
+            .upsert_friend_request(
+                &peer_b,
+                &pk_b,
+                "Device B",
+                DeviceOs::Windows,
+                DeviceCategory::Desktop,
+                "654321",
+                "outgoing",
+            )
+            .unwrap();
+
+        storage.forget_peer(&peer_a).unwrap();
+
+        assert!(storage.get_peer(&peer_a).unwrap().is_none());
+        let peers = storage.list_peers().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].peer_id, peer_b);
+
+        let reqs = storage.list_friend_requests().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].peer_id, peer_b.to_hex());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

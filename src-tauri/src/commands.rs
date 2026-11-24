@@ -55,6 +55,11 @@ pub fn rename_peer(
 }
 
 #[tauri::command]
+pub fn forget_peer(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
+    state.engine.forget_peer(&peer_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn list_friend_requests(state: State<'_, AppState>) -> Result<Vec<FriendRequestInfo>, String> {
     state.engine.list_friend_requests().map_err(|e| e.to_string())
 }
@@ -1171,6 +1176,35 @@ pub async fn open_file_external(
     path_or_uri: String,
 ) -> Result<(), String> {
     crate::preview::open_file_external(&app, &path_or_uri).await
+}
+
+#[tauri::command]
+pub async fn resolve_preview_names(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
+    let mut out = std::collections::HashMap::new();
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
+            for path in paths {
+                if path.starts_with("content://") {
+                    if let Ok(meta) = bridge.get_content_uri_meta_async(&path).await {
+                        if !meta.name.trim().is_empty() {
+                            out.insert(path, meta.name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, paths);
+    }
+    Ok(out)
 }
 
 // --- Optional Module: Video Link ---

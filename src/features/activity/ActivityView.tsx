@@ -38,11 +38,14 @@ export function ActivityView({
   onError,
 }: ActivityViewProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [resolvedNames, setResolvedNames] = useState<Record<string, string>>({});
+
+  const isAndroid = navigator.userAgent.toLowerCase().includes("android");
 
   const handleOpenSaved = async (paths: string[]) => {
     if (paths.length === 0) return;
     try {
-      if (paths[0].startsWith("content://")) {
+      if (paths[0].startsWith("content://") || isAndroid) {
         await api.openFileExternal(paths[0]);
       } else if (paths.length === 1) {
         await revealItemInDir(paths[0]);
@@ -54,7 +57,30 @@ export function ActivityView({
     }
   };
 
+  const toggleExpand = (item: TransferHistoryRecord) => {
+    const nextExpanded = expandedId === item.id ? null : item.id;
+    setExpandedId(nextExpanded);
+    if (nextExpanded) {
+      const unresolved = item.savedPaths.filter(
+        (p) => p.startsWith("content://") && !resolvedNames[p]
+      );
+      if (unresolved.length > 0) {
+        api
+          .resolvePreviewNames(unresolved)
+          .then((names) => {
+            if (Object.keys(names).length > 0) {
+              setResolvedNames((prev) => ({ ...prev, ...names }));
+            }
+          })
+          .catch(() => {});
+      }
+    }
+  };
+
   const extractFileName = (pathOrUri: string) => {
+    if (resolvedNames[pathOrUri]) {
+      return resolvedNames[pathOrUri];
+    }
     const clean = pathOrUri.split("?")[0];
     const parts = clean.split(/[/\\]/);
     return decodeURIComponent(parts[parts.length - 1] || pathOrUri);
@@ -194,7 +220,7 @@ export function ActivityView({
                       onClick={() => {
                         if (!canPreview) return;
                         if (isMulti) {
-                          setExpandedId(isExpanded ? null : item.id);
+                          toggleExpand(item);
                         } else {
                           onPreviewPath(item.savedPaths[0]);
                         }
@@ -241,7 +267,7 @@ export function ActivityView({
                           variant="glass"
                           onClick={() => {
                             if (isMulti) {
-                              setExpandedId(isExpanded ? null : item.id);
+                              toggleExpand(item);
                             } else {
                               onPreviewPath(item.savedPaths[0]);
                             }

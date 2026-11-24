@@ -54,4 +54,28 @@ internal object DownloadsPublisher {
         }
         return "Downloads/Landa/$displayRel"
     }
+
+    fun selectMediaStorePublishedPath(
+        contentUri: String,
+        @Suppress("UNUSED_PARAMETER") resolvedPath: String?,
+    ): String {
+        return contentUri
+    }
+
+    fun parseDownloadRelativeQuery(path: String): Pair<String, String>? {
+        val normalized = path.replace('\\', '/').trim()
+        val marker = "/Download/"
+        val idx = normalized.indexOf(marker)
+        if (idx < 0) return null
+        val afterDownload = normalized.substring(idx + marker.length).trimStart('/')
+        if (afterDownload.isEmpty()) return null
+        val lastSlash = afterDownload.lastIndexOf('/')
+        return if (lastSlash < 0) {
+            Pair("Download/", afterDownload)
+        } else {
+            val subDir = afterDownload.substring(0, lastSlash)
+            val fileName = afterDownload.substring(lastSlash + 1)
+            if (fileName.isEmpty()) null else Pair("Download/$subDir/", fileName)
+        }
+    }
 }

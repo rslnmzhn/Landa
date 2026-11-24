@@ -85,6 +85,17 @@ impl DiscoveryService {
         guard.get(peer_id).cloned()
     }
 
+    pub fn remove_live_peer(&self, peer_id: &PeerId) {
+        self.live_peers
+            .write()
+            .expect("live_peers lock poisoned")
+            .remove(peer_id);
+        self.last_unicast_reply
+            .lock()
+            .expect("last_unicast_reply lock poisoned")
+            .remove(peer_id);
+    }
+
     pub fn register_direct_peer(
         &self,
         peer_id: PeerId,

@@ -14,6 +14,7 @@ import {
   ScanLine,
   ShieldCheck,
   Smartphone,
+  Trash2,
   Upload,
   UserMinus,
   UserPlus,
@@ -71,6 +72,8 @@ export function DevicesView({
   const [scanning, setScanning] = useState(false);
   const [renameTarget, setRenameTarget] = useState<PeerInfo | null>(null);
   const [aliasDraft, setAliasDraft] = useState("");
+  const [forgetTarget, setForgetTarget] = useState<PeerInfo | null>(null);
+  const [forgetting, setForgetting] = useState(false);
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
@@ -216,6 +219,19 @@ export function DevicesView({
     }
   };
 
+  const handleConfirmForget = async () => {
+    if (!forgetTarget || forgetting) return;
+    setForgetting(true);
+    try {
+      await api.forgetPeer(forgetTarget.peerId);
+      setForgetTarget(null);
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setForgetting(false);
+    }
+  };
+
   const runUpdateCheck = async () => {
     setCheckingUpdate(true);
     setUpdateHint(null);
@@ -335,14 +351,15 @@ export function DevicesView({
           leftHanded ? "flex-row-reverse" : ""
         }`}
       >
-        <div className="flex items-center gap-3 min-w-0">
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900/95 dark:text-white/95">
-            {t.devices.title}
-          </h1>
+        <div
+          className={`flex flex-1 items-center min-w-0 ${
+            leftHanded ? "justify-end" : ""
+          }`}
+        >
           {identity && (
             <GlassBadge tone="neutral">
-              <span className="h-2 w-2 rounded-full bg-emerald-400" />
-              <span className="truncate max-w-[140px] text-xs">
+              <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-400" />
+              <span className="min-w-0 truncate text-xs">
                 {identity.deviceName}
               </span>
             </GlassBadge>
@@ -574,6 +591,8 @@ export function DevicesView({
                     size="sm"
                     disabled={!peer.isOnline}
                     title={t.devices.sendFolder}
+                    aria-label={t.devices.sendFolder}
+                    className="px-3"
                     onClick={() => handleSendFiles(peer.peerId, true)}
                   >
                     <FolderUp className="h-4 w-4" />
@@ -583,6 +602,8 @@ export function DevicesView({
                       variant="ghost"
                       size="sm"
                       title={t.devices.unfriend}
+                      aria-label={t.devices.unfriend}
+                      className="px-3"
                       onClick={() =>
                         api.unfriend(peer.peerId).catch((e) => onError(String(e)))
                       }
@@ -595,6 +616,8 @@ export function DevicesView({
                       size="sm"
                       disabled={!peer.isOnline}
                       title={t.devices.addFriend}
+                      aria-label={t.devices.addFriend}
+                      className="px-3"
                       onClick={() =>
                         api
                           .sendFriendRequest(peer.peerId)
@@ -604,6 +627,16 @@ export function DevicesView({
                       <UserPlus className="h-4 w-4" />
                     </GlassButton>
                   )}
+                  <GlassButton
+                    variant="ghost"
+                    size="sm"
+                    title={t.devices.forget}
+                    aria-label={t.devices.forget}
+                    className="px-3 text-slate-600/75 dark:text-white/55 hover:text-rose-600 dark:hover:text-rose-300"
+                    onClick={() => setForgetTarget(peer)}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </GlassButton>
                 </div>
               </GlassCard>
             );
@@ -635,6 +668,48 @@ export function DevicesView({
             </GlassButton>
           </div>
         </div>
+      </GlassModal>
+
+      {/* Forget Device Confirmation Modal */}
+      <GlassModal
+        open={forgetTarget !== null}
+        onClose={() => {
+          if (!forgetting) setForgetTarget(null);
+        }}
+        title={t.devices.forgetConfirmTitle}
+      >
+        {forgetTarget && (
+          <div className="space-y-4">
+            <div className="rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-3">
+              <div className="font-semibold text-slate-900/95 dark:text-white/95 truncate">
+                {forgetTarget.displayName}
+              </div>
+              <div className="mt-0.5 font-mono text-xs text-slate-700/70 dark:text-white/55">
+                {forgetTarget.ip ?? "—"} · {forgetTarget.os.toUpperCase()}
+              </div>
+            </div>
+            <p className="text-sm text-slate-800/85 dark:text-white/80">
+              {t.devices.forgetConfirmDesc}
+            </p>
+            <div className="flex justify-end gap-2">
+              <GlassButton
+                variant="ghost"
+                disabled={forgetting}
+                onClick={() => setForgetTarget(null)}
+              >
+                {t.devices.dropCancel}
+              </GlassButton>
+              <GlassButton
+                variant="danger"
+                disabled={forgetting}
+                onClick={handleConfirmForget}
+              >
+                <Trash2 className="h-4 w-4" />
+                <span>{t.devices.forgetConfirmAction}</span>
+              </GlassButton>
+            </div>
+          </div>
+        )}
       </GlassModal>
 
       {/* App Update Modal */}

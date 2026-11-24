@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test": "node --test src/features/clipboard/clipboardPaste.test.ts",
+    "test": "node --test src/features/clipboard/clipboardPaste.test.ts src/components/glass/glassModal.test.ts src/features/devices/devicesHeader.test.ts src/features/devices/devicesForget.test.ts src/features/activity/activityPreview.test.ts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

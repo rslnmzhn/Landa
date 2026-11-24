@@ -19,6 +19,11 @@ export const translations = {
       sendFolder: "Папка",
       addFriend: "В друзья",
       unfriend: "Убрать из друзей",
+      forget: "Забыть устройство",
+      forgetConfirmTitle: "Забыть устройство?",
+      forgetConfirmDesc:
+        "Устройство и связанные запросы в друзья будут удалены из списка. Если оно снова появится в сети, его можно будет добавить заново.",
+      forgetConfirmAction: "Забыть",
       rename: "Переименовать",
       renamePrompt: "Имя устройства",
       sasLabel: "Код",
@@ -205,6 +210,11 @@ export const translations = {
       sendFolder: "Folder",
       addFriend: "Add Friend",
       unfriend: "Unfriend",
+      forget: "Forget device",
+      forgetConfirmTitle: "Forget device?",
+      forgetConfirmDesc:
+        "This device and any pending friend requests will be removed from your list. If it appears on the network again, it will be discovered as a new device.",
+      forgetConfirmAction: "Forget",
       rename: "Rename",
       renamePrompt: "Device name",
       sasLabel: "Code",

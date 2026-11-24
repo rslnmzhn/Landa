@@ -31,6 +31,7 @@ export const api = {
   triggerScan: () => invoke<void>("trigger_scan"),
   renamePeer: (peerId: string, alias: string | null) =>
     invoke<void>("rename_peer", { peerId, alias }),
+  forgetPeer: (peerId: string) => invoke<void>("forget_peer", { peerId }),
 
   listFriendRequests: () => invoke<FriendRequestInfo[]>("list_friend_requests"),
   sendFriendRequest: (peerId: string) =>
@@ -158,6 +159,8 @@ export const api = {
     invoke<PreviewDescriptor>("prepare_file_preview", { pathOrUri }),
   openFileExternal: (pathOrUri: string) =>
     invoke<void>("open_file_external", { pathOrUri }),
+  resolvePreviewNames: (paths: string[]) =>
+    invoke<Record<string, string>>("resolve_preview_names", { paths }),
 
   // QR Quick Connect
   getQrConnectInfo: () => invoke<QrConnectInfo>("get_qr_connect_info"),

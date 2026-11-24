@@ -165,6 +165,12 @@ pub struct ContentUriMeta {
     pub mime_type: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveContentUriResponse {
+    uri: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingFocusTarget {
@@ -719,6 +725,20 @@ impl<R: Runtime> AndroidBridge<R> {
             )
             .await
             .map_err(|e| e.to_string())
+    }
+
+    pub async fn resolve_content_uri_for_path_async(&self, path: &str) -> Option<String> {
+        self.handle
+            .run_mobile_plugin_async::<ResolveContentUriResponse>(
+                "resolveContentUriForPath",
+                OpenContentUriArgs {
+                    uri: path.to_string(),
+                },
+            )
+            .await
+            .ok()
+            .and_then(|r| r.uri)
+            .filter(|u| u.starts_with("content://"))
     }
 
     pub async fn open_file_external_async(&self, path_or_uri: &str) -> Result<(), String> {

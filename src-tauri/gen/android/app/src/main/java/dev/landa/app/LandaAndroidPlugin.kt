@@ -8,6 +8,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -1035,7 +1036,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                     if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) sizeBytes = cursor.getLong(sizeIdx)
                 }
             }
-            if (sizeBytes < 0L) {
+            if (sizeBytes <= 0L) {
                 sizeBytes = runCatching {
                     activity.contentResolver.openFileDescriptor(parsed, "r")?.use { it.statSize } ?: 0L
                 }.getOrDefault(0L)
@@ -1049,6 +1050,66 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (ex: Exception) {
             invoke.reject(ex.message ?: "Failed to query content URI metadata")
         }
+    }
+
+    @Command
+    fun resolveContentUriForPath(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(OpenContentUriArgs::class.java)
+            val target = args.uri.trim()
+            val resolved = if (target.isEmpty()) null else resolveContentUriForPathInternal(target)
+            val res = JSObject()
+            res.put("uri", resolved?.toString())
+            invoke.resolve(res)
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to resolve content URI")
+        }
+    }
+
+    private fun resolveContentUriForPathInternal(path: String): Uri? {
+        publishedUris[path]?.first?.let { return it }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return null
+        }
+        val resolver = activity.contentResolver
+        val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        val projection = arrayOf(MediaStore.MediaColumns._ID)
+
+        runCatching {
+            resolver.query(
+                collection,
+                projection,
+                "${MediaStore.MediaColumns.DATA} = ?",
+                arrayOf(path),
+                "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idIdx = cursor.getColumnIndex(MediaStore.MediaColumns._ID)
+                    if (idIdx >= 0) {
+                        return ContentUris.withAppendedId(collection, cursor.getLong(idIdx))
+                    }
+                }
+            }
+        }
+
+        val relQuery = DownloadsPublisher.parseDownloadRelativeQuery(path) ?: return null
+        val (relDir, displayName) = relQuery
+        return runCatching {
+            resolver.query(
+                collection,
+                projection,
+                "${MediaStore.MediaColumns.RELATIVE_PATH} = ? AND ${MediaStore.MediaColumns.DISPLAY_NAME} = ?",
+                arrayOf(relDir, displayName),
+                "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idIdx = cursor.getColumnIndex(MediaStore.MediaColumns._ID)
+                    if (idIdx >= 0) {
+                        ContentUris.withAppendedId(collection, cursor.getLong(idIdx))
+                    } else null
+                } else null
+            }
+        }.getOrNull()
     }
 
     @Command
@@ -1068,22 +1129,39 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
             } else {
-                val file = File(target).canonicalFile
-                if (!file.exists() || !file.isFile) {
-                    invoke.reject("File not found")
-                    return
-                }
-                val uri = FileProvider.getUriForFile(
-                    activity,
-                    "${activity.packageName}.fileprovider",
-                    file
-                )
-                val ext = file.extension.lowercase()
-                val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
-                    ?: if (ext == "log" || ext == "txt") "text/plain" else "*/*"
-                Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, mime)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                val cached = publishedUris[target]
+                if (cached != null) {
+                    Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(cached.first, cached.second)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                } else {
+                    val file = File(target).canonicalFile
+                    if (!file.exists() || !file.isFile || !file.canRead()) {
+                        val resolvedUri = resolveContentUriForPathInternal(target)
+                        if (resolvedUri == null) {
+                            invoke.reject("File not found")
+                            return
+                        }
+                        val mime = activity.contentResolver.getType(resolvedUri) ?: "*/*"
+                        Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(resolvedUri, mime)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                    } else {
+                        val uri = FileProvider.getUriForFile(
+                            activity,
+                            "${activity.packageName}.fileprovider",
+                            file
+                        )
+                        val ext = file.extension.lowercase()
+                        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                            ?: if (ext == "log" || ext == "txt") "text/plain" else "*/*"
+                        Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, mime)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                    }
                 }
             }
             activity.startActivity(intent)
@@ -1700,8 +1778,13 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                     }
                 }
             }
-            val key = resolvedPath ?: uri.toString()
-            publishedUris[key] = Pair(uri, mimeType)
+            val contentUriStr = uri.toString()
+            val publishedPath = DownloadsPublisher.selectMediaStorePublishedPath(
+                contentUri = contentUriStr,
+                resolvedPath = resolvedPath,
+            )
+            publishedUris[contentUriStr] = Pair(uri, mimeType)
+            resolvedPath?.let { publishedUris[it] = Pair(uri, mimeType) }
             val displayPath = DownloadsPublisher.formatMediaStoreDisplayPath(
                 parts = parts,
                 actualDisplayName = actualDisplayName,
@@ -1709,7 +1792,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                 fallbackFileName = fileName,
             )
             return PublishedDownload(
-                publishedPath = key,
+                publishedPath = publishedPath,
                 displayPath = displayPath,
             )
         } catch (ex: Exception) {

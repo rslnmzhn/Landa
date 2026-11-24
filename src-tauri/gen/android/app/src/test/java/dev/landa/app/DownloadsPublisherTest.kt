@@ -62,4 +62,29 @@ class DownloadsPublisherTest {
         )
         assertEquals("Downloads/Landa/landa-v0.5.10-android-arm64-v8a (2).apk", fallbackFromData)
     }
+
+    @Test
+    fun mediaStorePublishedPathPrefersContentUriOverDataPath() {
+        val published = DownloadsPublisher.selectMediaStorePublishedPath(
+            contentUri = "content://media/external/downloads/1000012345",
+            resolvedPath = "/storage/emulated/0/Download/Landa/photo.jpg",
+        )
+        assertEquals("content://media/external/downloads/1000012345", published)
+    }
+
+    @Test
+    fun parsesDownloadRelativeQueryFromLegacyMediaStorePath() {
+        assertEquals(
+            Pair("Download/Landa/", "photo.jpg"),
+            DownloadsPublisher.parseDownloadRelativeQuery("/storage/emulated/0/Download/Landa/photo.jpg"),
+        )
+        assertEquals(
+            Pair("Download/Landa/Vacation/", "clip.mp4"),
+            DownloadsPublisher.parseDownloadRelativeQuery("/storage/emulated/0/Download/Landa/Vacation/clip.mp4"),
+        )
+        assertEquals(
+            null,
+            DownloadsPublisher.parseDownloadRelativeQuery("/data/user/0/dev.landa.app/files/note.txt"),
+        )
+    }
 }

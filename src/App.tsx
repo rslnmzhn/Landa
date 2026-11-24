@@ -457,7 +457,12 @@ export function App() {
               t={t}
               settings={settings}
               modules={modules}
-              onSettingsUpdated={setSettings}
+              onSettingsUpdated={(next) => {
+                setSettings(next);
+                setIdentity((prev) =>
+                  prev ? { ...prev, deviceName: next.deviceName } : prev
+                );
+              }}
               onModulesUpdated={setModules}
               onError={(m) => showToast("error", m)}
               onNotice={(m) => showToast("notice", m)}

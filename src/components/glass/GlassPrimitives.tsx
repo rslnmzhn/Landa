@@ -1,4 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 export function MeshCanvas() {
   return (
@@ -81,9 +82,11 @@ export function GlassButton({
 
 export function GlassBadge({
   tone = "neutral",
+  className = "",
   children,
 }: {
   tone?: "neutral" | "success" | "accent" | "warning";
+  className?: string;
   children: React.ReactNode;
 }) {
   const tones = {
@@ -98,7 +101,7 @@ export function GlassBadge({
   };
   return (
     <span
-      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium backdrop-blur-md ${tones[tone]}`}
+      className={`inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium backdrop-blur-md ${tones[tone]} ${className}`}
     >
       {children}
     </span>
@@ -364,23 +367,40 @@ export function GlassModal({
   title: string;
   children: React.ReactNode;
 }) {
+  useEffect(() => {
+    if (!open || !onClose) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, onClose]);
+
   if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4 backdrop-blur-md">
+
+  const modal = (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      className="safe-top safe-bottom fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/65 dark:bg-black/75 p-4 backdrop-blur-md"
+    >
       <div
         className="fixed inset-0"
         onClick={onClose}
         aria-hidden="true"
       />
-      <GlassCard
-        elevated
-        className="animate-glass-modal relative z-10 w-full max-w-md p-6"
-      >
+      <div className="liquid-glass-modal animate-glass-modal relative z-10 my-auto w-full max-w-md max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-3xl p-6 text-slate-900/90 dark:text-white/90">
         <h2 className="mb-4 text-lg font-semibold text-slate-900/95 dark:text-white/95">
           {title}
         </h2>
         {children}
-      </GlassCard>
+      </div>
     </div>
   );
+
+  if (typeof document !== "undefined" && document.body) {
+    return createPortal(modal, document.body);
+  }
+  return modal;
 }
