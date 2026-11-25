@@ -879,7 +879,7 @@ test("SharesView displays local share paths/URIs and clickable multi-level bread
   const rootCurrent = container.querySelector('nav[aria-label] [aria-current="page"]');
   assert.equal(rootCurrent?.textContent?.trim(), "Photos");
 
-  // When selected peer goes offline, remote browse state resets cleanly
+  // When selected trusted peer goes temporarily offline, selection is preserved and peerOffline is shown
   await act(async () => {
     root.render(
       React.createElement(SharesView, {
@@ -895,7 +895,435 @@ test("SharesView displays local share paths/URIs and clickable multi-level bread
     );
   });
   assert.ok(
-    container.textContent?.includes(translations.ru.shares.noFriends),
-    "going offline must reset remote browse state and show noFriends notice"
+    container.textContent?.includes(translations.ru.shares.peerOffline),
+    "temporary offline must preserve selection and show peerOffline notice"
   );
+
+  // When peer is unfriended (isTrusted: false), remote browse state resets cleanly
+  await act(async () => {
+    root.render(
+      React.createElement(SharesView, {
+        t: translations.ru,
+        identity: null,
+        peers: [makePeer({ isTrusted: false, isOnline: false })],
+        enabled: true,
+        onPreviewRemoteFile: () => {},
+        onPreviewLocalPath: (p) => localPreviewCalls.push(p),
+        onError: () => {},
+        onNotice: () => {},
+      })
+    );
+  });
+  assert.ok(
+    container.textContent?.includes(translations.ru.shares.noFriends),
+    "unfriending must reset remote browse state and show noFriends notice"
+  );
+});
+
+test("SharesView preserves selection across offline blink, reloads on reconnect, ignores stale responses, and distinguishes empty vs error", async (t) => {
+  const SharesView = await loadSharesViewComponent();
+  const env = setupDomEnvironment();
+  const container = env.dom.window.document.getElementById("root")!;
+  const root = createRoot(container);
+
+  const prevMock = (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__;
+  let scanCalls = 0;
+  let peer1BrowseCalls = 0;
+  let peer1Mode: "ok" | "empty" | "error" | "deferred" = "ok";
+  let resolveDeferredPeer1: ((val: unknown) => void) | null = null;
+
+  (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__ = async (
+    cmd: string,
+    args: Record<string, unknown>
+  ) => {
+    if (cmd === "shares_list_local") return [];
+    if (cmd === "trigger_scan") {
+      scanCalls++;
+      return null;
+    }
+    if (cmd === "shares_browse_remote_roots") {
+      const pid = String(args.peerId);
+      if (pid === "peer-1") {
+        peer1BrowseCalls++;
+        if (peer1Mode === "deferred") {
+          return new Promise((resolve) => {
+            resolveDeferredPeer1 = resolve;
+          });
+        }
+        if (peer1Mode === "empty") return [];
+        if (peer1Mode === "error") throw new Error("QUIC connection timed out");
+        return [{ id: "root-1", name: "AliceDocs", isDir: true }];
+      }
+      if (pid === "peer-2") {
+        return [{ id: "root-2", name: "BobMedia", isDir: true }];
+      }
+    }
+    return null;
+  };
+
+  t.after(async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__ = prevMock;
+    env.cleanup();
+  });
+
+  const errors: string[] = [];
+  const peer1Online = makePeer({ peerId: "peer-1", displayName: "Alice", isOnline: true });
+  const peer1Offline = makePeer({ peerId: "peer-1", displayName: "Alice", isOnline: false });
+  const peer2Online = makePeer({ peerId: "peer-2", displayName: "Bob", isOnline: true });
+
+  await act(async () => {
+    root.render(
+      React.createElement(SharesView, {
+        t: translations.ru,
+        identity: null,
+        peers: [peer1Online, peer2Online],
+        enabled: true,
+        onPreviewRemoteFile: () => {},
+        onPreviewLocalPath: () => {},
+        onError: (msg) => errors.push(msg),
+        onNotice: () => {},
+      })
+    );
+  });
+
+  const findButtonByText = (text: string) =>
+    Array.from(container.querySelectorAll("button")).find((btn) =>
+      btn.textContent?.includes(text)
+    );
+
+  // 1. Select Alice -> loads AliceDocs
+  await act(async () => {
+    findButtonByText("Alice")!.click();
+  });
+  assert.equal(peer1BrowseCalls, 1);
+  assert.ok(container.textContent?.includes("AliceDocs"));
+
+  // 2. Alice blinks offline -> selection preserved, peerOffline shown
+  await act(async () => {
+    root.render(
+      React.createElement(SharesView, {
+        t: translations.ru,
+        identity: null,
+        peers: [peer1Offline, peer2Online],
+        enabled: true,
+        onPreviewRemoteFile: () => {},
+        onPreviewLocalPath: () => {},
+        onError: (msg) => errors.push(msg),
+        onNotice: () => {},
+      })
+    );
+  });
+  assert.ok(container.textContent?.includes(translations.ru.shares.peerOffline));
+
+  // 3. Alice returns online -> automatically reloads remoteRoots
+  peer1Mode = "empty";
+  await act(async () => {
+    root.render(
+      React.createElement(SharesView, {
+        t: translations.ru,
+        identity: null,
+        peers: [peer1Online, peer2Online],
+        enabled: true,
+        onPreviewRemoteFile: () => {},
+        onPreviewLocalPath: () => {},
+        onError: (msg) => errors.push(msg),
+        onNotice: () => {},
+      })
+    );
+  });
+  assert.equal(peer1BrowseCalls, 2);
+  assert.ok(
+    container.textContent?.includes(translations.ru.shares.noRemoteShares),
+    "empty remote roots must show noRemoteShares"
+  );
+  assert.ok(!container.textContent?.includes(translations.ru.shares.loadError));
+
+  // 4. Manual refresh triggers scan and reloads roots; connection error shows loadError + retry
+  peer1Mode = "error";
+  const refreshBtn = container.querySelector(
+    `button[aria-label="${translations.ru.shares.refresh}"]`
+  ) as HTMLButtonElement | null;
+  assert.ok(refreshBtn, "manual refresh button must render");
+  await act(async () => {
+    refreshBtn.click();
+  });
+  assert.equal(scanCalls, 1);
+  assert.equal(peer1BrowseCalls, 3);
+  assert.ok(
+    container.textContent?.includes(translations.ru.shares.loadError),
+    "connection error must show loadError"
+  );
+  assert.ok(container.textContent?.includes("QUIC connection timed out"));
+  assert.ok(!container.textContent?.includes(translations.ru.shares.noRemoteShares));
+
+  // 5. Stale response from peer-1 must be ignored after switching to peer-2
+  peer1Mode = "deferred";
+  const retryBtn = findButtonByText(translations.ru.shares.retry);
+  assert.ok(retryBtn, "retry button must render on error");
+  await act(async () => {
+    retryBtn.click();
+  });
+  await act(async () => {
+    findButtonByText("Bob")!.click();
+  });
+  assert.ok(container.textContent?.includes("BobMedia"));
+
+  await act(async () => {
+    resolveDeferredPeer1?.([{ id: "stale-root", name: "StaleAliceRoot", isDir: true }]);
+  });
+  assert.ok(
+    container.textContent?.includes("BobMedia"),
+    "BobMedia must remain visible after stale peer-1 response resolves"
+  );
+  assert.ok(
+    !container.textContent?.includes("StaleAliceRoot"),
+    "stale peer-1 response must be ignored"
+  );
+});
+
+test("SharesView retries exact failed directory target A/B after navigation error", async (t) => {
+  const SharesView = await loadSharesViewComponent();
+  const env = setupDomEnvironment();
+  const container = env.dom.window.document.getElementById("root")!;
+  const root = createRoot(container);
+
+  const prevMock = (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__;
+  const dirCalls: Array<{ peerId: string; rootId: string; relPath: string }> = [];
+  let failAB = true;
+
+  (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__ = async (
+    cmd: string,
+    args: Record<string, unknown>
+  ) => {
+    if (cmd === "shares_list_local") return [];
+    if (cmd === "shares_browse_remote_roots") {
+      return [{ id: "root-1", name: "Root", isDir: true }];
+    }
+    if (cmd === "shares_browse_remote_dir") {
+      const relPath = String(args.relPath ?? "");
+      dirCalls.push({
+        peerId: String(args.peerId),
+        rootId: String(args.rootId),
+        relPath,
+      });
+      if (relPath === "") {
+        return [
+          {
+            name: "A",
+            relPath: "A",
+            isDir: true,
+            sizeBytes: 0,
+            modifiedMs: 1000,
+          },
+        ];
+      }
+      if (relPath === "A") {
+        return [
+          {
+            name: "B",
+            relPath: "A/B",
+            isDir: true,
+            sizeBytes: 0,
+            modifiedMs: 1000,
+          },
+        ];
+      }
+      if (relPath === "A/B") {
+        if (failAB) {
+          throw new Error("stream reset on A/B");
+        }
+        return [
+          {
+            name: "target-in-ab.txt",
+            relPath: "A/B/target-in-ab.txt",
+            isDir: false,
+            sizeBytes: 42,
+            modifiedMs: 1000,
+          },
+        ];
+      }
+      return [];
+    }
+    return null;
+  };
+
+  t.after(async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__ = prevMock;
+    env.cleanup();
+  });
+
+  const errors: string[] = [];
+  await act(async () => {
+    root.render(
+      React.createElement(SharesView, {
+        t: translations.ru,
+        identity: null,
+        peers: [makePeer()],
+        enabled: true,
+        onPreviewRemoteFile: () => {},
+        onPreviewLocalPath: () => {},
+        onError: (msg) => errors.push(msg),
+        onNotice: () => {},
+      })
+    );
+  });
+
+  const findButtonByText = (text: string) =>
+    Array.from(container.querySelectorAll("button")).find(
+      (btn) => btn.textContent?.trim() === text
+    );
+
+  await act(async () => {
+    findButtonByText("Alice")!.click();
+  });
+  await act(async () => {
+    findButtonByText("Root")!.click();
+  });
+  await act(async () => {
+    findButtonByText("A")!.click();
+  });
+  assert.ok(findButtonByText("B"), "folder B inside A should render");
+
+  // Opening A/B fails
+  await act(async () => {
+    findButtonByText("B")!.click();
+  });
+  assert.ok(container.textContent?.includes(translations.ru.shares.loadError));
+  assert.ok(container.textContent?.includes("stream reset on A/B"));
+  assert.equal(errors.length, 1);
+
+  // Retry must request A/B (not A) and display A/B contents
+  failAB = false;
+  const retryBtn = findButtonByText(translations.ru.shares.retry);
+  assert.ok(retryBtn, "retry button must render");
+  await act(async () => {
+    retryBtn.click();
+  });
+
+  assert.deepEqual(
+    dirCalls.map((c) => c.relPath),
+    ["", "A", "A/B", "A/B"]
+  );
+  assert.ok(
+    container.textContent?.includes("target-in-ab.txt"),
+    "A/B contents must render after retry"
+  );
+  assert.equal(
+    container.querySelector('nav[aria-label] [aria-current="page"]')?.textContent?.trim(),
+    "B"
+  );
+  assert.ok(!container.textContent?.includes(translations.ru.shares.loadError));
+});
+
+test("SharesView surfaces manual triggerScan failure without online peers and without blocking shares load", async (t) => {
+  const SharesView = await loadSharesViewComponent();
+  const env = setupDomEnvironment();
+  const container = env.dom.window.document.getElementById("root")!;
+  const root = createRoot(container);
+
+  const prevMock = (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__;
+  let failScan = true;
+
+  (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__ = async (
+    cmd: string
+  ) => {
+    if (cmd === "shares_list_local") return [];
+    if (cmd === "trigger_scan") {
+      if (failScan) {
+        throw new Error("UDP socket bind failed");
+      }
+      return null;
+    }
+    if (cmd === "shares_browse_remote_roots") {
+      return [{ id: "root-1", name: "AliceDocs", isDir: true }];
+    }
+    return null;
+  };
+
+  t.after(async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__ = prevMock;
+    env.cleanup();
+  });
+
+  const errors: string[] = [];
+  await act(async () => {
+    root.render(
+      React.createElement(SharesView, {
+        t: translations.ru,
+        identity: null,
+        peers: [],
+        enabled: true,
+        onPreviewRemoteFile: () => {},
+        onPreviewLocalPath: () => {},
+        onError: (msg) => errors.push(msg),
+        onNotice: () => {},
+      })
+    );
+  });
+
+  const refreshBtn = container.querySelector(
+    `button[aria-label="${translations.ru.shares.refresh}"]`
+  ) as HTMLButtonElement | null;
+  assert.ok(refreshBtn, "manual refresh button must render even with no peers");
+
+  await act(async () => {
+    refreshBtn.click();
+  });
+
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /UDP socket bind failed/);
+  assert.ok(container.textContent?.includes(translations.ru.shares.scanError));
+  assert.ok(container.textContent?.includes("UDP socket bind failed"));
+  assert.ok(container.textContent?.includes(translations.ru.shares.noFriends));
+
+  // With an online peer selected, scan failure must still allow shares to load independently
+  await act(async () => {
+    root.render(
+      React.createElement(SharesView, {
+        t: translations.ru,
+        identity: null,
+        peers: [makePeer()],
+        enabled: true,
+        onPreviewRemoteFile: () => {},
+        onPreviewLocalPath: () => {},
+        onError: (msg) => errors.push(msg),
+        onNotice: () => {},
+      })
+    );
+  });
+
+  const aliceBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+    b.textContent?.includes("Alice")
+  );
+  assert.ok(aliceBtn);
+  await act(async () => {
+    aliceBtn.click();
+  });
+  await act(async () => {
+    refreshBtn.click();
+  });
+
+  assert.equal(errors.length, 2);
+  assert.ok(container.textContent?.includes(translations.ru.shares.scanError));
+  assert.ok(
+    container.textContent?.includes("AliceDocs"),
+    "shares must still load and render even when triggerScan fails"
+  );
+
+  // Subsequent successful scan clears scanError
+  failScan = false;
+  await act(async () => {
+    refreshBtn.click();
+  });
+  assert.ok(!container.textContent?.includes(translations.ru.shares.scanError));
+  assert.ok(container.textContent?.includes("AliceDocs"));
 });

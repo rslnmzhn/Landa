@@ -1537,12 +1537,150 @@ mod tests {
         let saved = engine.update_settings(settings).unwrap();
         assert_eq!(saved.excluded_subnets, vec!["192.168.56.0/24".to_string()]);
 
-        let report = build_diagnostics_report(&engine, "2026-11-23 INFO test log line");
+        let listener_state = AndroidNetworkListenerState::new();
+        listener_state.record_result(&Err("plugin not initialized".into()));
+        assert!(!listener_state.is_registered());
+        assert_eq!(
+            listener_state.last_error().as_deref(),
+            Some("plugin not initialized")
+        );
+
+        let report = build_diagnostics_report_with_listener(
+            &engine,
+            "2026-11-23 INFO test log line",
+            Some(&listener_state),
+        );
         assert!(report.contains("Device Name: DiagNode"));
         assert!(report.contains("192.168.56.0/24"));
+        assert!(report.contains("Android Network Listener: registered=false, error=plugin not initialized"));
         assert!(report.contains("2026-11-23 INFO test log line"));
+
+        listener_state.record_result(&Ok(()));
+        assert!(listener_state.is_registered());
+        assert_eq!(listener_state.last_error(), None);
+        let recovered_report =
+            build_diagnostics_report_with_listener(&engine, "", Some(&listener_state));
+        assert!(recovered_report.contains("Android Network Listener: registered=true"));
+        assert!(!recovered_report.contains("error="));
 
         engine.shutdown();
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    struct FakeScanTrigger {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_first_n: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeScanTrigger {
+        fn new(fail_first_n: usize) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_first_n: std::sync::atomic::AtomicUsize::new(fail_first_n),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl StartupScanTrigger for FakeScanTrigger {
+        fn trigger_scan(&self) -> Result<(), String> {
+            let idx = self.calls.fetch_add(1, Ordering::AcqRel);
+            if idx < self.fail_first_n.load(Ordering::Acquire) {
+                Err(format!("simulated scan failure #{idx}"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_startup_permissions_runs_single_scan_across_two_calls_when_listener_not_notified_and_reregister_fails() {
+        let listener_state = AndroidNetworkListenerState::new();
+        let trigger = FakeScanTrigger::new(0);
+
+        ensure_startup_permissions_with_deps(
+            || async { Ok(false) },
+            || async { Err("plugin unavailable".to_string()) },
+            &listener_state,
+            &trigger,
+        )
+        .await
+        .expect("first call should succeed via fallback scan");
+
+        ensure_startup_permissions_with_deps(
+            || async { Ok(false) },
+            || async { Err("plugin unavailable".to_string()) },
+            &listener_state,
+            &trigger,
+        )
+        .await
+        .expect("second call should not trigger duplicate fallback scan");
+
+        assert_eq!(trigger.call_count(), 1);
+        assert!(!listener_state.is_registered());
+        assert_eq!(
+            listener_state.last_error().as_deref(),
+            Some("plugin unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_startup_permissions_skips_fallback_scan_when_listener_already_notified() {
+        let listener_state = AndroidNetworkListenerState::new();
+        let trigger = FakeScanTrigger::new(0);
+
+        ensure_startup_permissions_with_deps(
+            || async { Ok(true) },
+            || async { Ok(()) },
+            &listener_state,
+            &trigger,
+        )
+        .await
+        .expect("call with notified listener should succeed");
+
+        assert_eq!(trigger.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn ensure_startup_permissions_retries_failed_trigger_scan_once_and_releases_claim_on_persistent_failure() {
+        // Transient failure on first attempt -> retried once and succeeds.
+        let transient_state = AndroidNetworkListenerState::new();
+        let transient_trigger = FakeScanTrigger::new(1);
+        ensure_startup_permissions_with_deps(
+            || async { Ok(false) },
+            || async { Err("no listener".to_string()) },
+            &transient_state,
+            &transient_trigger,
+        )
+        .await
+        .expect("transient trigger_scan failure should recover on retry");
+        assert_eq!(transient_trigger.call_count(), 2);
+
+        // Persistent failure (both initial and retry fail) -> returns Err and releases claim so next call can recover.
+        let persistent_state = AndroidNetworkListenerState::new();
+        let persistent_trigger = FakeScanTrigger::new(2);
+        let err = ensure_startup_permissions_with_deps(
+            || async { Ok(false) },
+            || async { Err("no listener".to_string()) },
+            &persistent_state,
+            &persistent_trigger,
+        )
+        .await
+        .expect_err("persistent trigger_scan failure must not be silently swallowed");
+        assert!(err.contains("simulated scan failure"));
+        assert_eq!(persistent_trigger.call_count(), 2);
+
+        ensure_startup_permissions_with_deps(
+            || async { Ok(false) },
+            || async { Err("no listener".to_string()) },
+            &persistent_state,
+            &persistent_trigger,
+        )
+        .await
+        .expect("released claim should allow subsequent recovery call to scan");
+        assert_eq!(persistent_trigger.call_count(), 3);
     }
 }

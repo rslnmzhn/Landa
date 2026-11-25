@@ -472,3 +472,378 @@ async fn open_bi_with_kind(
         })?
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::module::ModuleRegistry;
+    use crate::transfer::TransferManager;
+    use landa_proto::{DeviceCategory, DeviceOs};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn make_test_ctx(dir: &std::path::Path) -> TransportHandlerCtx {
+        let storage = Arc::new(Storage::open(&dir.join("test.sqlite")).unwrap());
+        let (events, _) = broadcast::channel(16);
+        let transfers = Arc::new(TransferManager::new(
+            Arc::clone(&storage),
+            events.clone(),
+            dir.join("temp"),
+        ));
+        TransportHandlerCtx {
+            storage,
+            modules: Arc::new(ModuleRegistry::new()),
+            transfers,
+            events,
+            settings: Arc::new(RwLock::new(AppSettings::default_with(
+                "Test".into(),
+                dir.join("dl"),
+            ))),
+        }
+    }
+
+    #[tokio::test]
+    async fn wildcard_quic_endpoints_fall_back_to_distinct_ports_and_remain_reachable() {
+        let base = std::env::temp_dir().join(format!(
+            "landa-transport-wildcard-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let dir_1 = base.join("ep1");
+        let dir_2 = base.join("ep2");
+        let dir_c = base.join("client");
+        std::fs::create_dir_all(&dir_1).unwrap();
+        std::fs::create_dir_all(&dir_2).unwrap();
+        std::fs::create_dir_all(&dir_c).unwrap();
+
+        let id_1 = Arc::new(DeviceIdentity::load_or_generate(&dir_1.join("id.key")).unwrap());
+        let id_2 = Arc::new(DeviceIdentity::load_or_generate(&dir_2.join("id.key")).unwrap());
+        let id_c = Arc::new(DeviceIdentity::load_or_generate(&dir_c.join("id.key")).unwrap());
+        let peer_1 = id_1.peer_id();
+        let peer_2 = id_2.peer_id();
+
+        let ep1 = Arc::new(QuicTransport::bind_ip(id_1, Ipv4Addr::UNSPECIFIED).unwrap());
+        let ep2 = Arc::new(QuicTransport::bind_ip(id_2, Ipv4Addr::UNSPECIFIED).unwrap());
+        let client = Arc::new(QuicTransport::bind_ip(id_c, Ipv4Addr::LOCALHOST).unwrap());
+
+        assert_ne!(
+            ep1.local_port(),
+            ep2.local_port(),
+            "second wildcard endpoint must fall back to a distinct port when primary port is occupied"
+        );
+        assert_ne!(
+            ep2.local_port(),
+            DEFAULT_QUIC_PORT,
+            "second wildcard endpoint must not share DEFAULT_QUIC_PORT"
+        );
+
+        let cancel_1 = CancellationToken::new();
+        let cancel_2 = CancellationToken::new();
+        let ep1_loop = Arc::clone(&ep1);
+        let ep2_loop = Arc::clone(&ep2);
+        let ctx_1 = make_test_ctx(&dir_1);
+        let ctx_2 = make_test_ctx(&dir_2);
+        let c1 = cancel_1.clone();
+        let c2 = cancel_2.clone();
+        tokio::spawn(async move {
+            ep1_loop.run_accept_loop(ctx_1, c1).await;
+        });
+        tokio::spawn(async move {
+            ep2_loop.run_accept_loop(ctx_2, c2).await;
+        });
+
+        let addr_1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), ep1.local_port());
+        let addr_2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), ep2.local_port());
+
+        let (mut s1, _r1) = client
+            .open_stream(addr_1, peer_1, StreamKind::FriendHandshake)
+            .await
+            .unwrap();
+        let _ = s1.finish();
+
+        let (mut s2, _r2) = client
+            .open_stream(addr_2, peer_2, StreamKind::FriendHandshake)
+            .await
+            .unwrap();
+        let _ = s2.finish();
+
+        cancel_1.cancel();
+        cancel_2.cancel();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn open_stream_recovers_when_cached_connection_closes_or_peer_changes_port() {
+        let base = std::env::temp_dir().join(format!("landa-transport-test-{}", uuid::Uuid::new_v4()));
+        let dir_a = base.join("a");
+        let dir_b1 = base.join("b1");
+        let dir_b2 = base.join("b2");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b1).unwrap();
+        std::fs::create_dir_all(&dir_b2).unwrap();
+
+        let id_a = Arc::new(DeviceIdentity::load_or_generate(&dir_a.join("id.key")).unwrap());
+        let id_b = Arc::new(DeviceIdentity::load_or_generate(&dir_b1.join("id.key")).unwrap());
+        let id_a_peer_id = id_a.peer_id();
+        let peer_id_b = id_b.peer_id();
+
+        let transport_a = Arc::new(QuicTransport::bind_ip(id_a, Ipv4Addr::LOCALHOST).unwrap());
+        let transport_b1 =
+            Arc::new(QuicTransport::bind_ip(Arc::clone(&id_b), Ipv4Addr::LOCALHOST).unwrap());
+        let cancel_b1 = CancellationToken::new();
+        let b1_loop = Arc::clone(&transport_b1);
+        let b1_ctx = make_test_ctx(&dir_b1);
+        let b1_cancel = cancel_b1.clone();
+        tokio::spawn(async move {
+            b1_loop.run_accept_loop(b1_ctx, b1_cancel).await;
+        });
+
+        let addr_b1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), transport_b1.local_port());
+        let (mut send1, _recv1) = transport_a
+            .open_stream(addr_b1, peer_id_b, StreamKind::FriendHandshake)
+            .await
+            .unwrap();
+        let _ = send1.finish();
+
+        // Simulate remote peer closing the cached connection on the same address
+        transport_b1.disconnect_peer(&id_a_peer_id);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (mut send2, _recv2) = transport_a
+            .open_stream(addr_b1, peer_id_b, StreamKind::FriendHandshake)
+            .await
+            .unwrap();
+        let _ = send2.finish();
+
+        // Simulate peer restart on a new port while old connection is still cached
+        cancel_b1.cancel();
+        let transport_b2 = Arc::new(QuicTransport::bind_ip(id_b, Ipv4Addr::LOCALHOST).unwrap());
+        let cancel_b2 = CancellationToken::new();
+        let b2_loop = Arc::clone(&transport_b2);
+        let b2_ctx = make_test_ctx(&dir_b2);
+        let b2_cancel = cancel_b2.clone();
+        tokio::spawn(async move {
+            b2_loop.run_accept_loop(b2_ctx, b2_cancel).await;
+        });
+
+        let addr_b2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), transport_b2.local_port());
+        assert_ne!(addr_b1.port(), addr_b2.port());
+        let (mut send3, _recv3) = transport_a
+            .open_stream(addr_b2, peer_id_b, StreamKind::FriendHandshake)
+            .await
+            .unwrap();
+        let _ = send3.finish();
+
+        cancel_b2.cancel();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn open_stream_evicts_fresh_connection_after_second_timeout_and_does_not_reuse_it() {
+        let base = std::env::temp_dir().join(format!(
+            "landa-transport-evict-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let dir_a = base.join("a");
+        let dir_b = base.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let id_a = Arc::new(DeviceIdentity::load_or_generate(&dir_a.join("id.key")).unwrap());
+        let id_b = Arc::new(DeviceIdentity::load_or_generate(&dir_b.join("id.key")).unwrap());
+        let peer_id_b = id_b.peer_id();
+
+        let transport_a = Arc::new(QuicTransport::bind_ip(id_a, Ipv4Addr::LOCALHOST).unwrap());
+
+        // Server endpoint that completes QUIC handshake but grants 0 bidi streams so open_bi times out
+        let server_tls = build_server_config(&id_b).unwrap();
+        let quic_server_crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_crypto));
+        let mut tcfg = TransportConfig::default();
+        tcfg.max_concurrent_bidi_streams(0u32.into());
+        server_config.transport_config(Arc::new(tcfg));
+
+        let std_sock =
+            std::net::UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+                .unwrap();
+        let runtime = quinn::default_runtime().unwrap();
+        let blocked_ep = Endpoint::new(
+            EndpointConfig::default(),
+            Some(server_config),
+            std_sock,
+            runtime,
+        )
+        .unwrap();
+        let addr_b = blocked_ep.local_addr().unwrap();
+
+        let accepted_count = Arc::new(AtomicUsize::new(0));
+        let accepted_count_task = Arc::clone(&accepted_count);
+        let blocked_ep_task = blocked_ep.clone();
+        let accept_handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(incoming) = blocked_ep_task.accept().await {
+                if let Ok(conn) = incoming.await {
+                    accepted_count_task.fetch_add(1, Ordering::SeqCst);
+                    held.push(conn);
+                }
+            }
+        });
+
+        let err = transport_a
+            .open_stream_with_timeout(
+                addr_b,
+                peer_id_b,
+                StreamKind::FriendHandshake,
+                Duration::from_millis(120),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        // Strictly 1 initial attempt + 1 retry
+        assert_eq!(accepted_count.load(Ordering::SeqCst), 2);
+        // Fresh connection must be evicted from cache after the second timeout
+        assert!(transport_a
+            .connections
+            .lock()
+            .expect("connections lock poisoned")
+            .get(&peer_id_b)
+            .is_none());
+
+        // Next request to the same address must not reuse the evicted `fresh` connection
+        let err2 = transport_a
+            .open_stream_with_timeout(
+                addr_b,
+                peer_id_b,
+                StreamKind::FriendHandshake,
+                Duration::from_millis(120),
+            )
+            .await
+            .unwrap_err();
+        assert!(err2.to_string().contains("timed out"));
+        assert_eq!(accepted_count.load(Ordering::SeqCst), 4);
+        assert!(transport_a
+            .connections
+            .lock()
+            .expect("connections lock poisoned")
+            .get(&peer_id_b)
+            .is_none());
+
+        accept_handle.abort();
+        let _ = accept_handle.await;
+        blocked_ep.close(0u32.into(), b"done");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn open_stream_reconnects_to_same_peer_id_on_new_port_while_old_connection_is_cached() {
+        let base = std::env::temp_dir().join(format!(
+            "landa-transport-port-change-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let dir_a = base.join("a");
+        let dir_b1 = base.join("b1");
+        let dir_b2 = base.join("b2");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b1).unwrap();
+        std::fs::create_dir_all(&dir_b2).unwrap();
+
+        let id_a = Arc::new(DeviceIdentity::load_or_generate(&dir_a.join("id.key")).unwrap());
+        let id_b = Arc::new(DeviceIdentity::load_or_generate(&dir_b1.join("id.key")).unwrap());
+        let id_a_peer_id = id_a.peer_id();
+        let peer_id_b = id_b.peer_id();
+
+        let transport_a = Arc::new(QuicTransport::bind_ip(id_a, Ipv4Addr::LOCALHOST).unwrap());
+        let transport_b1 =
+            Arc::new(QuicTransport::bind_ip(Arc::clone(&id_b), Ipv4Addr::LOCALHOST).unwrap());
+        let cancel_b1 = CancellationToken::new();
+        let b1_ctx = make_test_ctx(&dir_b1);
+        let b1_loop = Arc::clone(&transport_b1);
+        let b1_cancel = cancel_b1.clone();
+        let b1_ctx_loop = b1_ctx.clone();
+        tokio::spawn(async move {
+            b1_loop.run_accept_loop(b1_ctx_loop, b1_cancel).await;
+        });
+
+        let addr_b1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), transport_b1.local_port());
+        let (mut send1, mut recv1) = transport_a
+            .open_stream(addr_b1, peer_id_b, StreamKind::FriendHandshake)
+            .await
+            .unwrap();
+        write_frame(
+            &mut send1,
+            &FriendMessage::Request {
+                device_name: "Node A".into(),
+                os: DeviceOs::Linux,
+                category: DeviceCategory::Desktop,
+            },
+        )
+        .await
+        .unwrap();
+        let _ = send1.finish();
+        let ack1: FriendMessage = read_frame(&mut recv1, MAX_CONTROL_FRAME_BYTES)
+            .await
+            .unwrap();
+        assert!(matches!(ack1, FriendMessage::Accept { .. }));
+
+        // Verify old connection to addr_b1 is still alive and cached
+        let old_cached = transport_a
+            .connections
+            .lock()
+            .expect("connections lock poisoned")
+            .get(&peer_id_b)
+            .cloned()
+            .expect("old connection must be cached");
+        assert_eq!(old_cached.remote_address(), addr_b1);
+        assert!(old_cached.close_reason().is_none());
+        let old_stable_id = old_cached.stable_id();
+
+        // Start a second endpoint with the same PeerId on a new port while old connection is still cached
+        let transport_b2 = Arc::new(QuicTransport::bind_ip(id_b, Ipv4Addr::LOCALHOST).unwrap());
+        let cancel_b2 = CancellationToken::new();
+        let b2_ctx = make_test_ctx(&dir_b2);
+        let b2_loop = Arc::clone(&transport_b2);
+        let b2_cancel = cancel_b2.clone();
+        let b2_ctx_loop = b2_ctx.clone();
+        tokio::spawn(async move {
+            b2_loop.run_accept_loop(b2_ctx_loop, b2_cancel).await;
+        });
+
+        let addr_b2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), transport_b2.local_port());
+        assert_ne!(addr_b1.port(), addr_b2.port());
+
+        let (mut send2, mut recv2) = transport_a
+            .open_stream(addr_b2, peer_id_b, StreamKind::FriendHandshake)
+            .await
+            .unwrap();
+        write_frame(
+            &mut send2,
+            &FriendMessage::Request {
+                device_name: "Node A".into(),
+                os: DeviceOs::Linux,
+                category: DeviceCategory::Desktop,
+            },
+        )
+        .await
+        .unwrap();
+        let _ = send2.finish();
+        let ack2: FriendMessage = read_frame(&mut recv2, MAX_CONTROL_FRAME_BYTES)
+            .await
+            .unwrap();
+        assert!(matches!(ack2, FriendMessage::Accept { .. }));
+
+        // Cache must now point to addr_b2 with a new Connection, and b2 must have received the request
+        let new_cached = transport_a
+            .connections
+            .lock()
+            .expect("connections lock poisoned")
+            .get(&peer_id_b)
+            .cloned()
+            .expect("new connection must be cached");
+        assert_eq!(new_cached.remote_address(), addr_b2);
+        assert_ne!(new_cached.stable_id(), old_stable_id);
+        let reqs_b2 = b2_ctx.storage.list_friend_requests().unwrap();
+        assert_eq!(reqs_b2.len(), 1);
+        assert_eq!(reqs_b2[0].peer_id, id_a_peer_id.to_hex());
+
+        cancel_b1.cancel();
+        cancel_b2.cancel();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
