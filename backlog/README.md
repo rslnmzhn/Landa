@@ -6,14 +6,20 @@
 
 | # | Файл | Задача | Приоритет |
 |---|---|---|---|
-| 13 | [13-fullscreen-gesture-preview-and-ux.md](./13-fullscreen-gesture-preview-and-ux.md) | Починка предпросмотра файлов, полноэкранный режим с жестами и удаление кнопки «глазика» | P0 (Критический) |
-| 14 | [14-shares-folder-download-and-paths.md](./14-shares-folder-download-and-paths.md) | Скачивание папок целиком в `Shares` и отображение путей к файлам | P1 (Высокий) |
-| 15 | [15-android-automatic-update.md](./15-android-automatic-update.md) | Автоматический запуск установки обновлений на Android | P1 (Высокий) |
+| 17 | [17-clipboard-sync-and-ui-fix.md](./17-clipboard-sync-and-ui-fix.md) | Починка модуля буфера обмена (`Clipboard`) и бага отправки текста целевому устройству | P0 (Критический) |
+| 18 | [18-android-to-pc-shares-folder-download.md](./18-android-to-pc-shares-folder-download.md) | Починка скачивания папок из `Shares` с Android на ПК | P1 (Высокий) |
+| 19 | [19-downloads-storage-and-app-size-accounting.md](./19-downloads-storage-and-app-size-accounting.md) | Исключение скачанных файлов и кэшей из «веса приложения» на Android | P1 (Высокий) |
+| 20 | [20-svg-app-icon-and-android-launcher.md](./20-svg-app-icon-and-android-launcher.md) | Переделка PNG-иконки в SVG и замена иконки приложения везде (включая Android) | P1 (Высокий) |
+| 21 | [21-android-apk-size-reduction.md](./21-android-apk-size-reduction.md) | Уменьшение веса Android APK | P2 (Средний) |
 
 ## Done
 
 | # | Файл | Задача | Status |
 |---|---|---|---|
+| 16 | [16-android-connection-and-shares-recovery.md](./16-android-connection-and-shares-recovery.md) | Стабильность подключения на Android и восстановление видимости устройств и `Shares` | Done |
+| 15 | [15-android-automatic-update.md](./15-android-automatic-update.md) | Автоматический запуск установки обновлений на Android | Done |
+| 14 | [14-shares-folder-download-and-paths.md](./14-shares-folder-download-and-paths.md) | Скачивание папок целиком в `Shares` и отображение путей к файлам | Done |
+| 13 | [13-fullscreen-gesture-preview-and-ux.md](./13-fullscreen-gesture-preview-and-ux.md) | Починка предпросмотра файлов, полноэкранный режим с жестами и удаление кнопки «глазика» | Done |
 | 12 | [12-ui-layout-modals-and-devices.md](./12-ui-layout-modals-and-devices.md) | Исправление шапки, модальных окон и управление устройствами (забыть устройство) | Done |
 | 11 | [11-android-play-protect-fix.md](./11-android-play-protect-fix.md) | Устранение предупреждения Google Play Protect на Android APK | Done |
 | 10 | [10-diagnostics-and-release-signing.md](./10-diagnostics-and-release-signing.md) | Просмотр логов, выбор сетевых интерфейсов и релизная подпись Android/CI | Done |
