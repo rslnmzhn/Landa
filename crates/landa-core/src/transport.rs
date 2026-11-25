@@ -27,6 +27,7 @@ use crate::transfer::TransferManager;
 
 pub const DEFAULT_QUIC_PORT: u16 = 40406;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Clone)]
 pub struct TransportHandlerCtx {
@@ -113,6 +114,10 @@ impl QuicTransport {
         {
             bind_socket_to_lan_network(self.raw_fd);
         }
+        self.connections
+            .lock()
+            .expect("connections lock poisoned")
+            .retain(|_, conn| conn.close_reason().is_none());
     }
 
     pub fn set_handler_ctx(&self, ctx: TransportHandlerCtx) {
@@ -120,13 +125,25 @@ impl QuicTransport {
     }
 
     pub fn disconnect_peer(&self, peer_id: &PeerId) {
-        if let Some(conn) = self
-            .connections
-            .lock()
-            .expect("connections lock poisoned")
-            .remove(peer_id)
-        {
-            conn.close(0u32.into(), b"peer forgotten");
+        self.evict_connection(peer_id, None);
+    }
+
+    fn evict_connection(&self, peer_id: &PeerId, expected: Option<&Connection>) {
+        let removed = {
+            let mut guard = self.connections.lock().expect("connections lock poisoned");
+            let should_remove = match (guard.get(peer_id), expected) {
+                (Some(current), Some(exp)) => current.stable_id() == exp.stable_id(),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if should_remove {
+                guard.remove(peer_id)
+            } else {
+                None
+            }
+        };
+        if let Some(conn) = removed {
+            conn.close(0u32.into(), b"reconnecting");
         }
     }
 
@@ -135,21 +152,18 @@ impl QuicTransport {
         addr: SocketAddr,
         expected_peer_id: PeerId,
     ) -> Result<Connection, CoreError> {
-        if let Some(existing) = self
-            .connections
-            .lock()
-            .expect("connections lock poisoned")
-            .get(&expected_peer_id)
-            .cloned()
-        {
-            if existing.close_reason().is_none() && existing.remote_address() == addr {
-                return Ok(existing);
-            }
-            existing.close(0u32.into(), b"reconnecting");
+        let existing = {
             self.connections
                 .lock()
                 .expect("connections lock poisoned")
-                .remove(&expected_peer_id);
+                .get(&expected_peer_id)
+                .cloned()
+        };
+        if let Some(existing) = existing {
+            if existing.close_reason().is_none() && existing.remote_address() == addr {
+                return Ok(existing);
+            }
+            self.evict_connection(&expected_peer_id, Some(&existing));
         }
 
         self.rebind_network();
@@ -208,22 +222,31 @@ impl QuicTransport {
         expected_peer_id: PeerId,
         kind: StreamKind,
     ) -> Result<(SendStream, RecvStream), CoreError> {
+        self.open_stream_with_timeout(addr, expected_peer_id, kind, OPEN_STREAM_TIMEOUT)
+            .await
+    }
+
+    async fn open_stream_with_timeout(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        expected_peer_id: PeerId,
+        kind: StreamKind,
+        stream_timeout: Duration,
+    ) -> Result<(SendStream, RecvStream), CoreError> {
         let conn = self.connect_peer(addr, expected_peer_id).await?;
-        match conn.open_bi().await {
-            Ok((mut send, recv)) => {
-                send.write_all(&[kind as u8]).await?;
-                Ok((send, recv))
-            }
+        match open_bi_with_kind(&conn, kind, stream_timeout).await {
+            Ok(streams) => Ok(streams),
             Err(_) => {
                 // Cached connection may have gone stale; evict and reconnect once
-                self.connections
-                    .lock()
-                    .expect("connections lock poisoned")
-                    .remove(&expected_peer_id);
+                self.evict_connection(&expected_peer_id, Some(&conn));
                 let fresh = self.connect_peer(addr, expected_peer_id).await?;
-                let (mut send, recv) = fresh.open_bi().await?;
-                send.write_all(&[kind as u8]).await?;
-                Ok((send, recv))
+                match open_bi_with_kind(&fresh, kind, stream_timeout).await {
+                    Ok(streams) => Ok(streams),
+                    Err(err) => {
+                        self.evict_connection(&expected_peer_id, Some(&fresh));
+                        Err(err)
+                    }
+                }
             }
         }
     }
@@ -428,3 +451,24 @@ async fn handle_friend_stream(
     let _ = send.finish();
     Ok(())
 }
+
+async fn open_bi_with_kind(
+    conn: &Connection,
+    kind: StreamKind,
+    stream_timeout: Duration,
+) -> Result<(SendStream, RecvStream), CoreError> {
+    let fut = async {
+        let (mut send, recv) = conn.open_bi().await?;
+        send.write_all(&[kind as u8]).await?;
+        Ok::<_, CoreError>((send, recv))
+    };
+    tokio::time::timeout(stream_timeout, fut)
+        .await
+        .map_err(|_| {
+            CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "QUIC open_bi timed out",
+            ))
+        })?
+}
+

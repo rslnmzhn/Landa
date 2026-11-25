@@ -1,7 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use landa_core::{
     AppSettings, FriendRequestInfo, LanInterfaceStatus, LandaEngine, LocalIdentityInfo,
@@ -18,8 +17,129 @@ use landa_mod_shares::{
 use landa_mod_videolink::{VideoLinkModule, VideoLinkStatus, VideoSource};
 use tauri::State;
 
+#[derive(Default)]
+pub struct AndroidNetworkListenerState {
+    registered: AtomicBool,
+    startup_permissions_fallback_claimed: AtomicBool,
+    last_error: Mutex<Option<String>>,
+}
+
+impl AndroidNetworkListenerState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+    pub fn record_result(&self, res: &Result<(), String>) {
+        match res {
+            Ok(()) => {
+                self.registered.store(true, Ordering::Release);
+                if let Ok(mut guard) = self.last_error.lock() {
+                    *guard = None;
+                }
+            }
+            Err(err) => {
+                self.registered.store(false, Ordering::Release);
+                if let Ok(mut guard) = self.last_error.lock() {
+                    *guard = Some(err.clone());
+                }
+            }
+        }
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.registered.load(Ordering::Acquire)
+    }
+
+    #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+    pub fn try_claim_startup_permissions_fallback(&self) -> bool {
+        !self
+            .startup_permissions_fallback_claimed
+            .swap(true, Ordering::AcqRel)
+    }
+
+    #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+    pub fn release_startup_permissions_fallback(&self) {
+        self.startup_permissions_fallback_claimed
+            .store(false, Ordering::Release);
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|g| g.clone())
+    }
+
+    pub fn diagnostics_line(&self) -> String {
+        match self.last_error() {
+            Some(err) => format!(
+                "Android Network Listener: registered={}, error={err}",
+                self.is_registered()
+            ),
+            None => format!(
+                "Android Network Listener: registered={}",
+                self.is_registered()
+            ),
+        }
+    }
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub trait StartupScanTrigger: Send + Sync {
+    fn trigger_scan(&self) -> Result<(), String>;
+}
+
+impl StartupScanTrigger for LandaEngine {
+    fn trigger_scan(&self) -> Result<(), String> {
+        LandaEngine::trigger_scan(self);
+        Ok(())
+    }
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub async fn ensure_startup_permissions_with_deps<F, Fut, R, RFut>(
+    request_permissions: F,
+    re_register_listener: R,
+    listener_state: &AndroidNetworkListenerState,
+    scan_trigger: &dyn StartupScanTrigger,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+    R: FnOnce() -> RFut,
+    RFut: std::future::Future<Output = Result<(), String>>,
+{
+    let listener_notified = request_permissions().await?;
+    if !listener_notified {
+        if !listener_state.is_registered() {
+            let res = re_register_listener().await;
+            listener_state.record_result(&res);
+            if let Err(err) = res {
+                tracing::warn!(
+                    "failed to re-register Android network listener after startup permissions: {err}"
+                );
+            }
+        }
+        if listener_state.try_claim_startup_permissions_fallback() {
+            if let Err(first_err) = scan_trigger.trigger_scan() {
+                tracing::warn!(
+                    "startup permissions fallback trigger_scan failed, retrying once: {first_err}"
+                );
+                if let Err(retry_err) = scan_trigger.trigger_scan() {
+                    tracing::error!(
+                        "startup permissions fallback trigger_scan retry failed: {retry_err}"
+                    );
+                    listener_state.release_startup_permissions_fallback();
+                    return Err(retry_err);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub struct AppState {
     pub engine: Arc<LandaEngine>,
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub android_network_listener: Arc<AndroidNetworkListenerState>,
     #[cfg(feature = "mod-shares")]
     pub shares: Arc<SharesModule>,
     #[cfg(feature = "mod-clipboard")]
@@ -41,7 +161,27 @@ pub fn list_peers(state: State<'_, AppState>) -> Result<Vec<PeerInfo>, String> {
 }
 
 #[tauri::command]
-pub fn trigger_scan(state: State<'_, AppState>) {
+pub fn trigger_scan(app: tauri::AppHandle, state: State<'_, AppState>) {
+    #[cfg(target_os = "android")]
+    {
+        if !state.android_network_listener.is_registered() {
+            let app_clone = app.clone();
+            let engine_clone = Arc::clone(&state.engine);
+            let listener_state = Arc::clone(&state.android_network_listener);
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = crate::register_android_network_listener_once(
+                    &app_clone,
+                    &engine_clone,
+                    &listener_state,
+                )
+                .await
+                {
+                    tracing::warn!("retry register Android network listener failed: {err}");
+                }
+            });
+        }
+    }
+    let _ = app;
     state.engine.trigger_scan();
 }
 
@@ -291,12 +431,20 @@ pub async fn copy_diagnostics(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let log_tail = crate::logging::read_log_tail(200);
-    let report = build_diagnostics_report(&state.engine, &log_tail);
+    #[cfg(target_os = "android")]
+    let listener_diag = Some(state.android_network_listener.as_ref());
+    #[cfg(not(target_os = "android"))]
+    let listener_diag: Option<&AndroidNetworkListenerState> = None;
+    let report = build_diagnostics_report_with_listener(&state.engine, &log_tail, listener_diag);
     write_text_to_system_clipboard(&app, &state, &report).await?;
     Ok(report)
 }
 
-pub fn build_diagnostics_report(engine: &LandaEngine, log_tail: &str) -> String {
+pub fn build_diagnostics_report_with_listener(
+    engine: &LandaEngine,
+    log_tail: &str,
+    android_listener: Option<&AndroidNetworkListenerState>,
+) -> String {
     use std::fmt::Write;
 
     let identity = engine.local_identity_info();
@@ -362,6 +510,10 @@ pub fn build_diagnostics_report(engine: &LandaEngine, log_tail: &str) -> String 
             "  - {}: enabled={}, available={}",
             m.id, m.enabled, m.available
         );
+    }
+
+    if let Some(listener) = android_listener {
+        let _ = writeln!(out, "\n{}", listener.diagnostics_line());
     }
 
     let _ = writeln!(out, "\nRecent Logs (landa.log):");
@@ -1102,15 +1254,35 @@ pub fn take_pending_shared_files(app: tauri::AppHandle) -> Result<Vec<String>, S
 }
 
 #[tauri::command]
-pub async fn ensure_startup_permissions(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn ensure_startup_permissions(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
         use tauri::Manager;
         if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
-            return bridge.ensure_startup_permissions_async().await;
+            return ensure_startup_permissions_with_deps(
+                || async {
+                    bridge
+                        .ensure_startup_permissions_async()
+                        .await
+                        .map(|outcome| outcome.listener_notified)
+                },
+                || {
+                    crate::register_android_network_listener_once(
+                        &app,
+                        &state.engine,
+                        &state.android_network_listener,
+                    )
+                },
+                &state.android_network_listener,
+                state.engine.as_ref(),
+            )
+            .await;
         }
     }
-    let _ = app;
+    let _ = (app, state);
     Ok(())
 }
 

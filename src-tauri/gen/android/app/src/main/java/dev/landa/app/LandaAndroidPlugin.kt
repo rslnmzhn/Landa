@@ -21,6 +21,8 @@ import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.MediaStore
@@ -30,13 +32,13 @@ import android.webkit.MimeTypeMap
 import android.webkit.WebView
 import androidx.activity.result.ActivityResult
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
+import app.tauri.annotation.PermissionCallback
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSArray
@@ -174,6 +176,8 @@ class WriteClipboardImageArgs {
 @TauriPlugin
 class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var webViewRef: WebView? = null
     private val pendingSharedPaths = mutableListOf<String>()
     private var pendingFocusTarget: JSObject? = null
@@ -186,20 +190,27 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     private var fgServiceRunning: Boolean = false
     @Volatile
     private var appInForeground: Boolean = true
+    @Volatile
+    private var isDestroyed: Boolean = false
+    @Volatile
+    private var pendingNetworkChanged: Boolean = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var permissionsRequestedThisSession = false
+    private val startupPermissionsCoordinator = StartupPermissionsCoordinator<Invoke>()
 
     companion object {
         private const val CHANNEL_PROGRESS = "landa_transfer_progress"
         private const val CHANNEL_DONE = "landa_transfer_done"
         private const val CHANNEL_REQUESTS = "landa_incoming_requests"
-        private const val REQ_STARTUP_PERMS = 1002
         private const val MAX_FOLDER_FILES = 10_000
         private const val MAX_FOLDER_DEPTH = 32
     }
 
     init {
-        acquireMulticastLock()
+        runOnMainThread {
+            if (isDestroyed) return@runOnMainThread
+            acquireMulticastLock()
+            acquireWifiLock()
+        }
         ensureNotificationChannels()
         registerWifiNetworkCallback()
     }
@@ -207,8 +218,13 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     override fun load(webView: WebView) {
         super.load(webView)
         webViewRef = webView
-        appInForeground = true
-        acquireMulticastLock()
+        runOnMainThread {
+            if (isDestroyed) return@runOnMainThread
+            appInForeground = true
+            acquireMulticastLock(forceReacquire = true)
+            acquireWifiLock()
+            triggerNetworkChanged(NetworkChangeSource.LOAD)
+        }
         sweepOldShareCache()
         activity.intent?.let {
             handleShareIntent(it)
@@ -218,21 +234,36 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
 
     override fun onResume(activity: AppCompatActivity) {
         super.onResume(activity)
-        appInForeground = true
-        acquireMulticastLock()
-        dispatchWebEvent("landa-network-changed")
+        runOnMainThread {
+            if (isDestroyed) return@runOnMainThread
+            appInForeground = true
+            acquireMulticastLock(forceReacquire = true)
+            acquireWifiLock()
+            triggerNetworkChanged(NetworkChangeSource.RESUME)
+        }
     }
 
     override fun onPause(activity: AppCompatActivity) {
-        appInForeground = false
+        runOnMainThread {
+            appInForeground = false
+            releaseWifiLock()
+        }
         super.onPause(activity)
     }
 
     override fun onDestroy(activity: AppCompatActivity) {
-        appInForeground = false
+        runOnMainThread {
+            isDestroyed = true
+            appInForeground = false
+            startupPermissionsCoordinator.clearPending { pendingInvoke ->
+                pendingInvoke.reject("Plugin destroyed")
+            }
+            unregisterWifiNetworkCallback()
+            releaseWifiLock()
+            releaseMulticastLock()
+            mainHandler.removeCallbacksAndMessages(null)
+        }
         stopTransferForegroundInternal()
-        unregisterWifiNetworkCallback()
-        releaseMulticastLock()
         super.onDestroy(activity)
     }
 
@@ -251,45 +282,107 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
-    fun ensureStartupPermissions(invoke: Invoke) {
-        try {
-            if (!permissionsRequestedThisSession) {
-                permissionsRequestedThisSession = true
-                val missing = mutableListOf<String>()
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    if (ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS)
-                        != PackageManager.PERMISSION_GRANTED
-                    ) {
-                        missing.add(Manifest.permission.POST_NOTIFICATIONS)
-                    }
-                    if (ContextCompat.checkSelfPermission(activity, Manifest.permission.NEARBY_WIFI_DEVICES)
-                        != PackageManager.PERMISSION_GRANTED
-                    ) {
-                        missing.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-                    }
-                } else {
-                    if (ContextCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_FINE_LOCATION)
-                        != PackageManager.PERMISSION_GRANTED
-                    ) {
-                        missing.add(Manifest.permission.ACCESS_FINE_LOCATION)
-                    }
-                }
-                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-                    if (ContextCompat.checkSelfPermission(activity, Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                        != PackageManager.PERMISSION_GRANTED
-                    ) {
-                        missing.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                    }
-                }
-                if (missing.isNotEmpty()) {
-                    ActivityCompat.requestPermissions(activity, missing.toTypedArray(), REQ_STARTUP_PERMS)
-                }
+    fun registerNetworkListener(invoke: Invoke) {
+        super.registerListener(invoke)
+        mainHandler.post {
+            if (!isDestroyed && pendingNetworkChanged && hasListener("network-changed")) {
+                pendingNetworkChanged = false
+                trigger("network-changed", JSObject())
             }
+        }
+    }
+
+    @Command
+    fun ensureStartupPermissions(invoke: Invoke) {
+        runOnMainThread {
+            if (isDestroyed) {
+                invoke.reject("Plugin destroyed")
+                return@runOnMainThread
+            }
+            try {
+                val missing = mutableListOf<String>()
+                if (startupPermissionsCoordinator.state == StartupPermissionsState.NOT_REQUESTED) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        if (ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS)
+                            != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            missing.add(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                        if (ContextCompat.checkSelfPermission(activity, Manifest.permission.NEARBY_WIFI_DEVICES)
+                            != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            missing.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+                        }
+                    } else {
+                        if (ContextCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_FINE_LOCATION)
+                            != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            missing.add(Manifest.permission.ACCESS_FINE_LOCATION)
+                        }
+                    }
+                    if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+                        if (ContextCompat.checkSelfPermission(activity, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                            != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            missing.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                        }
+                    }
+                }
+
+                val pluginHandle = handle
+                startupPermissionsCoordinator.onRequest(
+                    token = invoke,
+                    missingPermissions = missing,
+                    hasPluginHandle = pluginHandle != null,
+                    requestWithHandle = { perms ->
+                        pluginHandle!!.requestPermissions(
+                            invoke,
+                            perms,
+                            "onStartupPermissionsResult"
+                        )
+                    },
+                    onComplete = { invokes ->
+                        completeStartupPermissions(invokes)
+                    },
+                    onReject = { targetInvoke, reason ->
+                        targetInvoke.reject(reason)
+                    },
+                )
+            } catch (ex: Exception) {
+                invoke.reject(ex.message ?: "Failed to request permissions")
+            }
+        }
+    }
+
+    @PermissionCallback
+    fun onStartupPermissionsResult(invoke: Invoke) {
+        runOnMainThread {
+            startupPermissionsCoordinator.onPermissionCallback(invoke) { invokes ->
+                completeStartupPermissions(invokes)
+            }
+        }
+    }
+
+    private fun completeStartupPermissions(invokes: List<Invoke>) {
+        val resolutions = StartupPermissionsCompletion.complete(
+            invokes = invokes,
+            isDestroyed = isDestroyed,
+            hasListener = hasListener("network-changed"),
+            onAcquireLocks = {
+                acquireMulticastLock(forceReacquire = true)
+                if (appInForeground) {
+                    acquireWifiLock()
+                }
+            },
+            onTriggerNetworkChanged = { source ->
+                triggerNetworkChanged(source)
+            },
+        )
+        for (resolution in resolutions) {
             val res = JSObject()
             res.put("requested", true)
-            invoke.resolve(res)
-        } catch (ex: Exception) {
-            invoke.reject(ex.message ?: "Failed to request permissions")
+            res.put("listenerNotified", resolution.listenerNotified)
+            resolution.token.resolve(res)
         }
     }
 
@@ -2268,6 +2361,14 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         return fallbackEthernet
     }
 
+    private fun runOnMainThread(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post(block)
+        }
+    }
+
     private fun registerWifiNetworkCallback() {
         try {
             val cm = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
@@ -2278,14 +2379,29 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                 .build()
             val cb = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    dispatchWebEvent("landa-network-changed")
+                    runOnMainThread {
+                        if (isDestroyed) return@runOnMainThread
+                        acquireMulticastLock(forceReacquire = true)
+                        if (appInForeground) {
+                            acquireWifiLock()
+                        }
+                        triggerNetworkChanged(NetworkChangeSource.NETWORK_CALLBACK)
+                    }
                 }
 
                 override fun onLost(network: Network) {
-                    dispatchWebEvent("landa-network-changed")
+                    runOnMainThread {
+                        if (isDestroyed) return@runOnMainThread
+                        acquireMulticastLock(forceReacquire = true)
+                        triggerNetworkChanged(NetworkChangeSource.NETWORK_CALLBACK)
+                    }
                 }
             }
-            cm.registerNetworkCallback(req, cb)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                cm.registerNetworkCallback(req, cb, mainHandler)
+            } else {
+                cm.registerNetworkCallback(req, cb)
+            }
             networkCallback = cb
         } catch (_: Exception) {
         }
@@ -2302,6 +2418,16 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    private fun triggerNetworkChanged(source: NetworkChangeSource) {
+        NetworkChangedDispatcher.dispatch(
+            source = source,
+            hasListener = hasListener("network-changed"),
+            setPending = { pendingNetworkChanged = it },
+            notifyNativeListener = { trigger("network-changed", JSObject()) },
+            notifyWebView = { dispatchWebEvent("landa-network-changed") },
+        )
+    }
+
     private fun dispatchWebEvent(eventName: String) {
         activity.runOnUiThread {
             webViewRef?.evaluateJavascript(
@@ -2311,8 +2437,12 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    private fun acquireMulticastLock() {
+    private fun acquireMulticastLock(forceReacquire: Boolean = false) {
         try {
+            if (forceReacquire && multicastLock?.isHeld == true) {
+                runCatching { multicastLock?.release() }
+                multicastLock = null
+            }
             if (multicastLock?.isHeld == true) return
             val wifi = activity.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
                 ?: return
@@ -2333,6 +2463,36 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (_: Exception) {
         } finally {
             multicastLock = null
+        }
+    }
+
+    private fun acquireWifiLock() {
+        try {
+            if (wifiLock?.isHeld == true) return
+            val wifi = activity.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                ?: return
+            @Suppress("DEPRECATION")
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wifi.createWifiLock(mode, "landa:foreground_wifi").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun releaseWifiLock() {
+        try {
+            if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+            }
+        } catch (_: Exception) {
+        } finally {
+            wifiLock = null
         }
     }
 

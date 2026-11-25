@@ -277,11 +277,54 @@ struct ScanQrResponse {
     uri: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterListenerArgs {
+    event: String,
+    handler: tauri::ipc::Channel<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartupPermissionsResponse {
+    #[serde(default)]
+    pub requested: bool,
+    #[serde(default)]
+    pub listener_notified: bool,
+}
+
 pub struct AndroidBridge<R: Runtime> {
     handle: PluginHandle<R>,
 }
 
 impl<R: Runtime> AndroidBridge<R> {
+    pub async fn register_network_listener_async(
+        &self,
+        on_change: impl Fn() + Send + Sync + 'static,
+    ) -> Result<(), String> {
+        let on_change = Arc::new(on_change);
+        let channel = tauri::ipc::Channel::new(move |_body| {
+            // Kotlin invokes Channel.send() on the Android main thread; run the callback
+            // asynchronously so trigger_scan() -> bindSocketToLan never deadlocks the UI thread.
+            let cb = Arc::clone(&on_change);
+            tauri::async_runtime::spawn(async move {
+                cb();
+            });
+            Ok(())
+        });
+        self.handle
+            .run_mobile_plugin_async::<serde_json::Value>(
+                "registerNetworkListener",
+                RegisterListenerArgs {
+                    event: "network-changed".to_string(),
+                    handler: channel,
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn get_system_device_name_async(&self) -> Option<String> {
         self.handle
             .run_mobile_plugin_async::<DeviceNameResponse>("getSystemDeviceName", ())
@@ -291,11 +334,12 @@ impl<R: Runtime> AndroidBridge<R> {
             .filter(|n| !n.trim().is_empty())
     }
 
-    pub async fn ensure_startup_permissions_async(&self) -> Result<(), String> {
+    pub async fn ensure_startup_permissions_async(
+        &self,
+    ) -> Result<StartupPermissionsResponse, String> {
         self.handle
-            .run_mobile_plugin_async::<serde_json::Value>("ensureStartupPermissions", ())
+            .run_mobile_plugin_async::<StartupPermissionsResponse>("ensureStartupPermissions", ())
             .await
-            .map(|_| ())
             .map_err(|e| e.to_string())
     }
 

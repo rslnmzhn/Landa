@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,7 @@ use landa_proto::{
 use rand::RngCore;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, watch, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -47,6 +48,7 @@ pub struct DiscoveryService {
     last_unicast_reply: Mutex<HashMap<PeerId, Instant>>,
     events: broadcast::Sender<CoreEvent>,
     scan_notify: Arc<Notify>,
+    rebind_requested: AtomicBool,
     device_name: Arc<RwLock<String>>,
     quic_port: u16,
 }
@@ -66,6 +68,7 @@ impl DiscoveryService {
             last_unicast_reply: Mutex::new(HashMap::new()),
             events,
             scan_notify: Arc::new(Notify::new()),
+            rebind_requested: AtomicBool::new(false),
             device_name: Arc::new(RwLock::new(device_name)),
             quic_port,
         }
@@ -77,6 +80,11 @@ impl DiscoveryService {
     }
 
     pub fn trigger_scan(&self) {
+        self.request_rebind();
+    }
+
+    pub fn request_rebind(&self) {
+        self.rebind_requested.store(true, Ordering::Release);
         self.scan_notify.notify_one();
     }
 
@@ -189,25 +197,29 @@ impl DiscoveryService {
         interval_secs: Arc<RwLock<u64>>,
         cancel: CancellationToken,
     ) -> Result<(), CoreError> {
-        let socket = Arc::new(bind_discovery_socket()?);
-        join_multicast_on_lan(&socket);
+        let mut current_socket = Arc::new(bind_discovery_socket()?);
+        rejoin_multicast_on_lan(&current_socket);
+        let (socket_tx, mut socket_rx) = watch::channel(Arc::clone(&current_socket));
+        let mut last_lan_ips = current_lan_ips();
 
-        let recv_socket = Arc::clone(&socket);
         let recv_self = Arc::clone(&self);
         let recv_cancel = cancel.clone();
 
         let recv_task = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             loop {
+                let sock = socket_rx.borrow_and_update().clone();
                 tokio::select! {
                     _ = recv_cancel.cancelled() => break,
-                    res = recv_socket.recv_from(&mut buf) => {
+                    _ = socket_rx.changed() => continue,
+                    res = sock.recv_from(&mut buf) => {
                         match res {
                             Ok((len, addr)) => {
-                                recv_self.handle_datagram(&buf[..len], addr, &recv_socket).await;
+                                recv_self.handle_datagram(&buf[..len], addr, &sock).await;
                             }
                             Err(err) => {
                                 warn!("discovery recv error: {err}");
+                                recv_self.request_rebind();
                                 tokio::time::sleep(Duration::from_millis(200)).await;
                             }
                         }
@@ -243,23 +255,41 @@ impl DiscoveryService {
         });
 
         // Initial burst so peers appear immediately on launch
-        self.send_beacon(&socket).await;
+        self.send_beacon(&current_socket).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
-        self.send_beacon(&socket).await;
+        self.send_beacon(&current_socket).await;
         tokio::time::sleep(Duration::from_millis(800)).await;
-        self.send_beacon(&socket).await;
+        self.send_beacon(&current_socket).await;
 
         loop {
             let secs = (*interval_secs.read().expect("interval lock poisoned")).clamp(2, 3600);
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = self.scan_notify.notified() => {
-                    self.send_beacon(&socket).await;
-                }
-                _ = tokio::time::sleep(Duration::from_secs(secs)) => {
-                    self.send_beacon(&socket).await;
+                _ = self.scan_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
+            }
+
+            let rebind_flag = self.rebind_requested.swap(false, Ordering::AcqRel);
+            let now_lan_ips = current_lan_ips();
+            let ifaces_changed = now_lan_ips != last_lan_ips;
+            if rebind_flag || ifaces_changed {
+                last_lan_ips = now_lan_ips;
+                match bind_discovery_socket() {
+                    Ok(new_sock) => {
+                        let new_arc = Arc::new(new_sock);
+                        rejoin_multicast_on_lan(&new_arc);
+                        current_socket = Arc::clone(&new_arc);
+                        let _ = socket_tx.send(new_arc);
+                    }
+                    Err(err) => {
+                        debug!("discovery socket rebind fallback to multicast rejoin: {err}");
+                        bind_socket_to_lan(&current_socket);
+                        rejoin_multicast_on_lan(&current_socket);
+                    }
                 }
             }
+
+            self.send_beacon(&current_socket).await;
         }
 
         recv_task.abort();
@@ -442,6 +472,22 @@ fn bind_interface_sender_socket(local_ip: Ipv4Addr) -> Result<UdpSocket, CoreErr
     Ok(tokio_sock)
 }
 
+fn current_lan_ips() -> Vec<Ipv4Addr> {
+    let mut ips: Vec<Ipv4Addr> = enumerate_lan_interfaces().into_iter().map(|i| i.ip).collect();
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
+fn rejoin_multicast_on_lan(socket: &UdpSocket) {
+    let all_interfaces = enumerate_all_lan_interfaces();
+    for iface in &all_interfaces {
+        let _ = socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip);
+    }
+    let _ = socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED);
+    join_multicast_on_lan(socket);
+}
+
 fn join_multicast_on_lan(socket: &UdpSocket) {
     let all_interfaces = enumerate_all_lan_interfaces();
     for iface in &all_interfaces {
@@ -523,4 +569,35 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trigger_scan_sets_rebind_requested_flag() {
+        let dir = std::env::temp_dir().join(format!("landa-disc-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = Arc::new(DeviceIdentity::load_or_generate(&dir.join("id.key")).unwrap());
+        let storage = Arc::new(Storage::open(&dir.join("db.sqlite")).unwrap());
+        let (events, _) = broadcast::channel(8);
+        let svc = DiscoveryService::new(id, storage, events, "Test".into(), 40406);
+
+        assert!(!svc.rebind_requested.load(Ordering::Acquire));
+        svc.trigger_scan();
+        assert!(svc.rebind_requested.swap(false, Ordering::AcqRel));
+        assert!(!svc.rebind_requested.load(Ordering::Acquire));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_lan_ips_is_sorted_and_deduplicated() {
+        let ips = current_lan_ips();
+        let mut sorted = ips.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ips, sorted);
+    }
 }

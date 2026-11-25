@@ -6,6 +6,7 @@ import {
   File,
   Folder,
   Loader2,
+  RefreshCw,
 } from "lucide-react";
 import { api, formatBytes } from "../../core/api";
 import type {
@@ -125,6 +126,10 @@ function LazyShareThumbnail({
   );
 }
 
+type FailedBrowseTarget =
+  | { kind: "roots"; peerId: string }
+  | { kind: "dir"; peerId: string; root: ShareRootInfo; relPath: string };
+
 interface SharesViewProps {
   t: TranslationDict;
   identity: LocalIdentityInfo | null;
@@ -159,6 +164,8 @@ export function SharesView({
   const [relPath, setRelPath] = useState<string>("");
   const [entries, setEntries] = useState<ShareEntry[]>([]);
   const [loading, setLoading] = useState(false);
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
   const [localDownloadingKey, setLocalDownloadingKey] = useState<string | null>(
     null
@@ -172,6 +179,14 @@ export function SharesView({
 
   const downloadingRef = useRef(false);
   const browseReqIdRef = useRef(0);
+  const failedTargetRef = useRef<FailedBrowseTarget | null>(null);
+  const prevSelectedPeerRef = useRef<{ peerId: string; isOnline: boolean } | null>(
+    null
+  );
+  const activeRootRef = useRef<ShareRootInfo | null>(null);
+  activeRootRef.current = activeRoot;
+  const relPathRef = useRef<string>("");
+  relPathRef.current = relPath;
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
 
@@ -179,22 +194,136 @@ export function SharesView({
     identity?.os === "android" ||
     navigator.userAgent.toLowerCase().includes("android");
 
-  const trustedOnlinePeers = peers.filter((p) => p.isTrusted && p.isOnline);
+  const trustedPeers = peers.filter((p) => p.isTrusted);
+  const trustedOnlinePeers = trustedPeers.filter((p) => p.isOnline);
+  const selectedPeer =
+    trustedPeers.find((p) => p.peerId === selectedPeerId) ?? null;
+  const selectorPeers = trustedPeers.filter(
+    (p) => p.isOnline || p.peerId === selectedPeerId
+  );
+
+  const loadRemoteRoots = useCallback(async (peerId: string) => {
+    const reqId = ++browseReqIdRef.current;
+    failedTargetRef.current = null;
+    setLoading(true);
+    setRemoteError(null);
+    let failedDirTarget: FailedBrowseTarget | null = null;
+    try {
+      const roots = await api.sharesBrowseRemoteRoots(peerId);
+      if (browseReqIdRef.current !== reqId) return;
+      setRemoteRoots(roots);
+
+      const currentRoot = activeRootRef.current;
+      if (currentRoot) {
+        const stillExists = roots.find((r) => r.id === currentRoot.id) ?? null;
+        if (!stillExists) {
+          setActiveRoot(null);
+          setRelPath("");
+          setEntries([]);
+        } else {
+          const targetRel = relPathRef.current;
+          failedDirTarget = {
+            kind: "dir",
+            peerId,
+            root: stillExists,
+            relPath: targetRel,
+          };
+          const nextEntries = await api.sharesBrowseRemoteDir(
+            peerId,
+            stillExists.id,
+            targetRel
+          );
+          if (browseReqIdRef.current !== reqId) return;
+          setActiveRoot(stillExists);
+          setEntries(nextEntries);
+        }
+      }
+    } catch (e) {
+      if (browseReqIdRef.current !== reqId) return;
+      const msg = String(e);
+      failedTargetRef.current = failedDirTarget ?? { kind: "roots", peerId };
+      setRemoteError(msg);
+      onErrorRef.current(msg);
+    } finally {
+      if (browseReqIdRef.current === reqId) {
+        setLoading(false);
+      }
+    }
+  }, []);
+
+  const openDirTarget = useCallback(
+    async (peerId: string, root: ShareRootInfo, nextRel: string) => {
+      const reqId = ++browseReqIdRef.current;
+      failedTargetRef.current = null;
+      setLoading(true);
+      setRemoteError(null);
+      try {
+        const nextEntries = await api.sharesBrowseRemoteDir(
+          peerId,
+          root.id,
+          nextRel
+        );
+        if (browseReqIdRef.current === reqId) {
+          setActiveRoot(root);
+          setRelPath(nextRel);
+          setEntries(nextEntries);
+        }
+      } catch (e) {
+        if (browseReqIdRef.current === reqId) {
+          const msg = String(e);
+          failedTargetRef.current = {
+            kind: "dir",
+            peerId,
+            root,
+            relPath: nextRel,
+          };
+          setRemoteError(msg);
+          onErrorRef.current(msg);
+        }
+      } finally {
+        if (browseReqIdRef.current === reqId) {
+          setLoading(false);
+        }
+      }
+    },
+    []
+  );
 
   useEffect(() => {
-    if (
-      selectedPeerId &&
-      !peers.some((p) => p.peerId === selectedPeerId && p.isTrusted && p.isOnline)
-    ) {
+    if (!selectedPeerId) {
+      prevSelectedPeerRef.current = null;
+      return;
+    }
+    if (!selectedPeer) {
       browseReqIdRef.current++;
+      failedTargetRef.current = null;
+      prevSelectedPeerRef.current = null;
       setSelectedPeerId("");
       setRemoteRoots([]);
       setActiveRoot(null);
       setRelPath("");
       setEntries([]);
+      setRemoteError(null);
       setLoading(false);
+      return;
     }
-  }, [peers, selectedPeerId]);
+
+    const prev = prevSelectedPeerRef.current;
+    prevSelectedPeerRef.current = {
+      peerId: selectedPeer.peerId,
+      isOnline: selectedPeer.isOnline,
+    };
+
+    if (!selectedPeer.isOnline) {
+      browseReqIdRef.current++;
+      setLoading(false);
+      return;
+    }
+
+    if (prev && prev.peerId === selectedPeer.peerId && !prev.isOnline) {
+      void loadRemoteRoots(selectedPeer.peerId);
+    }
+  }, [selectedPeer, selectedPeerId, loadRemoteRoots]);
 
   const loadLocal = useCallback(async () => {
     try {
@@ -249,96 +378,88 @@ export function SharesView({
   };
 
   const handleSelectPeer = async (peerId: string) => {
-    const reqId = ++browseReqIdRef.current;
+    browseReqIdRef.current++;
+    failedTargetRef.current = null;
+    activeRootRef.current = null;
+    relPathRef.current = "";
     setSelectedPeerId(peerId);
     setRemoteRoots([]);
     setActiveRoot(null);
     setRelPath("");
     setEntries([]);
+    setRemoteError(null);
     if (!peerId) {
+      prevSelectedPeerRef.current = null;
       setLoading(false);
       return;
     }
-    setLoading(true);
-    try {
-      const roots = await api.sharesBrowseRemoteRoots(peerId);
-      if (browseReqIdRef.current === reqId) {
-        setRemoteRoots(roots);
-      }
-    } catch (e) {
-      if (browseReqIdRef.current === reqId) {
-        onError(String(e));
-      }
-    } finally {
-      if (browseReqIdRef.current === reqId) {
-        setLoading(false);
-      }
+    const target = trustedPeers.find((p) => p.peerId === peerId);
+    prevSelectedPeerRef.current = {
+      peerId,
+      isOnline: Boolean(target?.isOnline),
+    };
+    if (!target?.isOnline) {
+      setLoading(false);
+      return;
     }
+    await loadRemoteRoots(peerId);
   };
 
   const handleOpenRoot = async (root: ShareRootInfo) => {
     if (!selectedPeerId) return;
-    const reqId = ++browseReqIdRef.current;
-    setLoading(true);
-    try {
-      const nextEntries = await api.sharesBrowseRemoteDir(
-        selectedPeerId,
-        root.id,
-        ""
-      );
-      if (browseReqIdRef.current === reqId) {
-        setActiveRoot(root);
-        setRelPath("");
-        setEntries(nextEntries);
-      }
-    } catch (e) {
-      if (browseReqIdRef.current === reqId) {
-        onError(String(e));
-      }
-    } finally {
-      if (browseReqIdRef.current === reqId) {
-        setLoading(false);
-      }
-    }
+    await openDirTarget(selectedPeerId, root, "");
   };
 
   const handleOpenDir = async (nextRel: string) => {
     if (!activeRoot || !selectedPeerId) return;
-    const reqId = ++browseReqIdRef.current;
-    setLoading(true);
-    try {
-      const nextEntries = await api.sharesBrowseRemoteDir(
-        selectedPeerId,
-        activeRoot.id,
-        nextRel
-      );
-      if (browseReqIdRef.current === reqId) {
-        setRelPath(nextRel);
-        setEntries(nextEntries);
-      }
-    } catch (e) {
-      if (browseReqIdRef.current === reqId) {
-        onError(String(e));
-      }
-    } finally {
-      if (browseReqIdRef.current === reqId) {
-        setLoading(false);
-      }
-    }
+    await openDirTarget(selectedPeerId, activeRoot, nextRel);
   };
 
   const handleBack = () => {
     if (!activeRoot) return;
     if (!relPath) {
       browseReqIdRef.current++;
+      failedTargetRef.current = null;
       setActiveRoot(null);
       setEntries([]);
+      setRemoteError(null);
       setLoading(false);
       return;
     }
     const parts = relPath.split("/").filter(Boolean);
     parts.pop();
     handleOpenDir(parts.join("/"));
+  };
+
+  const retryFailedTarget = async () => {
+    if (!selectedPeerId || !selectedPeer?.isOnline) return;
+    const target = failedTargetRef.current;
+    if (target && target.peerId === selectedPeerId) {
+      if (target.kind === "dir") {
+        await openDirTarget(target.peerId, target.root, target.relPath);
+      } else {
+        await loadRemoteRoots(target.peerId);
+      }
+      return;
+    }
+    if (activeRoot) {
+      await openDirTarget(selectedPeerId, activeRoot, relPath);
+    } else {
+      await loadRemoteRoots(selectedPeerId);
+    }
+  };
+
+  const handleRefresh = async () => {
+    setScanError(null);
+    const scanPromise = api.triggerScan().catch((e) => {
+      const msg = String(e);
+      setScanError(msg);
+      onErrorRef.current(msg);
+    });
+    if (selectedPeerId && selectedPeer?.isOnline) {
+      await retryFailedTarget();
+    }
+    await scanPromise;
   };
 
   const runDownload = async (key: string, task: () => Promise<string>) => {
@@ -443,84 +564,143 @@ export function SharesView({
           <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
             {t.shares.friendShares}
           </h2>
-          {trustedOnlinePeers.length > 0 && (
-            <GlassSegmented
-              options={trustedOnlinePeers.map((p) => ({
-                id: p.peerId,
-                label: p.displayName,
-              }))}
-              value={selectedPeerId}
-              onChange={handleSelectPeer}
-            />
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            {selectorPeers.length > 0 && (
+              <GlassSegmented
+                options={selectorPeers.map((p) => ({
+                  id: p.peerId,
+                  label: p.displayName,
+                }))}
+                value={selectedPeerId}
+                onChange={handleSelectPeer}
+              />
+            )}
+            <GlassButton
+              size="sm"
+              variant="glass"
+              onClick={handleRefresh}
+              aria-label={t.shares.refresh}
+              title={t.shares.refresh}
+              className="min-w-[44px] shrink-0"
+            >
+              <RefreshCw
+                className={`h-4 w-4 ${loading ? "animate-spin" : ""}`}
+                aria-hidden="true"
+              />
+            </GlassButton>
+          </div>
         </div>
 
         <ActiveReceiveTransfers t={t} transfers={activeReceiveTransfers} />
 
-        {trustedOnlinePeers.length === 0 ? (
+        {scanError && (
+          <div className="rounded-2xl border border-rose-400/30 bg-rose-500/10 px-4 py-2.5">
+            <div className="text-xs font-medium text-rose-900 dark:text-rose-200">
+              {t.shares.scanError}
+            </div>
+            <div className="break-all font-mono text-xs text-rose-800/80 dark:text-rose-200/75">
+              {scanError}
+            </div>
+          </div>
+        )}
+
+        {trustedPeers.length === 0 ? (
           <p className="text-sm text-slate-700/65 dark:text-white/50">
             {t.shares.noFriends}
           </p>
-        ) : !selectedPeerId ? (
+        ) : !selectedPeer ? (
           <p className="text-sm text-slate-700/65 dark:text-white/50">
-            {t.shares.selectFriend}
+            {trustedOnlinePeers.length === 0
+              ? t.shares.noOnlineFriends
+              : t.shares.selectFriend}
           </p>
+        ) : !selectedPeer.isOnline ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-3">
+            <p className="text-sm text-slate-700/75 dark:text-white/65">
+              {t.shares.peerOffline}
+            </p>
+            <GlassButton size="sm" variant="glass" onClick={handleRefresh}>
+              <RefreshCw className="h-4 w-4" aria-hidden="true" />
+              <span>{t.shares.refresh}</span>
+            </GlassButton>
+          </div>
         ) : loading ? (
           <div className="py-6 text-center text-sm text-slate-700/65 dark:text-white/50">
             ...
           </div>
-        ) : !activeRoot ? (
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            {remoteRoots.map((root) => {
-              const rootKey = `root:${selectedPeerId}:${root.id}`;
-              const isDownloading = downloadingKey === rootKey;
-              const downloadLabel = root.isDir
-                ? t.shares.downloadFolder
-                : t.shares.download;
-              return (
-                <div
-                  key={root.id}
-                  className="flex min-h-[52px] items-center justify-between gap-2 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2 transition hover:bg-white/30 dark:hover:bg-white/10"
-                >
-                  <button
-                    type="button"
-                    onClick={() => handleOpenRoot(root)}
-                    className="flex min-h-[44px] min-w-0 flex-1 items-center gap-3 text-left"
-                  >
-                    {root.isDir ? (
-                      <Folder
-                        className="h-5 w-5 shrink-0 text-indigo-500 dark:text-indigo-300"
-                        aria-hidden="true"
-                      />
-                    ) : (
-                      <File
-                        className="h-5 w-5 shrink-0 text-sky-500 dark:text-sky-300"
-                        aria-hidden="true"
-                      />
-                    )}
-                    <span className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
-                      {root.name}
-                    </span>
-                  </button>
-                  <GlassButton
-                    size="sm"
-                    variant="glass"
-                    disabled={downloadingKey !== null}
-                    onClick={() => handleDownloadRoot(root)}
-                    aria-label={`${downloadLabel}: ${root.name}`}
-                    title={downloadLabel}
-                    className="min-w-[44px] shrink-0"
-                  >
-                    {isDownloading ? (
-                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                    ) : (
-                      <Download className="h-4 w-4" aria-hidden="true" />
-                    )}
-                  </GlassButton>
-                </div>
-              );
-            })}
+        ) : remoteError ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-rose-400/30 bg-rose-500/10 px-4 py-3">
+            <div className="min-w-0 flex-1 space-y-0.5">
+              <div className="text-sm font-medium text-rose-900 dark:text-rose-200">
+                {t.shares.loadError}
+              </div>
+              <div className="break-all font-mono text-xs text-rose-800/80 dark:text-rose-200/75">
+                {remoteError}
+              </div>
+            </div>
+            <GlassButton size="sm" variant="glass" onClick={retryFailedTarget}>
+              <RefreshCw className="h-4 w-4" aria-hidden="true" />
+              <span>{t.shares.retry}</span>
+            </GlassButton>
           </div>
+        ) : !activeRoot ? (
+          remoteRoots.length === 0 ? (
+            <p className="text-sm text-slate-700/65 dark:text-white/50">
+              {t.shares.noRemoteShares}
+            </p>
+          ) : (
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {remoteRoots.map((root) => {
+                const rootKey = `root:${selectedPeerId}:${root.id}`;
+                const isDownloading = downloadingKey === rootKey;
+                const downloadLabel = root.isDir
+                  ? t.shares.downloadFolder
+                  : t.shares.download;
+                return (
+                  <div
+                    key={root.id}
+                    className="flex min-h-[52px] items-center justify-between gap-2 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2 transition hover:bg-white/30 dark:hover:bg-white/10"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleOpenRoot(root)}
+                      className="flex min-h-[44px] min-w-0 flex-1 items-center gap-3 text-left"
+                    >
+                      {root.isDir ? (
+                        <Folder
+                          className="h-5 w-5 shrink-0 text-indigo-500 dark:text-indigo-300"
+                          aria-hidden="true"
+                        />
+                      ) : (
+                        <File
+                          className="h-5 w-5 shrink-0 text-sky-500 dark:text-sky-300"
+                          aria-hidden="true"
+                        />
+                      )}
+                      <span className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
+                        {root.name}
+                      </span>
+                    </button>
+                    <GlassButton
+                      size="sm"
+                      variant="glass"
+                      disabled={downloadingKey !== null}
+                      onClick={() => handleDownloadRoot(root)}
+                      aria-label={`${downloadLabel}: ${root.name}`}
+                      title={downloadLabel}
+                      className="min-w-[44px] shrink-0"
+                    >
+                      {isDownloading ? (
+                        <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                      ) : (
+                        <Download className="h-4 w-4" aria-hidden="true" />
+                      )}
+                    </GlassButton>
+                  </div>
+                );
+              })}
+            </div>
+          )
         ) : (
           <div className="space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">

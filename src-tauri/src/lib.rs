@@ -122,8 +122,36 @@ pub fn run() {
                 engine_for_loops.trigger_scan();
             });
 
+            let android_network_listener = Arc::new(commands::AndroidNetworkListenerState::new());
+
             #[cfg(target_os = "android")]
             {
+                let handle_for_net = app.handle().clone();
+                let engine_for_net = Arc::clone(&engine);
+                let listener_state_for_net = Arc::clone(&android_network_listener);
+                tauri::async_runtime::spawn(async move {
+                    for (attempt, delay_ms) in [0u64, 500, 1500].into_iter().enumerate() {
+                        if delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                        match register_android_network_listener_once(
+                            &handle_for_net,
+                            &engine_for_net,
+                            &listener_state_for_net,
+                        )
+                        .await
+                        {
+                            Ok(()) => break,
+                            Err(err) => {
+                                tracing::warn!(
+                                    "failed to register Android network listener (attempt {}): {err}",
+                                    attempt + 1
+                                );
+                            }
+                        }
+                    }
+                });
+
                 let handle_for_name = app.handle().clone();
                 let engine_for_name = Arc::clone(&engine);
                 tauri::async_runtime::spawn(async move {
@@ -340,6 +368,7 @@ pub fn run() {
 
             app.manage(AppState {
                 engine,
+                android_network_listener,
                 #[cfg(feature = "mod-shares")]
                 shares,
                 #[cfg(feature = "mod-clipboard")]
@@ -417,6 +446,30 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Landa");
+}
+
+#[cfg(target_os = "android")]
+pub(crate) async fn register_android_network_listener_once(
+    app: &tauri::AppHandle,
+    engine: &Arc<LandaEngine>,
+    listener_state: &Arc<commands::AndroidNetworkListenerState>,
+) -> Result<(), String> {
+    let Some(bridge) = app.try_state::<android_bridge::AndroidBridge<tauri::Wry>>() else {
+        let err = "Android bridge unavailable".to_string();
+        listener_state.record_result(&Err(err.clone()));
+        return Err(err);
+    };
+    let engine_for_net = Arc::clone(engine);
+    let res = bridge
+        .register_network_listener_async(move || {
+            let engine_for_scan = Arc::clone(&engine_for_net);
+            tauri::async_runtime::spawn_blocking(move || {
+                engine_for_scan.trigger_scan();
+            });
+        })
+        .await;
+    listener_state.record_result(&res);
+    res
 }
 
 fn resolve_default_device_name() -> String {
