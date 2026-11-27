@@ -13,7 +13,7 @@ use std::sync::Arc;
 use commands::AppState;
 use landa_core::{LandaConfig, LandaEngine};
 #[cfg(feature = "mod-clipboard")]
-use landa_mod_clipboard::ClipboardModule;
+use landa_mod_clipboard::{ClipboardContentKind, ClipboardItem, ClipboardModule};
 #[cfg(feature = "mod-shares")]
 use landa_mod_shares::SharesModule;
 #[cfg(feature = "mod-videolink")]
@@ -327,6 +327,43 @@ pub fn run() {
 
                             known_incoming_requests = current_ids;
                         }
+                        #[cfg(feature = "mod-clipboard")]
+                        landa_core::CoreEvent::ModuleEvent {
+                            module_id,
+                            event_name,
+                            data,
+                        } if module_id == "clipboard" => {
+                            let settings = engine_for_events.get_settings();
+                            #[cfg(target_os = "android")]
+                            let (is_android, is_foreground, should_notify_os) = {
+                                let fg = if let Some(bridge) = handle
+                                    .try_state::<android_bridge::AndroidBridge<tauri::Wry>>()
+                                {
+                                    bridge.is_app_in_foreground_async().await
+                                } else {
+                                    false
+                                };
+                                (true, fg, !fg)
+                            };
+                            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                            let (is_android, is_foreground, should_notify_os) = {
+                                let notify = should_notify_desktop(&handle);
+                                (false, !notify, notify)
+                            };
+                            #[cfg(target_os = "ios")]
+                            let (is_android, is_foreground, should_notify_os) = (false, true, false);
+
+                            let ctx = ClipboardReceiveContext {
+                                auto_copy_clipboard: settings.auto_copy_clipboard,
+                                is_android,
+                                is_foreground,
+                                should_notify_os,
+                                lang: settings.language,
+                            };
+                            let sink = TauriClipboardReceiveSink { handle: &handle };
+                            let _ = process_clipboard_module_event(event_name, data, &ctx, &sink)
+                                .await;
+                        }
                         _ => {}
                     }
 
@@ -364,6 +401,7 @@ pub fn run() {
             let app_for_sweep = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 preview::sweep_old_preview_cache(&app_for_sweep).await;
+                updater::cleanup_updates_cache(&app_for_sweep).await;
             });
 
             app.manage(AppState {
@@ -434,6 +472,8 @@ pub fn run() {
             commands::check_for_updates,
             commands::download_update,
             commands::install_update,
+            commands::get_cache_size,
+            commands::clear_cache,
             commands::prepare_file_preview,
             commands::open_file_external,
             commands::resolve_preview_names,
@@ -518,5 +558,393 @@ fn format_bytes_human(bytes: u64) -> String {
         format!("{:.0} {}", val, UNITS[idx])
     } else {
         format!("{:.1} {}", val, UNITS[idx])
+    }
+}
+
+#[cfg(feature = "mod-clipboard")]
+struct ClipboardReceiveContext {
+    auto_copy_clipboard: bool,
+    is_android: bool,
+    is_foreground: bool,
+    should_notify_os: bool,
+    lang: String,
+}
+
+#[cfg(feature = "mod-clipboard")]
+fn format_clipboard_notification_body(is_image: bool, lang: &str) -> &'static str {
+    if is_image {
+        if lang == "en" {
+            "Clipboard image received"
+        } else {
+            "Получено изображение в буфер"
+        }
+    } else if lang == "en" {
+        "Clipboard text received"
+    } else {
+        "Получен текст в буфер"
+    }
+}
+
+#[cfg(feature = "mod-clipboard")]
+trait ClipboardReceiveSink: Sync {
+    fn write_system_text<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+
+    fn notify_received<'a>(
+        &'a self,
+        peer_name: &'a str,
+        is_image: bool,
+        body: &'a str,
+        lang: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+#[cfg(feature = "mod-clipboard")]
+struct TauriClipboardReceiveSink<'a> {
+    handle: &'a tauri::AppHandle,
+}
+
+#[cfg(feature = "mod-clipboard")]
+impl ClipboardReceiveSink for TauriClipboardReceiveSink<'_> {
+    fn write_system_text<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            #[cfg(target_os = "android")]
+            {
+                let bridge = self
+                    .handle
+                    .try_state::<android_bridge::AndroidBridge<tauri::Wry>>()
+                    .ok_or_else(|| "Android bridge unavailable".to_string())?;
+                bridge.write_system_clipboard_text_async(text).await
+            }
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                let state = self
+                    .handle
+                    .try_state::<AppState>()
+                    .ok_or_else(|| "AppState unavailable".to_string())?;
+                commands::write_desktop_clipboard_text(&state.desktop_clipboard, text)
+            }
+            #[cfg(target_os = "ios")]
+            {
+                let _ = text;
+                Ok(())
+            }
+        })
+    }
+
+    fn notify_received<'a>(
+        &'a self,
+        peer_name: &'a str,
+        is_image: bool,
+        body: &'a str,
+        lang: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            #[cfg(target_os = "android")]
+            {
+                let _ = body;
+                let bridge = self
+                    .handle
+                    .try_state::<android_bridge::AndroidBridge<tauri::Wry>>()
+                    .ok_or_else(|| "Android bridge unavailable".to_string())?;
+                bridge
+                    .show_clipboard_received_notification_async(peer_name, is_image, lang)
+                    .await
+                    .map(|_| ())
+            }
+
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                let _ = (is_image, lang);
+                self.handle
+                    .notification()
+                    .builder()
+                    .title(format!("Landa · {peer_name}"))
+                    .body(body)
+                    .extra("target", "clipboard")
+                    .show()
+                    .map_err(|e| e.to_string())
+            }
+
+            #[cfg(target_os = "ios")]
+            {
+                let _ = (peer_name, is_image, body, lang);
+                Ok(())
+            }
+        })
+    }
+}
+
+#[cfg(feature = "mod-clipboard")]
+async fn process_clipboard_module_event(
+    event_name: &str,
+    data: &serde_json::Value,
+    ctx: &ClipboardReceiveContext,
+    sink: &dyn ClipboardReceiveSink,
+) -> Result<(), String> {
+    if event_name != "received" {
+        return Ok(());
+    }
+    let Ok(item) = serde_json::from_value::<ClipboardItem>(data.clone()) else {
+        return Ok(());
+    };
+    if item.source_peer_id.is_none() {
+        return Ok(());
+    }
+
+    let peer_name = item.source_peer_name.as_deref().unwrap_or("Peer");
+    let is_image = item.kind == ClipboardContentKind::Image;
+
+    if !is_image && ctx.auto_copy_clipboard {
+        if ctx.is_android && !ctx.is_foreground {
+            tracing::debug!("skipping background system clipboard write on Android");
+        } else if let Err(err) = sink.write_system_text(&item.text).await {
+            tracing::warn!("auto-copy incoming clipboard text failed: {err}");
+        }
+    }
+
+    if ctx.should_notify_os {
+        let body = format_clipboard_notification_body(is_image, &ctx.lang);
+        if let Err(err) = sink.notify_received(peer_name, is_image, body, &ctx.lang).await {
+            tracing::warn!(
+                peer = peer_name,
+                is_image,
+                "failed to show incoming clipboard notification: {err}"
+            );
+            return Err(err);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(all(test, feature = "mod-clipboard"))]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct FakeClipboardSink {
+        copied_texts: Mutex<Vec<String>>,
+        notifications: Mutex<Vec<(String, bool, String, String)>>,
+        notify_error: Option<String>,
+    }
+
+    impl ClipboardReceiveSink for FakeClipboardSink {
+        fn write_system_text<'a>(
+            &'a self,
+            text: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.copied_texts.lock().unwrap().push(text.to_string());
+                Ok(())
+            })
+        }
+
+        fn notify_received<'a>(
+            &'a self,
+            peer_name: &'a str,
+            is_image: bool,
+            body: &'a str,
+            lang: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if let Some(err) = &self.notify_error {
+                    return Err(err.clone());
+                }
+                self.notifications.lock().unwrap().push((
+                    peer_name.to_string(),
+                    is_image,
+                    body.to_string(),
+                    lang.to_string(),
+                ));
+                Ok(())
+            })
+        }
+    }
+
+    fn make_item(kind: ClipboardContentKind, text: &str, source_peer_id: Option<&str>) -> serde_json::Value {
+        serde_json::to_value(ClipboardItem {
+            id: "item-1".into(),
+            kind,
+            text: text.into(),
+            image_path: None,
+            image_width: if kind == ClipboardContentKind::Image { Some(10) } else { None },
+            image_height: if kind == ClipboardContentKind::Image { Some(10) } else { None },
+            size_bytes: text.len() as u64,
+            content_hash: "hash".into(),
+            source_peer_id: source_peer_id.map(str::to_string),
+            source_peer_name: source_peer_id.map(|_| "Alice".to_string()),
+            created_at: 1000,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn clipboard_receive_copies_text_when_auto_copy_enabled_and_notifies_when_unfocused() {
+        let sink = FakeClipboardSink::default();
+        let ctx = ClipboardReceiveContext {
+            auto_copy_clipboard: true,
+            is_android: false,
+            is_foreground: false,
+            should_notify_os: true,
+            lang: "ru".into(),
+        };
+        let data = make_item(ClipboardContentKind::Text, "hello from alice", Some("peer-a"));
+
+        let res = process_clipboard_module_event("received", &data, &ctx, &sink).await;
+        assert_eq!(res, Ok(()));
+
+        assert_eq!(
+            *sink.copied_texts.lock().unwrap(),
+            vec!["hello from alice".to_string()]
+        );
+        let notifs = sink.notifications.lock().unwrap();
+        assert_eq!(
+            *notifs,
+            vec![(
+                "Alice".to_string(),
+                false,
+                "Получен текст в буфер".to_string(),
+                "ru".to_string()
+            )]
+        );
+        assert!(!notifs[0].2.contains("hello from alice"));
+    }
+
+    #[tokio::test]
+    async fn clipboard_receive_respects_disabled_auto_copy_setting_and_still_notifies() {
+        let sink = FakeClipboardSink::default();
+        let ctx = ClipboardReceiveContext {
+            auto_copy_clipboard: false,
+            is_android: false,
+            is_foreground: false,
+            should_notify_os: true,
+            lang: "en".into(),
+        };
+        let data = make_item(ClipboardContentKind::Text, "secret", Some("peer-a"));
+
+        let res = process_clipboard_module_event("received", &data, &ctx, &sink).await;
+        assert_eq!(res, Ok(()));
+
+        assert!(sink.copied_texts.lock().unwrap().is_empty());
+        let notifs = sink.notifications.lock().unwrap();
+        assert_eq!(
+            *notifs,
+            vec![(
+                "Alice".to_string(),
+                false,
+                "Clipboard text received".to_string(),
+                "en".to_string()
+            )]
+        );
+        assert!(!notifs[0].2.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn clipboard_receive_skips_android_background_clipboard_write_and_notifies() {
+        let sink = FakeClipboardSink::default();
+        let ctx = ClipboardReceiveContext {
+            auto_copy_clipboard: true,
+            is_android: true,
+            is_foreground: false,
+            should_notify_os: true,
+            lang: "ru".into(),
+        };
+        let data = make_item(ClipboardContentKind::Text, "bg text", Some("peer-a"));
+
+        let res = process_clipboard_module_event("received", &data, &ctx, &sink).await;
+        assert_eq!(res, Ok(()));
+
+        assert!(sink.copied_texts.lock().unwrap().is_empty());
+        let notifs = sink.notifications.lock().unwrap();
+        assert_eq!(
+            *notifs,
+            vec![(
+                "Alice".to_string(),
+                false,
+                "Получен текст в буфер".to_string(),
+                "ru".to_string()
+            )]
+        );
+        assert!(!notifs[0].2.contains("bg text"));
+    }
+
+    #[tokio::test]
+    async fn clipboard_receive_image_does_not_write_text_clipboard_and_notifies() {
+        let sink = FakeClipboardSink::default();
+        let ctx = ClipboardReceiveContext {
+            auto_copy_clipboard: true,
+            is_android: true,
+            is_foreground: false,
+            should_notify_os: true,
+            lang: "en".into(),
+        };
+        let data = make_item(ClipboardContentKind::Image, "PNG 10×10", Some("peer-a"));
+
+        let res = process_clipboard_module_event("received", &data, &ctx, &sink).await;
+        assert_eq!(res, Ok(()));
+
+        assert!(sink.copied_texts.lock().unwrap().is_empty());
+        assert_eq!(
+            *sink.notifications.lock().unwrap(),
+            vec![(
+                "Alice".to_string(),
+                true,
+                "Clipboard image received".to_string(),
+                "en".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn clipboard_local_updated_event_does_not_auto_copy_or_notify() {
+        let sink = FakeClipboardSink::default();
+        let ctx = ClipboardReceiveContext {
+            auto_copy_clipboard: true,
+            is_android: false,
+            is_foreground: false,
+            should_notify_os: true,
+            lang: "ru".into(),
+        };
+        let data = make_item(ClipboardContentKind::Text, "local", None);
+
+        let res = process_clipboard_module_event("updated", &data, &ctx, &sink).await;
+        assert_eq!(res, Ok(()));
+
+        assert!(sink.copied_texts.lock().unwrap().is_empty());
+        assert!(sink.notifications.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn clipboard_receive_returns_error_when_notification_fails_without_leaking_text() {
+        let sink = FakeClipboardSink {
+            notify_error: Some("Failed to show clipboard notification: SecurityException".into()),
+            ..Default::default()
+        };
+        let ctx = ClipboardReceiveContext {
+            auto_copy_clipboard: true,
+            is_android: true,
+            is_foreground: false,
+            should_notify_os: true,
+            lang: "ru".into(),
+        };
+        let data = make_item(ClipboardContentKind::Text, "otp-994411", Some("peer-a"));
+
+        let res = process_clipboard_module_event("received", &data, &ctx, &sink).await;
+
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.contains("SecurityException"));
+        assert!(!err.contains("otp-994411"));
+        assert!(sink.copied_texts.lock().unwrap().is_empty());
+        assert!(sink.notifications.lock().unwrap().is_empty());
     }
 }

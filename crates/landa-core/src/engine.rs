@@ -47,6 +47,7 @@ pub struct LandaEngine {
     events: broadcast::Sender<CoreEvent>,
     settings: Arc<RwLock<AppSettings>>,
     discovery_interval_secs: Arc<RwLock<u64>>,
+    preview_quota: crate::preview_cache::PreviewCacheQuota,
     cancel: CancellationToken,
 }
 
@@ -101,8 +102,13 @@ impl LandaEngine {
             events,
             settings: Arc::new(RwLock::new(settings_val)),
             discovery_interval_secs: Arc::new(RwLock::new(interval)),
+            preview_quota: crate::preview_cache::PreviewCacheQuota::new(),
             cancel: CancellationToken::new(),
         }))
+    }
+
+    pub fn preview_quota(&self) -> &crate::preview_cache::PreviewCacheQuota {
+        &self.preview_quota
     }
 
     pub fn register_module(&self, module: Arc<dyn LandaModule>) {

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test": "node --test src/features/clipboard/clipboardPaste.test.ts src/components/glass/glassModal.test.ts src/features/devices/devicesHeader.test.ts src/features/devices/devicesForget.test.ts src/features/devices/devicesUpdate.test.ts src/features/activity/activityPreview.test.ts src/features/shares/sharesView.test.ts src/features/preview/filePreviewModal.test.ts",
+    "test": "node --test src/features/clipboard/clipboardPaste.test.ts src/features/clipboard/clipboardView.test.ts src/components/glass/glassModal.test.ts src/features/devices/devicesHeader.test.ts src/features/devices/devicesForget.test.ts src/features/devices/devicesUpdate.test.ts src/features/activity/activityPreview.test.ts src/features/shares/sharesView.test.ts src/features/preview/filePreviewModal.test.ts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

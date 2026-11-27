@@ -1174,3 +1174,947 @@ async fn shares_folder_download_rejects_manifest_exceeding_depth_limit_without_w
         let _ = std::fs::remove_dir_all(&dir_b);
     }
 }
+
+struct SizeMismatchSafProvider {
+    backing_file: PathBuf,
+}
+
+impl ShareContentProvider for SizeMismatchSafProvider {
+    fn list_dir(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        _rel_path: &str,
+    ) -> Result<Vec<ShareEntry>, CoreError> {
+        Ok(Vec::new())
+    }
+
+    fn list_tree(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        _rel_path: &str,
+        _max_depth: usize,
+        _max_files: usize,
+    ) -> Result<Vec<ShareEntry>, CoreError> {
+        Ok(vec![ShareEntry {
+            name: "shot:1.png".into(),
+            rel_path: "shot:1.png".into(),
+            is_dir: false,
+            size_bytes: 5,
+            modified_ms: 1,
+        }])
+    }
+
+    fn open_file(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        rel_path: &str,
+    ) -> Result<ShareOpenedFile, CoreError> {
+        assert_eq!(rel_path, "shot:1.png");
+        let file = std::fs::File::open(&self.backing_file)?;
+        let size_bytes = file.metadata()?.len();
+        Ok(ShareOpenedFile {
+            file,
+            file_name: "shot:1.png".into(),
+            size_bytes,
+            modified_ms: 1,
+        })
+    }
+}
+
+#[tokio::test]
+async fn shares_folder_download_reports_size_mismatch_to_receiver() {
+    let dir_a = temp_dir("mismatch-a");
+    let dir_b = temp_dir("mismatch-b");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let backing_file = dir_b.join("actual.bin");
+    std::fs::write(&backing_file, b"twelve-bytes").unwrap();
+
+    let engine_a = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_a.clone(),
+        default_download_dir: dir_a.join("downloads"),
+        default_device_name: "A".into(),
+    })
+    .unwrap();
+    let engine_b = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_b.clone(),
+        default_download_dir: dir_b.join("downloads"),
+        default_device_name: "B".into(),
+    })
+    .unwrap();
+
+    let shares_a = SharesModule::new(Arc::clone(engine_a.storage()));
+    let shares_b = SharesModule::new(Arc::clone(engine_b.storage()));
+    shares_b.set_content_provider(Arc::new(SizeMismatchSafProvider {
+        backing_file: backing_file.clone(),
+    }));
+    engine_a.register_module(shares_a.clone());
+    engine_b.register_module(shares_b.clone());
+
+    let root = shares_b
+        .add_local_share_uri(
+            "content://com.android.externalstorage.documents/tree/primary%3AMismatch".into(),
+            "Mismatch".into(),
+            true,
+        )
+        .unwrap();
+
+    engine_a.start_transport_loop();
+    engine_b.start_transport_loop();
+
+    let info_a = engine_a.local_identity_info();
+    let info_b = engine_b.local_identity_info();
+    let peer_a = PeerId::from_hex(&info_a.peer_id).unwrap();
+    let peer_b = PeerId::from_hex(&info_b.peer_id).unwrap();
+
+    engine_a
+        .storage()
+        .upsert_peer(
+            &peer_b,
+            &hex_decode_32(&info_b.public_key_hex),
+            "B",
+            DeviceOs::Android,
+            DeviceCategory::Phone,
+            Some("127.0.0.1"),
+            Some(info_b.quic_port),
+        )
+        .unwrap();
+    engine_b
+        .storage()
+        .upsert_peer(
+            &peer_a,
+            &hex_decode_32(&info_a.public_key_hex),
+            "A",
+            DeviceOs::Linux,
+            DeviceCategory::Desktop,
+            Some("127.0.0.1"),
+            Some(info_a.quic_port),
+        )
+        .unwrap();
+
+    engine_a.send_friend_request(&info_b.peer_id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    engine_b
+        .respond_friend_request(&info_a.peer_id, true)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let err = shares_a
+        .download_remote_folder(&engine_a, &info_b.peer_id, &root.id, "")
+        .await
+        .expect_err("receiver must receive size mismatch error");
+    let msg = err.to_string();
+    assert!(msg.contains("shot_1.png"), "unexpected error: {msg}");
+    assert!(msg.contains("5"), "unexpected error: {msg}");
+    assert!(msg.contains("12"), "unexpected error: {msg}");
+
+    engine_a.shutdown();
+    engine_b.shutdown();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+struct SingleOpenSafProvider {
+    checked_file: PathBuf,
+    stale_file: PathBuf,
+    open_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl ShareContentProvider for SingleOpenSafProvider {
+    fn list_dir(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        _rel_path: &str,
+    ) -> Result<Vec<ShareEntry>, CoreError> {
+        Ok(Vec::new())
+    }
+
+    fn list_tree(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        _rel_path: &str,
+        _max_depth: usize,
+        _max_files: usize,
+    ) -> Result<Vec<ShareEntry>, CoreError> {
+        Ok(vec![ShareEntry {
+            name: "shot:1.png".into(),
+            rel_path: "shot:1.png".into(),
+            is_dir: false,
+            size_bytes: 5,
+            modified_ms: 1,
+        }])
+    }
+
+    fn open_file(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        rel_path: &str,
+    ) -> Result<ShareOpenedFile, CoreError> {
+        assert_eq!(rel_path, "shot:1.png");
+        let call_idx = self
+            .open_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = if call_idx == 0 {
+            &self.checked_file
+        } else {
+            &self.stale_file
+        };
+        let file = std::fs::File::open(path)?;
+        let size_bytes = file.metadata()?.len();
+        Ok(ShareOpenedFile {
+            file,
+            file_name: "shot:1.png".into(),
+            size_bytes,
+            modified_ms: 1,
+        })
+    }
+}
+
+#[tokio::test]
+async fn shares_folder_download_streams_checked_handle_without_reopening() {
+    let dir_a = temp_dir("single-open-a");
+    let dir_b = temp_dir("single-open-b");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let checked_file = dir_b.join("checked.bin");
+    let stale_file = dir_b.join("stale.bin");
+    std::fs::write(&checked_file, b"hello").unwrap();
+    std::fs::write(&stale_file, b"twelve-bytes").unwrap();
+
+    let provider = Arc::new(SingleOpenSafProvider {
+        checked_file,
+        stale_file,
+        open_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+
+    let engine_a = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_a.clone(),
+        default_download_dir: dir_a.join("downloads"),
+        default_device_name: "A".into(),
+    })
+    .unwrap();
+    let engine_b = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_b.clone(),
+        default_download_dir: dir_b.join("downloads"),
+        default_device_name: "B".into(),
+    })
+    .unwrap();
+
+    let shares_a = SharesModule::new(Arc::clone(engine_a.storage()));
+    let shares_b = SharesModule::new(Arc::clone(engine_b.storage()));
+    shares_b.set_content_provider(provider.clone());
+    engine_a.register_module(shares_a.clone());
+    engine_b.register_module(shares_b.clone());
+
+    let root = shares_b
+        .add_local_share_uri(
+            "content://com.android.externalstorage.documents/tree/primary%3ASingleOpen".into(),
+            "SingleOpen".into(),
+            true,
+        )
+        .unwrap();
+
+    engine_a.start_transport_loop();
+    engine_b.start_transport_loop();
+
+    let info_a = engine_a.local_identity_info();
+    let info_b = engine_b.local_identity_info();
+    let peer_a = PeerId::from_hex(&info_a.peer_id).unwrap();
+    let peer_b = PeerId::from_hex(&info_b.peer_id).unwrap();
+
+    engine_a
+        .storage()
+        .upsert_peer(
+            &peer_b,
+            &hex_decode_32(&info_b.public_key_hex),
+            "B",
+            DeviceOs::Android,
+            DeviceCategory::Phone,
+            Some("127.0.0.1"),
+            Some(info_b.quic_port),
+        )
+        .unwrap();
+    engine_b
+        .storage()
+        .upsert_peer(
+            &peer_a,
+            &hex_decode_32(&info_a.public_key_hex),
+            "A",
+            DeviceOs::Linux,
+            DeviceCategory::Desktop,
+            Some("127.0.0.1"),
+            Some(info_a.quic_port),
+        )
+        .unwrap();
+
+    engine_a.send_friend_request(&info_b.peer_id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    engine_b
+        .respond_friend_request(&info_a.peer_id, true)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let res = shares_a
+        .download_remote_folder(&engine_a, &info_b.peer_id, &root.id, "")
+        .await
+        .expect("folder download should stream from the checked handle");
+    assert_eq!(
+        provider
+            .open_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "provider.open_file must be called only once per file"
+    );
+    assert_eq!(
+        std::fs::read(PathBuf::from(&res.destination).join("shot_1.png")).unwrap(),
+        b"hello"
+    );
+
+    engine_a.shutdown();
+    engine_b.shutdown();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+struct SequentialBudgetSafProvider {
+    backing_file: PathBuf,
+    file_count: usize,
+}
+
+impl ShareContentProvider for SequentialBudgetSafProvider {
+    fn list_dir(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        _rel_path: &str,
+    ) -> Result<Vec<ShareEntry>, CoreError> {
+        Ok(Vec::new())
+    }
+
+    fn list_tree(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        _rel_path: &str,
+        _max_depth: usize,
+        _max_files: usize,
+    ) -> Result<Vec<ShareEntry>, CoreError> {
+        Ok((0..self.file_count)
+            .map(|i| ShareEntry {
+                name: format!("item_{i:02}.txt"),
+                rel_path: format!("item_{i:02}.txt"),
+                is_dir: false,
+                size_bytes: 7,
+                modified_ms: 1,
+            })
+            .collect())
+    }
+
+    fn open_file(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        _rel_path: &str,
+    ) -> Result<ShareOpenedFile, CoreError> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Exclusive read access: fails if any previous source handle is still open.
+            opts.share_mode(0);
+        }
+        let file = opts.open(&self.backing_file)?;
+        let size_bytes = file.metadata()?.len();
+        Ok(ShareOpenedFile {
+            file,
+            file_name: "item.txt".into(),
+            size_bytes,
+            modified_ms: 1,
+        })
+    }
+}
+
+#[tokio::test]
+async fn shares_folder_download_closes_each_source_before_opening_next() {
+    let dir_a = temp_dir("budget-a");
+    let dir_b = temp_dir("budget-b");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let backing_file = dir_b.join("shared.txt");
+    std::fs::write(&backing_file, b"payload").unwrap();
+
+    let file_count = 12usize;
+    let engine_a = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_a.clone(),
+        default_download_dir: dir_a.join("downloads"),
+        default_device_name: "A".into(),
+    })
+    .unwrap();
+    let engine_b = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_b.clone(),
+        default_download_dir: dir_b.join("downloads"),
+        default_device_name: "B".into(),
+    })
+    .unwrap();
+
+    let shares_a = SharesModule::new(Arc::clone(engine_a.storage()));
+    let shares_b = SharesModule::new(Arc::clone(engine_b.storage()));
+    shares_b.set_content_provider(Arc::new(SequentialBudgetSafProvider {
+        backing_file,
+        file_count,
+    }));
+    engine_a.register_module(shares_a.clone());
+    engine_b.register_module(shares_b.clone());
+
+    let root = shares_b
+        .add_local_share_uri(
+            "content://com.android.externalstorage.documents/tree/primary%3ABudget".into(),
+            "Budget".into(),
+            true,
+        )
+        .unwrap();
+
+    engine_a.start_transport_loop();
+    engine_b.start_transport_loop();
+
+    let info_a = engine_a.local_identity_info();
+    let info_b = engine_b.local_identity_info();
+    let peer_a = PeerId::from_hex(&info_a.peer_id).unwrap();
+    let peer_b = PeerId::from_hex(&info_b.peer_id).unwrap();
+
+    engine_a
+        .storage()
+        .upsert_peer(
+            &peer_b,
+            &hex_decode_32(&info_b.public_key_hex),
+            "B",
+            DeviceOs::Android,
+            DeviceCategory::Phone,
+            Some("127.0.0.1"),
+            Some(info_b.quic_port),
+        )
+        .unwrap();
+    engine_b
+        .storage()
+        .upsert_peer(
+            &peer_a,
+            &hex_decode_32(&info_a.public_key_hex),
+            "A",
+            DeviceOs::Linux,
+            DeviceCategory::Desktop,
+            Some("127.0.0.1"),
+            Some(info_a.quic_port),
+        )
+        .unwrap();
+
+    engine_a.send_friend_request(&info_b.peer_id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    engine_b
+        .respond_friend_request(&info_a.peer_id, true)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let res = shares_a
+        .download_remote_folder(&engine_a, &info_b.peer_id, &root.id, "")
+        .await
+        .expect("folder download must close each source handle before opening the next");
+    assert_eq!(res.file_count, file_count);
+    assert_eq!(
+        std::fs::read(PathBuf::from(&res.destination).join("item_11.txt")).unwrap(),
+        b"payload"
+    );
+
+    engine_a.shutdown();
+    engine_b.shutdown();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+struct TrailingBytesSafProvider {
+    backing_file: PathBuf,
+}
+
+impl ShareContentProvider for TrailingBytesSafProvider {
+    fn list_dir(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        _rel_path: &str,
+    ) -> Result<Vec<ShareEntry>, CoreError> {
+        Ok(Vec::new())
+    }
+
+    fn list_tree(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        _rel_path: &str,
+        _max_depth: usize,
+        _max_files: usize,
+    ) -> Result<Vec<ShareEntry>, CoreError> {
+        Ok(vec![ShareEntry {
+            name: "shot:1.png".into(),
+            rel_path: "shot:1.png".into(),
+            is_dir: false,
+            size_bytes: 5,
+            modified_ms: 1,
+        }])
+    }
+
+    fn open_file(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        rel_path: &str,
+    ) -> Result<ShareOpenedFile, CoreError> {
+        assert_eq!(rel_path, "shot:1.png");
+        let file = std::fs::File::open(&self.backing_file)?;
+        Ok(ShareOpenedFile {
+            file,
+            file_name: "shot:1.png".into(),
+            // Both manifest and open_file claim 5 bytes, while the descriptor yields 12 bytes.
+            size_bytes: 5,
+            modified_ms: 1,
+        })
+    }
+}
+
+#[tokio::test]
+async fn shares_folder_download_rejects_descriptor_with_trailing_bytes() {
+    let dir_a = temp_dir("trailing-a");
+    let dir_b = temp_dir("trailing-b");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let backing_file = dir_b.join("grown.bin");
+    std::fs::write(&backing_file, b"twelve-bytes").unwrap();
+
+    let engine_a = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_a.clone(),
+        default_download_dir: dir_a.join("downloads"),
+        default_device_name: "A".into(),
+    })
+    .unwrap();
+    let engine_b = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_b.clone(),
+        default_download_dir: dir_b.join("downloads"),
+        default_device_name: "B".into(),
+    })
+    .unwrap();
+
+    let shares_a = SharesModule::new(Arc::clone(engine_a.storage()));
+    let shares_b = SharesModule::new(Arc::clone(engine_b.storage()));
+    shares_b.set_content_provider(Arc::new(TrailingBytesSafProvider { backing_file }));
+    engine_a.register_module(shares_a.clone());
+    engine_b.register_module(shares_b.clone());
+
+    let root = shares_b
+        .add_local_share_uri(
+            "content://com.android.externalstorage.documents/tree/primary%3ATrailing".into(),
+            "Trailing".into(),
+            true,
+        )
+        .unwrap();
+
+    engine_a.start_transport_loop();
+    engine_b.start_transport_loop();
+
+    let info_a = engine_a.local_identity_info();
+    let info_b = engine_b.local_identity_info();
+    let peer_a = PeerId::from_hex(&info_a.peer_id).unwrap();
+    let peer_b = PeerId::from_hex(&info_b.peer_id).unwrap();
+
+    engine_a
+        .storage()
+        .upsert_peer(
+            &peer_b,
+            &hex_decode_32(&info_b.public_key_hex),
+            "B",
+            DeviceOs::Android,
+            DeviceCategory::Phone,
+            Some("127.0.0.1"),
+            Some(info_b.quic_port),
+        )
+        .unwrap();
+    engine_b
+        .storage()
+        .upsert_peer(
+            &peer_a,
+            &hex_decode_32(&info_a.public_key_hex),
+            "A",
+            DeviceOs::Linux,
+            DeviceCategory::Desktop,
+            Some("127.0.0.1"),
+            Some(info_a.quic_port),
+        )
+        .unwrap();
+
+    engine_a.send_friend_request(&info_b.peer_id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    engine_b
+        .respond_friend_request(&info_a.peer_id, true)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let err = shares_a
+        .download_remote_folder(&engine_a, &info_b.peer_id, &root.id, "")
+        .await
+        .expect_err("receiver must reject descriptor with trailing bytes beyond declared size");
+    let msg = err.to_string();
+    assert!(msg.contains("shot_1.png"), "unexpected error: {msg}");
+    assert!(msg.contains("5"), "unexpected error: {msg}");
+    assert!(msg.contains("12"), "unexpected error: {msg}");
+
+    engine_a.shutdown();
+    engine_b.shutdown();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+struct AndroidSafMockProvider {
+    backing_dir: PathBuf,
+}
+
+impl ShareContentProvider for AndroidSafMockProvider {
+    fn list_dir(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        _rel_path: &str,
+    ) -> Result<Vec<ShareEntry>, CoreError> {
+        Ok(Vec::new())
+    }
+
+    fn list_tree(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        _rel_path: &str,
+        _max_depth: usize,
+        _max_files: usize,
+    ) -> Result<Vec<ShareEntry>, CoreError> {
+        Ok(vec![
+            ShareEntry {
+                name: "empty_root_sub".into(),
+                rel_path: "empty_root_sub".into(),
+                is_dir: true,
+                size_bytes: 0,
+                modified_ms: 1,
+            },
+            ShareEntry {
+                name: "DCIM:2026".into(),
+                rel_path: "DCIM:2026".into(),
+                is_dir: true,
+                size_bytes: 0,
+                modified_ms: 1,
+            },
+            ShareEntry {
+                name: "Camera".into(),
+                rel_path: "DCIM:2026/Camera".into(),
+                is_dir: true,
+                size_bytes: 0,
+                modified_ms: 1,
+            },
+            ShareEntry {
+                name: "empty_nested".into(),
+                rel_path: "DCIM:2026/empty_nested".into(),
+                is_dir: true,
+                size_bytes: 0,
+                modified_ms: 1,
+            },
+            ShareEntry {
+                name: "shot:12:30.png".into(),
+                rel_path: "shot:12:30.png".into(),
+                is_dir: false,
+                size_bytes: 18,
+                modified_ms: 1,
+            },
+            ShareEntry {
+                name: "clip:01.mp4".into(),
+                rel_path: "DCIM:2026/Camera/clip:01.mp4".into(),
+                is_dir: false,
+                size_bytes: 24,
+                modified_ms: 1,
+            },
+        ])
+    }
+
+    fn open_file(
+        &self,
+        _root_uri: &str,
+        _is_dir: bool,
+        rel_path: &str,
+    ) -> Result<ShareOpenedFile, CoreError> {
+        let disk_name = match rel_path {
+            "shot:12:30.png" => "shot.png",
+            "DCIM:2026/Camera/clip:01.mp4" => "clip.mp4",
+            other => return Err(CoreError::NotFound(format!("unexpected rel_path: {other}"))),
+        };
+        let file = std::fs::File::open(self.backing_dir.join(disk_name))?;
+        let size_bytes = file.metadata()?.len();
+        Ok(ShareOpenedFile {
+            file,
+            file_name: rel_path.rsplit('/').next().unwrap_or(rel_path).into(),
+            size_bytes,
+            modified_ms: 1,
+        })
+    }
+}
+
+#[tokio::test]
+async fn saf_android_folder_download_with_colons_empty_dirs_and_blake3() {
+    let dir_a = temp_dir("saf-android-a");
+    let dir_b = temp_dir("saf-android-b");
+    let backing_dir = dir_b.join("saf_backing");
+    std::fs::create_dir_all(&backing_dir).unwrap();
+
+    let shot_bytes = b"png-shot-12-30-ok!";
+    let clip_bytes = b"mp4-clip-01-nested-data!";
+    assert_eq!(shot_bytes.len(), 18);
+    assert_eq!(clip_bytes.len(), 24);
+    std::fs::write(backing_dir.join("shot.png"), shot_bytes).unwrap();
+    std::fs::write(backing_dir.join("clip.mp4"), clip_bytes).unwrap();
+
+    let engine_a = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_a.clone(),
+        default_download_dir: dir_a.join("downloads"),
+        default_device_name: "PC".into(),
+    })
+    .unwrap();
+    let engine_b = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_b.clone(),
+        default_download_dir: dir_b.join("downloads"),
+        default_device_name: "Xiaomi".into(),
+    })
+    .unwrap();
+
+    let shares_a = SharesModule::new(Arc::clone(engine_a.storage()));
+    let shares_b = SharesModule::new(Arc::clone(engine_b.storage()));
+    shares_b.set_content_provider(Arc::new(AndroidSafMockProvider { backing_dir }));
+    engine_a.register_module(shares_a.clone());
+    engine_b.register_module(shares_b.clone());
+
+    let root = shares_b
+        .add_local_share_uri(
+            "content://com.android.externalstorage.documents/tree/primary%3APictures".into(),
+            "Pictures".into(),
+            true,
+        )
+        .unwrap();
+
+    engine_a.start_transport_loop();
+    engine_b.start_transport_loop();
+
+    let info_a = engine_a.local_identity_info();
+    let info_b = engine_b.local_identity_info();
+    let peer_a = PeerId::from_hex(&info_a.peer_id).unwrap();
+    let peer_b = PeerId::from_hex(&info_b.peer_id).unwrap();
+
+    engine_a
+        .storage()
+        .upsert_peer(
+            &peer_b,
+            &hex_decode_32(&info_b.public_key_hex),
+            "Xiaomi",
+            DeviceOs::Android,
+            DeviceCategory::Phone,
+            Some("127.0.0.1"),
+            Some(info_b.quic_port),
+        )
+        .unwrap();
+    engine_b
+        .storage()
+        .upsert_peer(
+            &peer_a,
+            &hex_decode_32(&info_a.public_key_hex),
+            "PC",
+            DeviceOs::Windows,
+            DeviceCategory::Desktop,
+            Some("127.0.0.1"),
+            Some(info_a.quic_port),
+        )
+        .unwrap();
+
+    engine_a.send_friend_request(&info_b.peer_id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    engine_b
+        .respond_friend_request(&info_a.peer_id, true)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let res = shares_a
+        .download_remote_folder(&engine_a, &info_b.peer_id, &root.id, "")
+        .await
+        .expect("Android SAF folder with colons and empty subdirs must download cleanly");
+    assert_eq!(res.folder_name, "Pictures");
+    assert_eq!(res.file_count, 2);
+    assert_eq!(res.total_bytes, 42);
+
+    let dest = PathBuf::from(&res.destination);
+    assert!(dest.join("empty_root_sub").is_dir());
+    assert!(dest.join("DCIM_2026/empty_nested").is_dir());
+
+    let downloaded_shot = std::fs::read(dest.join("shot_12_30.png")).unwrap();
+    let downloaded_clip = std::fs::read(dest.join("DCIM_2026/Camera/clip_01.mp4")).unwrap();
+    assert_eq!(
+        blake3::hash(&downloaded_shot),
+        blake3::hash(shot_bytes),
+        "BLAKE3 mismatch for shot_12_30.png"
+    );
+    assert_eq!(
+        blake3::hash(&downloaded_clip),
+        blake3::hash(clip_bytes),
+        "BLAKE3 mismatch for clip_01.mp4"
+    );
+
+    engine_a.shutdown();
+    engine_b.shutdown();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[tokio::test]
+async fn shares_single_file_download_uses_publish_hook_and_cleans_temp() {
+    let dir_a = temp_dir("single-hook-a");
+    let dir_b = temp_dir("single-hook-b");
+    let shared_dir = dir_b.join("shared");
+    std::fs::create_dir_all(&shared_dir).unwrap();
+    let payload = b"single-file-mediastore-payload";
+    std::fs::write(shared_dir.join("report.pdf"), payload).unwrap();
+
+    let engine_a = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_a.clone(),
+        default_download_dir: dir_a.join("private_downloads"),
+        default_device_name: "A".into(),
+    })
+    .unwrap();
+    let engine_b = LandaEngine::new_loopback(LandaConfig {
+        app_data_dir: dir_b.clone(),
+        default_download_dir: dir_b.join("downloads"),
+        default_device_name: "B".into(),
+    })
+    .unwrap();
+
+    let published_calls = Arc::new(std::sync::Mutex::new(Vec::<(PathBuf, String, Vec<u8>)>::new()));
+    let published_calls_clone = Arc::clone(&published_calls);
+    let expected_temp_dir = dir_a.join("incoming_temp");
+    engine_a.set_receive_publish_hook(Arc::new(move |source, relative| {
+        assert!(
+            source.starts_with(&expected_temp_dir),
+            "single file must be staged in incoming_temp, got {}",
+            source.display()
+        );
+        let bytes = std::fs::read(source).expect("staged temp file must exist during publish");
+        let rel_str = relative.to_string_lossy().replace('\\', "/");
+        published_calls_clone
+            .lock()
+            .unwrap()
+            .push((source.to_path_buf(), rel_str.clone(), bytes));
+        Some(format!("content://media/external/downloads/{rel_str}"))
+    }));
+
+    let shares_a = SharesModule::new(Arc::clone(engine_a.storage()));
+    let shares_b = SharesModule::new(Arc::clone(engine_b.storage()));
+    engine_a.register_module(shares_a.clone());
+    engine_b.register_module(shares_b.clone());
+
+    let root = shares_b
+        .add_local_share(shared_dir.clone(), Some("Docs".into()))
+        .unwrap();
+
+    engine_a.start_transport_loop();
+    engine_b.start_transport_loop();
+
+    let info_a = engine_a.local_identity_info();
+    let info_b = engine_b.local_identity_info();
+    let peer_a = PeerId::from_hex(&info_a.peer_id).unwrap();
+    let peer_b = PeerId::from_hex(&info_b.peer_id).unwrap();
+
+    engine_a
+        .storage()
+        .upsert_peer(
+            &peer_b,
+            &hex_decode_32(&info_b.public_key_hex),
+            "B",
+            DeviceOs::Linux,
+            DeviceCategory::Desktop,
+            Some("127.0.0.1"),
+            Some(info_b.quic_port),
+        )
+        .unwrap();
+    engine_b
+        .storage()
+        .upsert_peer(
+            &peer_a,
+            &hex_decode_32(&info_a.public_key_hex),
+            "A",
+            DeviceOs::Android,
+            DeviceCategory::Phone,
+            Some("127.0.0.1"),
+            Some(info_a.quic_port),
+        )
+        .unwrap();
+
+    engine_a.send_friend_request(&info_b.peer_id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    engine_b
+        .respond_friend_request(&info_a.peer_id, true)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let saved = shares_a
+        .download_remote_file(&engine_a, &info_b.peer_id, &root.id, "report.pdf")
+        .await
+        .unwrap();
+    assert_eq!(saved, "content://media/external/downloads/report.pdf");
+
+    let calls = published_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, "report.pdf");
+    assert_eq!(calls[0].2, payload);
+    assert!(
+        !calls[0].0.exists(),
+        "staged temp file must be deleted immediately after publish"
+    );
+    drop(calls);
+
+    assert!(
+        !dir_a.join("private_downloads/report.pdf").exists(),
+        "file must not be written to private download_dir when publish hook is active"
+    );
+
+    let history = engine_a.list_history(10).unwrap();
+    assert_eq!(
+        history[0].saved_paths,
+        vec!["content://media/external/downloads/report.pdf".to_string()]
+    );
+    assert_eq!(history[0].relative_paths, vec!["report.pdf".to_string()]);
+
+    // If publish hook fails (returns None), download must fail and clean up temp file.
+    engine_a.set_receive_publish_hook(Arc::new(|_, _| None));
+    let err = shares_a
+        .download_remote_file(&engine_a, &info_b.peer_id, &root.id, "report.pdf")
+        .await
+        .expect_err("publish hook failure must fail single-file download");
+    assert!(err.to_string().contains("failed to publish"));
+    let remaining_temp: Vec<_> = std::fs::read_dir(dir_a.join("incoming_temp"))
+        .unwrap()
+        .collect();
+    assert!(
+        remaining_temp.is_empty(),
+        "incoming_temp must be empty after failed publish"
+    );
+
+    engine_a.shutdown();
+    engine_b.shutdown();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}

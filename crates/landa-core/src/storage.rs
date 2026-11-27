@@ -10,12 +10,18 @@ use serde::{Deserialize, Serialize};
 use crate::error::CoreError;
 use crate::events::{FriendRequestInfo, ManualTarget, TransferHistoryRecord};
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     pub device_name: String,
     pub download_dir: String,
     pub auto_accept_from_friends: bool,
+    #[serde(default = "default_true")]
+    pub auto_copy_clipboard: bool,
     pub minimize_to_tray: bool,
     pub left_handed_mode: bool,
     pub theme: String,
@@ -36,6 +42,7 @@ impl AppSettings {
             device_name,
             download_dir: download_dir.to_string_lossy().to_string(),
             auto_accept_from_friends: false,
+            auto_copy_clipboard: true,
             minimize_to_tray: true,
             left_handed_mode: false,
             theme: "dark".to_string(),
@@ -575,6 +582,7 @@ mod tests {
         let parsed: AppSettings = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(parsed.device_name, "Legacy PC");
         assert!(parsed.excluded_subnets.is_empty());
+        assert!(parsed.auto_copy_clipboard);
     }
 
     #[test]
@@ -585,6 +593,7 @@ mod tests {
 
         let mut settings = AppSettings::default_with("Test".into(), temp_dir.join("dl"));
         settings.excluded_subnets = vec!["192.168.56.0/24".into(), "172.17.0.0/16".into()];
+        settings.auto_copy_clipboard = false;
         storage.save_settings(&settings).unwrap();
 
         let loaded = storage
@@ -597,6 +606,7 @@ mod tests {
             loaded.excluded_subnets,
             vec!["192.168.56.0/24".to_string(), "172.17.0.0/16".to_string()]
         );
+        assert!(!loaded.auto_copy_clipboard);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

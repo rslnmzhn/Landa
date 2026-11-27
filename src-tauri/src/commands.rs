@@ -526,6 +526,66 @@ pub fn build_diagnostics_report_with_listener(
     out
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn with_clipboard_retry<C, T, F, N>(
+    clipboard: &Mutex<Option<C>>,
+    mut create: N,
+    mut op: F,
+) -> Result<T, String>
+where
+    N: FnMut() -> Result<C, arboard::Error>,
+    F: FnMut(&mut C) -> Result<T, arboard::Error>,
+{
+    let mut guard = clipboard
+        .lock()
+        .map_err(|_| "Clipboard lock poisoned".to_string())?;
+
+    let mut last_err: Option<String> = None;
+    for attempt in 0..3 {
+        if guard.is_none() {
+            match create() {
+                Ok(cb) => *guard = Some(cb),
+                Err(e) => {
+                    last_err = Some(format!("System clipboard unavailable: {e}"));
+                    if attempt < 2 {
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                    }
+                    continue;
+                }
+            }
+        }
+
+        let cb = guard.as_mut().expect("clipboard initialized");
+        match op(cb) {
+            Ok(val) => return Ok(val),
+            Err(arboard::Error::ContentNotAvailable) => {
+                return Err("Clipboard content not available".to_string());
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+                // Drop potentially stale X11/Wayland/Win32 handle and recreate on next attempt
+                *guard = None;
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| "System clipboard unavailable".to_string()))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn write_desktop_clipboard_text(
+    clipboard: &Mutex<Option<arboard::Clipboard>>,
+    text: &str,
+) -> Result<(), String> {
+    with_clipboard_retry(clipboard, arboard::Clipboard::new, |cb| {
+        cb.set_text(text.to_string())
+    })
+    .map_err(|e| format!("Failed to copy text: {e}"))
+}
+
 async fn write_text_to_system_clipboard(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -543,18 +603,7 @@ async fn write_text_to_system_clipboard(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let _ = app;
-        let mut guard = state
-            .desktop_clipboard
-            .lock()
-            .map_err(|_| "Clipboard lock poisoned".to_string())?;
-        if guard.is_none() {
-            *guard = arboard::Clipboard::new().ok();
-        }
-        let cb = guard
-            .as_mut()
-            .ok_or_else(|| "System clipboard unavailable".to_string())?;
-        cb.set_text(text.to_string())
-            .map_err(|e| format!("Failed to copy text: {e}"))
+        write_desktop_clipboard_text(&state.desktop_clipboard, text)
     }
 }
 
@@ -790,9 +839,11 @@ pub async fn shares_preview_remote_file(
             &rel_path,
             &cache_dir,
             crate::preview::MAX_REMOTE_PREVIEW_BYTES,
+            crate::preview::MAX_PREVIEW_CACHE_BYTES,
         )
         .await
         .map_err(|e| e.to_string())?;
+    crate::preview::touch_cache_file(std::path::Path::new(&cached_path)).await;
     crate::preview::prepare_file_preview(&app, &state, &server, &cached_path).await
 }
 
@@ -1017,36 +1068,40 @@ pub async fn clipboard_paste_from_system(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let _ = app;
-        let mut guard = state
-            .desktop_clipboard
-            .lock()
-            .map_err(|_| "Clipboard lock poisoned".to_string())?;
-        if guard.is_none() {
-            *guard = arboard::Clipboard::new().ok();
-        }
-        let Some(cb) = guard.as_mut() else {
-            return Err("System clipboard unavailable".into());
-        };
-
-        if let Ok(img) = cb.get_image() {
-            let width = u32::try_from(img.width)
-                .map_err(|_| "Clipboard image width overflow".to_string())?;
-            let height = u32::try_from(img.height)
-                .map_err(|_| "Clipboard image height overflow".to_string())?;
-            let item = state
-                .clipboard
-                .push_local_rgba_image(width, height, img.bytes.as_ref())
-                .map_err(|e| e.to_string())?;
-            return Ok(ClipboardPasteResult::Image { item });
+        enum DesktopClipboardRead {
+            Image(arboard::ImageData<'static>),
+            Text(String),
+            Empty,
         }
 
-        if let Ok(text) = cb.get_text() {
-            if !text.trim().is_empty() {
-                return Ok(ClipboardPasteResult::Text { text });
+        let read = with_clipboard_retry(&state.desktop_clipboard, arboard::Clipboard::new, |cb| {
+            match cb.get_image() {
+                Ok(img) => return Ok(DesktopClipboardRead::Image(img)),
+                Err(arboard::Error::ContentNotAvailable | arboard::Error::ConversionFailure) => {}
+                Err(e) => return Err(e),
             }
-        }
+            match cb.get_text() {
+                Ok(text) if !text.trim().is_empty() => Ok(DesktopClipboardRead::Text(text)),
+                Ok(_) | Err(arboard::Error::ContentNotAvailable) => Ok(DesktopClipboardRead::Empty),
+                Err(e) => Err(e),
+            }
+        })?;
 
-        Ok(ClipboardPasteResult::Empty)
+        match read {
+            DesktopClipboardRead::Image(img) => {
+                let width = u32::try_from(img.width)
+                    .map_err(|_| "Clipboard image width overflow".to_string())?;
+                let height = u32::try_from(img.height)
+                    .map_err(|_| "Clipboard image height overflow".to_string())?;
+                let item = state
+                    .clipboard
+                    .push_local_rgba_image(width, height, img.bytes.as_ref())
+                    .map_err(|e| e.to_string())?;
+                Ok(ClipboardPasteResult::Image { item })
+            }
+            DesktopClipboardRead::Text(text) => Ok(ClipboardPasteResult::Text { text }),
+            DesktopClipboardRead::Empty => Ok(ClipboardPasteResult::Empty),
+        }
     }
 }
 
@@ -1113,20 +1168,12 @@ pub async fn clipboard_copy_to_system(
         .await
         .map_err(|e| format!("Image decode task failed: {e}"))??;
 
-        let mut guard = state
-            .desktop_clipboard
-            .lock()
-            .map_err(|_| "Clipboard lock poisoned".to_string())?;
-        if guard.is_none() {
-            *guard = arboard::Clipboard::new().ok();
-        }
-        let cb = guard
-            .as_mut()
-            .ok_or_else(|| "System clipboard unavailable".to_string())?;
-        cb.set_image(arboard::ImageData {
-            width: rgba.0,
-            height: rgba.1,
-            bytes: std::borrow::Cow::Owned(rgba.2),
+        with_clipboard_retry(&state.desktop_clipboard, arboard::Clipboard::new, |cb| {
+            cb.set_image(arboard::ImageData {
+                width: rgba.0,
+                height: rgba.1,
+                bytes: std::borrow::Cow::Borrowed(rgba.2.as_slice()),
+            })
         })
         .map_err(|e| format!("Failed to copy image: {e}"))
     }
@@ -1195,6 +1242,7 @@ async fn ensure_remote_clipboard_image_cached(
     let cached_path = cache_dir.join(format!("clip_{hex}.png"));
 
     if tokio::fs::try_exists(&cached_path).await.unwrap_or(false) {
+        crate::preview::touch_cache_file(&cached_path).await;
         return Ok(cached_path.to_string_lossy().to_string());
     }
 
@@ -1203,6 +1251,16 @@ async fn ensure_remote_clipboard_image_cached(
         .fetch_remote_image(&state.engine, peer_id, item_id)
         .await
         .map_err(|e| e.to_string())?;
+    let _reservation = state
+        .engine
+        .preview_quota()
+        .reserve(
+            &cache_dir,
+            bytes.len() as u64,
+            crate::preview::MAX_PREVIEW_CACHE_BYTES,
+            std::slice::from_ref(&cached_path),
+        )
+        .map_err(|e| format!("Preview cache quota exceeded: {e}"))?;
     tokio::fs::write(&cached_path, &bytes)
         .await
         .map_err(|e| format!("Failed to cache remote clipboard image: {e}"))?;
@@ -1304,6 +1362,184 @@ pub async fn download_update(
 #[tauri::command]
 pub async fn install_update(app: tauri::AppHandle, file_path: String) -> Result<(), String> {
     crate::updater::install_update(&app, &file_path).await
+}
+
+// --- Cache Management ---
+
+const CACHE_SUBDIRS: &[&str] = &[
+    "preview_cache",
+    "updates",
+    "share_intent",
+    "clipboard_tmp",
+    "clipboard_share",
+];
+
+fn resolve_cache_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    app.path()
+        .app_cache_dir()
+        .or_else(|_| app.path().app_data_dir())
+        .map_err(|e| format!("Failed to resolve cache directory: {e}"))
+}
+
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_file() {
+            total = total.saturating_add(meta.len());
+        } else if meta.is_dir() {
+            total = total.saturating_add(dir_size_bytes(&entry.path()));
+        }
+    }
+    total
+}
+
+fn compute_app_cache_size(cache_root: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    for sub in CACHE_SUBDIRS {
+        total = total.saturating_add(dir_size_bytes(&cache_root.join(sub)));
+    }
+    if let Ok(entries) = std::fs::read_dir(cache_root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("saf_share_") && name_str.ends_with(".bin") {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        total = total.saturating_add(meta.len());
+                    }
+                }
+            }
+        }
+    }
+    total
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearCacheResult {
+    pub remaining_bytes: u64,
+    pub deleted_files: u64,
+    pub skipped_files: u64,
+    pub failed_files: u64,
+}
+
+fn is_protected_path(
+    path: &std::path::Path,
+    protected: &std::collections::HashSet<std::path::PathBuf>,
+    protected_canon: &std::collections::HashSet<std::path::PathBuf>,
+) -> bool {
+    if protected.contains(path) {
+        return true;
+    }
+    if let Ok(canon) = path.canonicalize() {
+        if protected_canon.contains(&canon) {
+            return true;
+        }
+    }
+    false
+}
+
+fn clear_app_cache_dir(
+    cache_root: &std::path::Path,
+    protected: &std::collections::HashSet<std::path::PathBuf>,
+) -> ClearCacheResult {
+    let protected_canon: std::collections::HashSet<std::path::PathBuf> = protected
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+    let mut deleted_files = 0u64;
+    let mut skipped_files = 0u64;
+    let mut failed_files = 0u64;
+
+    for sub in CACHE_SUBDIRS {
+        let dir = cache_root.join(sub);
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if is_protected_path(&path, protected, &protected_canon) {
+                    skipped_files += 1;
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        match std::fs::remove_dir_all(&path) {
+                            Ok(()) => deleted_files += 1,
+                            Err(_) => failed_files += 1,
+                        }
+                    } else {
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => deleted_files += 1,
+                            Err(_) => failed_files += 1,
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(cache_root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("saf_share_") && name_str.ends_with(".bin") {
+                let path = entry.path();
+                if is_protected_path(&path, protected, &protected_canon) {
+                    skipped_files += 1;
+                    continue;
+                }
+                match std::fs::remove_file(&path) {
+                    Ok(()) => deleted_files += 1,
+                    Err(_) => failed_files += 1,
+                }
+            }
+        }
+    }
+    ClearCacheResult {
+        remaining_bytes: compute_app_cache_size(cache_root),
+        deleted_files,
+        skipped_files,
+        failed_files,
+    }
+}
+
+#[tauri::command]
+pub async fn get_cache_size(app: tauri::AppHandle) -> Result<u64, String> {
+    let cache_root = resolve_cache_root(&app)?;
+    tokio::task::spawn_blocking(move || compute_app_cache_size(&cache_root))
+        .await
+        .map_err(|e| format!("Failed to compute cache size: {e}"))
+}
+
+#[tauri::command]
+pub async fn clear_cache(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ClearCacheResult, String> {
+    let cache_root = resolve_cache_root(&app)?;
+    let mut protected = state.engine.preview_quota().active_paths_snapshot();
+    protected.extend(crate::updater::active_update_paths_snapshot());
+
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
+            if let Ok(pending) = bridge.peek_pending_shared_files() {
+                for p in pending {
+                    protected.insert(std::path::PathBuf::from(p));
+                }
+            }
+        }
+    }
+
+    tokio::task::spawn_blocking(move || clear_app_cache_dir(&cache_root, &protected))
+        .await
+        .map_err(|e| format!("Failed to clear cache: {e}"))
 }
 
 // --- In-App File Preview ---
@@ -1682,5 +1918,86 @@ mod tests {
         .await
         .expect("released claim should allow subsequent recovery call to scan");
         assert_eq!(persistent_trigger.call_count(), 3);
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn desktop_clipboard_retry_recreates_instance_on_transient_error() {
+        let slot: Mutex<Option<usize>> = Mutex::new(Some(0));
+        let mut created = 0usize;
+        let mut ops = 0usize;
+
+        let res = with_clipboard_retry(
+            &slot,
+            || {
+                created += 1;
+                Ok(created)
+            },
+            |instance| {
+                ops += 1;
+                if *instance == 0 {
+                    Err(arboard::Error::ClipboardOccupied)
+                } else {
+                    Ok(*instance)
+                }
+            },
+        )
+        .expect("should recover after recreating clipboard instance");
+
+        assert_eq!(res, 1);
+        assert_eq!(created, 1);
+        assert_eq!(ops, 2);
+
+        // ContentNotAvailable must not recreate or retry
+        let err = with_clipboard_retry(
+            &slot,
+            || {
+                created += 1;
+                Ok(created)
+            },
+            |_| Err::<(), _>(arboard::Error::ContentNotAvailable),
+        )
+        .expect_err("ContentNotAvailable should return immediately");
+        assert!(err.contains("not available"));
+        assert_eq!(created, 1);
+    }
+
+    #[test]
+    fn clear_app_cache_dir_skips_protected_files_and_reports_counts() {
+        let root = std::env::temp_dir().join(format!("landa-clear-cache-{}", uuid::Uuid::new_v4()));
+        let preview_dir = root.join("preview_cache");
+        let updates_dir = root.join("updates");
+        let share_dir = root.join("share_intent");
+        std::fs::create_dir_all(&preview_dir).unwrap();
+        std::fs::create_dir_all(&updates_dir).unwrap();
+        std::fs::create_dir_all(&share_dir).unwrap();
+
+        let stale_preview = preview_dir.join("old.bin");
+        let active_preview = preview_dir.join(".preview-part-active");
+        let active_apk = updates_dir.join("landa-v0.5.1.apk");
+        let queued_share = share_dir.join("queued.jpg");
+
+        std::fs::write(&stale_preview, vec![1u8; 10]).unwrap();
+        std::fs::write(&active_preview, vec![2u8; 20]).unwrap();
+        std::fs::write(&active_apk, vec![3u8; 30]).unwrap();
+        std::fs::write(&queued_share, vec![4u8; 40]).unwrap();
+
+        let mut protected = std::collections::HashSet::new();
+        protected.insert(active_preview.clone());
+        protected.insert(active_apk.clone());
+        protected.insert(queued_share.clone());
+
+        let res = clear_app_cache_dir(&root, &protected);
+
+        assert_eq!(res.deleted_files, 1);
+        assert_eq!(res.skipped_files, 3);
+        assert_eq!(res.failed_files, 0);
+        assert_eq!(res.remaining_bytes, 90);
+        assert!(!stale_preview.exists());
+        assert!(active_preview.exists());
+        assert!(active_apk.exists());
+        assert!(queued_share.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

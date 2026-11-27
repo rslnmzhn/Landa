@@ -55,6 +55,7 @@ impl TransferManager {
         events: broadcast::Sender<CoreEvent>,
         temp_root: PathBuf,
     ) -> Self {
+        cleanup_temp_root_sync(&temp_root);
         Self {
             storage,
             events,
@@ -85,6 +86,11 @@ impl TransferManager {
             .open_source_hook
             .write()
             .expect("open_source_hook lock poisoned") = Some(hook);
+    }
+
+    pub async fn cleanup_temp_root(&self) {
+        let temp_root = self.temp_root.clone();
+        let _ = tokio::task::spawn_blocking(move || cleanup_temp_root_sync(&temp_root)).await;
     }
 
     pub fn register_cancellation(&self, transfer_id: &str, token: CancellationToken) {
@@ -816,4 +822,46 @@ fn emit_progress(
         error: None,
         saved_paths: Vec::new(),
     }));
+}
+
+fn cleanup_temp_root_sync(temp_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(temp_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_manager_new_cleans_orphaned_incoming_temp_synchronously() {
+        let root = std::env::temp_dir().join(format!("landa-temp-clean-{}", Uuid::new_v4()));
+        let temp_root = root.join("incoming_temp");
+        std::fs::create_dir_all(temp_root.join("nested_dir")).unwrap();
+        std::fs::write(temp_root.join("orphan.part"), b"partial").unwrap();
+        std::fs::write(temp_root.join("nested_dir").join("file.bin"), b"data").unwrap();
+
+        let storage = Arc::new(Storage::open(&root.join("test.sqlite")).unwrap());
+        let (events, _) = broadcast::channel(8);
+        let _mgr = TransferManager::new(storage, events, temp_root.clone());
+
+        assert!(temp_root.exists(), "temp_root directory itself should remain");
+        assert!(
+            std::fs::read_dir(&temp_root).unwrap().next().is_none(),
+            "all orphaned files and directories inside incoming_temp must be removed before TransferManager::new returns"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

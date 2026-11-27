@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ClipboardPaste,
   Copy,
@@ -133,68 +133,221 @@ export function ClipboardView({
   const [draft, setDraft] = useState("");
   const [pendingImage, setPendingImage] = useState<ClipboardItem | null>(null);
   const [pasting, setPasting] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [loadingRemote, setLoadingRemote] = useState(false);
   const [targetId, setTargetId] = useState<string>("local");
   const [localItems, setLocalItems] = useState<ClipboardItem[]>([]);
   const [remoteItems, setRemoteItems] = useState<ClipboardItem[]>([]);
 
-  const trustedOnlinePeers = useMemo(
-    () => peers.filter((p) => p.isTrusted && p.isOnline),
+  const sendingRef = useRef(false);
+  const draftVersionRef = useRef(0);
+  const pendingImageVersionRef = useRef(0);
+  const targetIdRef = useRef(targetId);
+  targetIdRef.current = targetId;
+  const remoteReqIdsByPeerRef = useRef<Record<string, number>>({});
+  const localReqIdRef = useRef(0);
+  const prevSelectedPeerRef = useRef<{ peerId: string; isOnline: boolean } | null>(
+    null
+  );
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+  const onNoticeRef = useRef(onNotice);
+  onNoticeRef.current = onNotice;
+
+  const updateDraft = useCallback((next: string) => {
+    draftVersionRef.current++;
+    setDraft(next);
+  }, []);
+
+  const updatePendingImage = useCallback((next: ClipboardItem | null) => {
+    pendingImageVersionRef.current++;
+    setPendingImage(next);
+  }, []);
+
+  const trustedPeers = useMemo(
+    () => peers.filter((p) => p.isTrusted),
     [peers]
   );
+  const selectedPeer = useMemo(
+    () =>
+      targetId === "local"
+        ? null
+        : trustedPeers.find((p) => p.peerId === targetId) ?? null,
+    [trustedPeers, targetId]
+  );
+  const selectorPeers = useMemo(
+    () => trustedPeers.filter((p) => p.isOnline || p.peerId === targetId),
+    [trustedPeers, targetId]
+  );
 
-  const loadLocal = async () => {
+  const loadLocal = useCallback(async () => {
+    const reqId = ++localReqIdRef.current;
     try {
-      setLocalItems(await api.clipboardListLocal());
+      const items = await api.clipboardListLocal();
+      if (localReqIdRef.current === reqId) {
+        setLocalItems(items);
+      }
     } catch (e) {
-      onError(String(e));
+      if (localReqIdRef.current === reqId) {
+        onErrorRef.current(String(e));
+      }
     }
-  };
+  }, []);
 
-  const loadRemote = async (peerId: string) => {
-    try {
-      setRemoteItems(await api.clipboardFetchRemote(peerId));
-    } catch (e) {
-      onError(String(e));
-    }
-  };
+  const loadRemote = useCallback(
+    async (peerId: string, errorPrefix?: string) => {
+      const reqId = (remoteReqIdsByPeerRef.current[peerId] ?? 0) + 1;
+      remoteReqIdsByPeerRef.current[peerId] = reqId;
+      if (targetIdRef.current === peerId) {
+        setLoadingRemote(true);
+      }
+      try {
+        const items = await api.clipboardFetchRemote(peerId);
+        if (
+          remoteReqIdsByPeerRef.current[peerId] === reqId &&
+          targetIdRef.current === peerId
+        ) {
+          setRemoteItems(items);
+        }
+      } catch (e) {
+        if (
+          remoteReqIdsByPeerRef.current[peerId] === reqId &&
+          targetIdRef.current === peerId
+        ) {
+          const msg = String(e);
+          onErrorRef.current(errorPrefix ? `${errorPrefix}: ${msg}` : msg);
+        }
+      } finally {
+        if (
+          remoteReqIdsByPeerRef.current[peerId] === reqId &&
+          targetIdRef.current === peerId
+        ) {
+          setLoadingRemote(false);
+        }
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (!enabled || targetId !== "local") return;
+    void loadLocal();
+  }, [enabled, refreshTick, targetId, loadLocal]);
+
+  const selectedPeerId = selectedPeer?.peerId ?? null;
+  const selectedPeerOnline = selectedPeer?.isOnline ?? false;
 
   useEffect(() => {
     if (!enabled) return;
     if (targetId === "local") {
-      loadLocal();
-    } else if (trustedOnlinePeers.some((p) => p.peerId === targetId)) {
-      loadRemote(targetId);
-    } else {
-      setTargetId("local");
+      prevSelectedPeerRef.current = null;
+      setLoadingRemote(false);
+      return;
     }
-  }, [enabled, refreshTick, targetId, trustedOnlinePeers]);
+    if (!selectedPeerId) {
+      const prevPeerId = prevSelectedPeerRef.current?.peerId;
+      if (prevPeerId) {
+        remoteReqIdsByPeerRef.current[prevPeerId] =
+          (remoteReqIdsByPeerRef.current[prevPeerId] ?? 0) + 1;
+      }
+      prevSelectedPeerRef.current = null;
+      setLoadingRemote(false);
+      setRemoteItems([]);
+      updatePendingImage(null);
+      setTargetId("local");
+      return;
+    }
+
+    const prev = prevSelectedPeerRef.current;
+    prevSelectedPeerRef.current = {
+      peerId: selectedPeerId,
+      isOnline: selectedPeerOnline,
+    };
+
+    if (!selectedPeerOnline) {
+      remoteReqIdsByPeerRef.current[selectedPeerId] =
+        (remoteReqIdsByPeerRef.current[selectedPeerId] ?? 0) + 1;
+      setLoadingRemote(false);
+      return;
+    }
+
+    if (!prev || prev.peerId !== selectedPeerId || !prev.isOnline) {
+      void loadRemote(selectedPeerId);
+    }
+  }, [enabled, targetId, selectedPeerId, selectedPeerOnline, loadRemote, updatePendingImage]);
 
   const handleSubmit = async () => {
-    if (pendingImage && targetId !== "local") {
+    if (sendingRef.current) return;
+    const submitTargetId = targetId;
+    if (submitTargetId !== "local" && !selectedPeer?.isOnline) return;
+
+    if (pendingImage && submitTargetId !== "local") {
+      const imageToSend = pendingImage;
+      const sendImageVersion = pendingImageVersionRef.current;
+      sendingRef.current = true;
+      setSending(true);
       try {
-        await api.clipboardSendImageToPeer(targetId, pendingImage.id);
-        setPendingImage(null);
-        onNotice(t.clipboard.sent);
-      } catch (e) {
-        onError(String(e));
+        try {
+          await api.clipboardSendImageToPeer(submitTargetId, imageToSend.id);
+        } catch (e) {
+          onErrorRef.current(String(e));
+          return;
+        }
+        if (pendingImageVersionRef.current === sendImageVersion) {
+          updatePendingImage(null);
+        }
+        onNoticeRef.current(t.clipboard.sent);
+        if (targetIdRef.current === submitTargetId) {
+          await loadRemote(submitTargetId, t.clipboard.refreshError);
+        }
+      } finally {
+        sendingRef.current = false;
+        setSending(false);
       }
       return;
     }
 
     if (!draft.trim()) return;
+    const textToSend = draft;
+    const sendDraftVersion = draftVersionRef.current;
+    sendingRef.current = true;
+    setSending(true);
     try {
-      if (targetId === "local") {
-        await api.clipboardPushLocalText(draft);
-        setDraft("");
-        await loadLocal();
-      } else {
-        await api.clipboardSendToPeer(targetId, draft);
-        await api.clipboardPushLocalText(draft);
-        setDraft("");
-        onNotice(t.clipboard.sent);
+      if (submitTargetId === "local") {
+        try {
+          await api.clipboardPushLocalText(textToSend);
+          if (draftVersionRef.current === sendDraftVersion) {
+            updateDraft("");
+          }
+          await loadLocal();
+        } catch (e) {
+          onErrorRef.current(String(e));
+        }
+        return;
       }
-    } catch (e) {
-      onError(String(e));
+
+      try {
+        await api.clipboardSendToPeer(submitTargetId, textToSend);
+      } catch (e) {
+        onErrorRef.current(String(e));
+        return;
+      }
+      if (draftVersionRef.current === sendDraftVersion) {
+        updateDraft("");
+      }
+      onNoticeRef.current(t.clipboard.sent);
+
+      try {
+        await api.clipboardPushLocalText(textToSend);
+      } catch (e) {
+        onErrorRef.current(`${t.clipboard.localSaveError}: ${String(e)}`);
+      }
+      if (targetIdRef.current === submitTargetId) {
+        await loadRemote(submitTargetId, t.clipboard.refreshError);
+      }
+    } finally {
+      sendingRef.current = false;
+      setSending(false);
     }
   };
 
@@ -207,15 +360,15 @@ export function ClipboardView({
         return;
       }
       if (res.kind === "text") {
-        setPendingImage(null);
-        setDraft(res.text);
+        updatePendingImage(null);
+        updateDraft(res.text);
         return;
       }
       if (res.kind === "image") {
-        if (targetId === "local") {
+        if (targetIdRef.current === "local") {
           await loadLocal();
         } else {
-          setPendingImage(res.item);
+          updatePendingImage(res.item);
         }
       }
     } catch (e) {
@@ -234,10 +387,10 @@ export function ClipboardView({
       {
         pushLocalImageBytes: api.clipboardPushLocalImageBytes,
         onImageSaved: async (saved) => {
-          if (targetId === "local") {
+          if (targetIdRef.current === "local") {
             await loadLocal();
           } else {
-            setPendingImage(saved);
+            updatePendingImage(saved);
           }
         },
         onError,
@@ -269,14 +422,18 @@ export function ClipboardView({
 
   const targetOptions = [
     { id: "local", label: t.clipboard.localTab },
-    ...trustedOnlinePeers.map((p) => ({
+    ...selectorPeers.map((p) => ({
       id: p.peerId,
       label: p.displayName,
     })),
   ];
 
   const visibleItems = targetId === "local" ? localItems : remoteItems;
-  const canSubmit = Boolean(pendingImage && targetId !== "local") || Boolean(draft.trim());
+  const isTargetOnline = targetId === "local" || Boolean(selectedPeer?.isOnline);
+  const canSubmit =
+    !sending &&
+    isTargetOnline &&
+    (Boolean(pendingImage && targetId !== "local") || Boolean(draft.trim()));
 
   return (
     <div className="space-y-5">
@@ -288,9 +445,14 @@ export function ClipboardView({
           <GlassButton
             size="sm"
             variant="glass"
-            onClick={() => loadRemote(targetId)}
+            disabled={!selectedPeer?.isOnline || loadingRemote}
+            onClick={() => {
+              if (selectedPeer?.isOnline) {
+                void loadRemote(targetId);
+              }
+            }}
           >
-            <RefreshCw className="h-4 w-4" />
+            <RefreshCw className={`h-4 w-4 ${loadingRemote ? "animate-spin" : ""}`} />
           </GlassButton>
         )}
       </div>
@@ -302,10 +464,19 @@ export function ClipboardView({
             options={targetOptions}
             value={targetId}
             onChange={(next) => {
+              if (next !== targetId) {
+                setRemoteItems([]);
+              }
               setTargetId(next);
-              if (next === "local") setPendingImage(null);
+              if (next === "local") updatePendingImage(null);
             }}
           />
+        </div>
+      )}
+
+      {targetId !== "local" && selectedPeer && !selectedPeer.isOnline && (
+        <div className="rounded-2xl border border-amber-400/30 bg-amber-500/10 px-3.5 py-2 text-xs text-amber-800 dark:text-amber-200">
+          {t.clipboard.peerOffline}
         </div>
       )}
 
@@ -331,7 +502,8 @@ export function ClipboardView({
             <GlassButton
               size="sm"
               variant="ghost"
-              onClick={() => setPendingImage(null)}
+              disabled={sending}
+              onClick={() => updatePendingImage(null)}
             >
               <X className="h-4 w-4" />
             </GlassButton>
@@ -341,16 +513,18 @@ export function ClipboardView({
         <div className="flex gap-2">
           <GlassInput
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => updateDraft(e.target.value)}
             onPaste={handleInputPaste}
             placeholder={t.clipboard.inputPlaceholder}
             onKeyDown={(e) => {
-              if (e.key === "Enter") handleSubmit();
+              if (e.key === "Enter" && canSubmit) {
+                void handleSubmit();
+              }
             }}
           />
           <GlassButton
             variant="glass"
-            disabled={pasting}
+            disabled={pasting || sending}
             title={t.clipboard.pasteFromClipboard}
             aria-label={t.clipboard.pasteFromClipboard}
             onClick={handlePasteFromSystem}
@@ -364,7 +538,7 @@ export function ClipboardView({
           <GlassButton
             variant="primary"
             disabled={!canSubmit}
-            onClick={handleSubmit}
+            onClick={() => void handleSubmit()}
             className="shrink-0"
           >
             {targetId === "local" ? (

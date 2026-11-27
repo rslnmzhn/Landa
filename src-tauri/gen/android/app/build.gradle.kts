@@ -75,6 +75,7 @@ android {
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "5000").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "0.5.0")
+        resourceConfigurations += listOf("ru", "en")
     }
     buildTypes {
         getByName("debug") {
@@ -109,6 +110,17 @@ android {
     }
     buildFeatures {
         buildConfig = true
+    }
+    packaging {
+        resources {
+            excludes += setOf(
+                "META-INF/FastDoubleParser-LICENSE",
+                "META-INF/FastDoubleParser-NOTICE",
+                "META-INF/*.version",
+                "DebugProbesKt.bin",
+                "kotlin-tooling-metadata.json",
+            )
+        }
     }
 }
 

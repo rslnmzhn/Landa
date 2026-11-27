@@ -19,6 +19,7 @@ const MAX_TEXT_PREVIEW_BYTES: usize = 512 * 1024;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_REMOTE_PREVIEW_BYTES: u64 = 100 * 1024 * 1024;
+pub const MAX_PREVIEW_CACHE_BYTES: u64 = 150 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -157,23 +158,93 @@ pub async fn sweep_old_preview_cache(app: &AppHandle) {
     let Ok(dir) = resolve_preview_cache_dir(app) else {
         return;
     };
+    sweep_preview_cache_dir(
+        &dir,
+        Duration::from_secs(24 * 60 * 60),
+        MAX_PREVIEW_CACHE_BYTES,
+        true,
+    )
+    .await;
+}
+
+pub async fn enforce_preview_cache_limit(dir: &Path, max_bytes: u64) {
+    sweep_preview_cache_dir(dir, Duration::from_secs(24 * 60 * 60), max_bytes, false).await;
+}
+
+pub async fn touch_cache_file(path: &Path) {
+    let path = path.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
+            let _ = file.set_modified(SystemTime::now());
+        }
+    })
+    .await;
+}
+
+async fn sweep_preview_cache_dir(
+    dir: &Path,
+    max_age: Duration,
+    max_bytes: u64,
+    remove_all_parts: bool,
+) {
     if !dir.exists() {
         return;
     }
-    let cutoff = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+    let now = SystemTime::now();
+    let cutoff = now.checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+    let part_cutoff = now
+        .checked_sub(Duration::from_secs(60 * 60))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
     };
+
+    let mut kept: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut total_bytes: u64 = 0;
+
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if let Ok(meta) = entry.metadata().await {
-            if meta.is_file() {
-                if let Ok(modified) = meta.modified() {
-                    if modified < cutoff {
-                        let _ = tokio::fs::remove_file(&path).await;
-                    }
-                }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let is_part = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".preview-part-"));
+        if is_part {
+            if remove_all_parts || modified < part_cutoff {
+                let _ = tokio::fs::remove_file(&path).await;
+            } else {
+                // Active partial download: reserve its size in total_bytes, never evict it.
+                total_bytes = total_bytes.saturating_add(meta.len());
             }
+            continue;
+        }
+        if modified < cutoff {
+            let _ = tokio::fs::remove_file(&path).await;
+            continue;
+        }
+        let len = meta.len();
+        total_bytes = total_bytes.saturating_add(len);
+        kept.push((path, len, modified));
+    }
+
+    if total_bytes <= max_bytes {
+        return;
+    }
+
+    // Evict oldest-modified files first (LRU).
+    kept.sort_by_key(|(_, _, modified)| *modified);
+    for (path, len, _) in kept {
+        if total_bytes <= max_bytes {
+            break;
+        }
+        if tokio::fs::remove_file(&path).await.is_ok() {
+            total_bytes = total_bytes.saturating_sub(len);
         }
     }
 }
@@ -882,5 +953,84 @@ mod tests {
             resolved,
             ResolvedPreviewTarget::ContentUri("content://media/external/downloads/42".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn enforce_preview_cache_limit_evicts_oldest_files_first() {
+        let dir = std::env::temp_dir().join(format!("landa-preview-lru-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let oldest = dir.join("oldest.bin");
+        let middle = dir.join("middle.bin");
+        let newest = dir.join("newest.bin");
+
+        let now = SystemTime::now();
+        std::fs::write(&oldest, vec![1u8; 40]).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&oldest)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(300))
+            .unwrap();
+
+        std::fs::write(&middle, vec![2u8; 40]).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&middle)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(200))
+            .unwrap();
+
+        std::fs::write(&newest, vec![3u8; 40]).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&newest)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(100))
+            .unwrap();
+
+        enforce_preview_cache_limit(&dir, 80).await;
+
+        assert!(!oldest.exists(), "oldest file must be evicted first");
+        assert!(middle.exists(), "middle file should remain within 80B limit");
+        assert!(newest.exists(), "newest file should remain within 80B limit");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn enforce_preview_cache_limit_preserves_active_part_and_counts_its_size() {
+        let dir = std::env::temp_dir().join(format!("landa-preview-part-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let completed_old = dir.join("completed_old.bin");
+        let active_part = dir.join(".preview-part-active");
+
+        let now = SystemTime::now();
+        std::fs::write(&completed_old, vec![1u8; 50]).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&completed_old)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(120))
+            .unwrap();
+
+        // Active part is newer than 1h and 60 bytes; total = 110 > 80.
+        // Even if active_part were older than completed_old, it must not be evicted,
+        // and its 60 bytes must force completed_old (50 bytes) to be evicted.
+        std::fs::write(&active_part, vec![2u8; 60]).unwrap();
+
+        enforce_preview_cache_limit(&dir, 80).await;
+
+        assert!(
+            active_part.exists(),
+            "active .preview-part- file must never be evicted"
+        );
+        assert!(
+            !completed_old.exists(),
+            "completed file must be evicted to reserve space for active .preview-part-"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

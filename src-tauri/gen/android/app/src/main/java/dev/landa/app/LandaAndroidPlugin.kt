@@ -7,6 +7,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.ContentUris
 import android.content.ContentValues
@@ -171,6 +172,13 @@ class WriteClipboardTextArgs {
 @InvokeArg
 class WriteClipboardImageArgs {
     lateinit var imagePath: String
+}
+
+@InvokeArg
+class ClipboardReceivedNotifArgs {
+    lateinit var peerName: String
+    var isImage: Boolean = false
+    var lang: String = "ru"
 }
 
 @TauriPlugin
@@ -809,6 +817,60 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun showClipboardReceivedNotification(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(ClipboardReceivedNotifArgs::class.java)
+            ClipboardNotificationPoster.post(
+                appInForeground = appInForeground,
+                canPostNotifications = canPostNotifications(),
+                postNotification = {
+                    ensureNotificationChannels()
+                    val nm = activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    val id = 50000 + (args.peerName.hashCode() and 0x7FFF)
+
+                    val tapIntent = Intent(activity, MainActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        putExtra("landa_focus_target", "clipboard")
+                    }
+                    val pendingIntent = PendingIntent.getActivity(
+                        activity,
+                        id,
+                        tapIntent,
+                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                    )
+
+                    val contentText = if (args.isImage) {
+                        if (args.lang == "en") "Clipboard image received" else "Получено изображение в буфер"
+                    } else {
+                        if (args.lang == "en") "Clipboard text received" else "Получен текст в буфер"
+                    }
+
+                    val builder = NotificationCompat.Builder(activity, CHANNEL_DONE)
+                        .setSmallIcon(android.R.drawable.stat_notify_chat)
+                        .setContentTitle("Landa · ${args.peerName}")
+                        .setContentText(contentText)
+                        .setAutoCancel(true)
+                        .setContentIntent(pendingIntent)
+                        .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+
+                    nm.notify(id, builder.build())
+                },
+                onSuccess = { shown ->
+                    val res = JSObject()
+                    res.put("shown", shown)
+                    invoke.resolve(res)
+                },
+                onFailure = { err ->
+                    invoke.reject(err)
+                },
+            )
+        } catch (ex: Exception) {
+            val detail = ex.message?.takeIf { it.isNotBlank() } ?: ex.javaClass.simpleName
+            invoke.reject("Failed to show clipboard notification: $detail")
+        }
+    }
+
+    @Command
     fun takePendingFocusTarget(invoke: Invoke) {
         val focus: JSObject?
         synchronized(lock) {
@@ -864,33 +926,48 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun readSystemClipboard(invoke: Invoke) {
-        activity.runOnUiThread {
+        fun performRead() {
             try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !activity.hasWindowFocus()) {
+                    invoke.reject("Clipboard access requires window focus on Android 10+")
+                    return
+                }
+
                 val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                 val clip = cm?.primaryClip
                 if (clip == null || clip.itemCount == 0) {
                     val res = JSObject()
                     res.put("kind", "empty")
                     invoke.resolve(res)
-                    return@runOnUiThread
+                    return
                 }
 
-                val item = clip.getItemAt(0)
-                val uri = item.uri
-                val mime = uri?.let { activity.contentResolver.getType(it) }
-                val isImage = uri != null && (
-                    mime?.startsWith("image/") == true ||
-                        clip.description.hasMimeType("image/*")
-                    )
+                val hasImageMime = clip.description?.hasMimeType("image/*") == true
+                val itemMimes = (0 until clip.itemCount).map { i ->
+                    val uri = clip.getItemAt(i).uri
+                    if (uri == null) {
+                        false to null
+                    } else {
+                        true to activity.contentResolver.getType(uri)
+                    }
+                }
+                val imageIndex = ClipboardClipSelector.selectImageItemIndex(itemMimes, hasImageMime)
+                val imageUri = imageIndex?.let { clip.getItemAt(it).uri }
 
-                if (isImage && uri != null) {
+                if (imageUri != null) {
                     Thread {
+                        val tmpDir = File(activity.cacheDir, "clipboard_tmp").apply { mkdirs() }
+                        val tmpFile = File(tmpDir, "${UUID.randomUUID()}.img")
                         try {
-                            val tmpDir = File(activity.cacheDir, "clipboard_tmp").apply { mkdirs() }
-                            val tmpFile = File(tmpDir, "${UUID.randomUUID()}.img")
                             val maxBytes = 10L * 1024L * 1024L
                             var total = 0L
-                            activity.contentResolver.openInputStream(uri)?.use { input ->
+                            val stream = activity.contentResolver.openInputStream(imageUri)
+                            if (stream == null) {
+                                tmpFile.delete()
+                                invoke.reject("Unable to read clipboard image URI")
+                                return@Thread
+                            }
+                            stream.use { input ->
                                 FileOutputStream(tmpFile).use { out ->
                                     val buf = ByteArray(64 * 1024)
                                     while (true) {
@@ -905,35 +982,49 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                                         out.write(buf, 0, n)
                                     }
                                 }
-                            } ?: run {
-                                invoke.reject("Unable to read clipboard image URI")
-                                return@Thread
                             }
                             val res = JSObject()
                             res.put("kind", "image")
                             res.put("tempPath", tmpFile.absolutePath)
                             invoke.resolve(res)
                         } catch (ex: Exception) {
+                            tmpFile.delete()
                             invoke.reject(ex.message ?: "Failed to read clipboard image")
                         }
                     }.start()
-                    return@runOnUiThread
+                    return
                 }
 
-                val text = item.coerceToText(activity)?.toString()
-                if (!text.isNullOrBlank()) {
-                    val res = JSObject()
-                    res.put("kind", "text")
-                    res.put("text", text)
-                    invoke.resolve(res)
-                } else {
-                    val res = JSObject()
-                    res.put("kind", "empty")
-                    invoke.resolve(res)
+                for (i in 0 until clip.itemCount) {
+                    val text = clip.getItemAt(i).coerceToText(activity)?.toString()
+                    if (!text.isNullOrBlank()) {
+                        val res = JSObject()
+                        res.put("kind", "text")
+                        res.put("text", text)
+                        invoke.resolve(res)
+                        return
+                    }
                 }
+
+                val res = JSObject()
+                res.put("kind", "empty")
+                invoke.resolve(res)
             } catch (ex: Exception) {
                 invoke.reject(ex.message ?: "Failed to read system clipboard")
             }
+        }
+
+        activity.runOnUiThread {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !activity.hasWindowFocus()) {
+                val decor = activity.window?.decorView
+                if (appInForeground && decor != null) {
+                    decor.postDelayed({ performRead() }, 80L)
+                } else {
+                    invoke.reject("Clipboard access requires window focus on Android 10+")
+                }
+                return@runOnUiThread
+            }
+            performRead()
         }
     }
 
@@ -943,6 +1034,13 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             val args = invoke.parseArgs(WriteClipboardTextArgs::class.java)
             activity.runOnUiThread {
                 try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                        !appInForeground &&
+                        !activity.hasWindowFocus()
+                    ) {
+                        invoke.reject("Clipboard write requires foreground focus on Android 10+")
+                        return@runOnUiThread
+                    }
                     val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                     if (cm == null) {
                         invoke.reject("ClipboardManager unavailable")
@@ -961,6 +1059,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun writeSystemClipboardImage(invoke: Invoke) {
+        var target: File? = null
         try {
             val args = invoke.parseArgs(WriteClipboardImageArgs::class.java)
             val source = File(args.imagePath).canonicalFile
@@ -983,9 +1082,13 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                 }
             }
 
-            val target = File(shareDir, "landa_${UUID.randomUUID().toString().take(8)}.png")
+            val ext = source.extension.lowercase().takeIf {
+                it in setOf("png", "jpg", "jpeg", "webp", "gif")
+            } ?: "png"
+            val stagedFile = File(shareDir, "landa_${UUID.randomUUID().toString().take(8)}.$ext")
+            target = stagedFile
             FileInputStream(source).use { input ->
-                FileOutputStream(target).use { out ->
+                FileOutputStream(stagedFile).use { out ->
                     input.copyTo(out, 64 * 1024)
                 }
             }
@@ -993,23 +1096,52 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             val uri = FileProvider.getUriForFile(
                 activity,
                 "${activity.packageName}.fileprovider",
-                target
+                stagedFile
             )
 
             activity.runOnUiThread {
                 try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                        !appInForeground &&
+                        !activity.hasWindowFocus()
+                    ) {
+                        stagedFile.delete()
+                        invoke.reject("Clipboard write requires foreground focus on Android 10+")
+                        return@runOnUiThread
+                    }
                     val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                     if (cm == null) {
+                        stagedFile.delete()
                         invoke.reject("ClipboardManager unavailable")
                         return@runOnUiThread
                     }
-                    cm.setPrimaryClip(ClipData.newUri(activity.contentResolver, "Landa Image", uri))
+                    // ClipboardManager.setPrimaryClip grants FLAG_GRANT_READ_URI_PERMISSION to readers
+                    // for the lifetime of the clipboard entry when given a FileProvider content:// URI.
+                    val clip = ClipData.newUri(activity.contentResolver, "Landa Image", uri).let { base ->
+                        if (base.description.mimeTypeCount > 0) {
+                            base
+                        } else {
+                            val fallbackMime = if (ext == "jpg") "image/jpeg" else "image/$ext"
+                            ClipData(
+                                ClipDescription("Landa Image", arrayOf(fallbackMime)),
+                                ClipData.Item(uri)
+                            )
+                        }
+                    }
+                    cm.setPrimaryClip(clip)
+                } catch (ex: Exception) {
+                    stagedFile.delete()
+                    invoke.reject(ex.message ?: "Failed to write clipboard image")
+                    return@runOnUiThread
+                }
+                try {
                     invoke.resolve()
                 } catch (ex: Exception) {
-                    invoke.reject(ex.message ?: "Failed to write clipboard image")
+                    android.util.Log.w("LandaAndroidPlugin", "Failed to resolve writeSystemClipboardImage", ex)
                 }
             }
         } catch (ex: Exception) {
+            target?.delete()
             invoke.reject(ex.message ?: "Failed to copy image to clipboard")
         }
     }
@@ -1020,6 +1152,21 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         synchronized(lock) {
             paths = pendingSharedPaths.toList()
             pendingSharedPaths.clear()
+        }
+        val arr = JSArray()
+        for (p in paths) {
+            arr.put(p)
+        }
+        val res = JSObject()
+        res.put("paths", arr)
+        invoke.resolve(res)
+    }
+
+    @Command
+    fun peekPendingSharedFiles(invoke: Invoke) {
+        val paths: List<String>
+        synchronized(lock) {
+            paths = pendingSharedPaths.toList()
         }
         val arr = JSArray()
         for (p in paths) {
@@ -1670,12 +1817,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
 
                 while (cursor.moveToNext() && rows.size < 5000) {
                     val rawName = if (nameIdx >= 0) cursor.getString(nameIdx) else null
-                    val name = rawName?.trim().orEmpty()
-                    if (name.isEmpty() || name == "." || name == ".." ||
-                        name.contains('/') || name.contains('\\') || name.contains('\u0000')
-                    ) {
-                        continue
-                    }
+                    val name = SafShareHelper.normalizeSafDisplayName(rawName) ?: continue
                     val flags = if (flagsIdx >= 0 && !cursor.isNull(flagsIdx)) cursor.getInt(flagsIdx) else 0
                     if ((flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) != 0) {
                         continue
@@ -1733,121 +1875,132 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             val maxDepth = args.maxDepth.coerceIn(1, MAX_FOLDER_DEPTH)
             val maxFiles = args.maxFiles.coerceIn(1, MAX_FOLDER_FILES)
 
-            val startDocId = resolveSafTreeDocId(rootUri, segments, expectDir = true)
-            val startPrefix = segments.joinToString("/")
+            Thread {
+                try {
+                    val startDocId = resolveSafTreeDocId(rootUri, segments, expectDir = true)
+                    val startPrefix = segments.joinToString("/")
 
-            val projection = arrayOf(
-                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                DocumentsContract.Document.COLUMN_MIME_TYPE,
-                DocumentsContract.Document.COLUMN_SIZE,
-                DocumentsContract.Document.COLUMN_LAST_MODIFIED,
-                DocumentsContract.Document.COLUMN_FLAGS
-            )
+                    val projection = arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE,
+                        DocumentsContract.Document.COLUMN_SIZE,
+                        DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+                        DocumentsContract.Document.COLUMN_FLAGS
+                    )
 
-            data class TreeRow(
-                val name: String,
-                val relPath: String,
-                val isDir: Boolean,
-                val sizeBytes: Long,
-                val modifiedMs: Long
-            )
+                    data class TreeRow(
+                        val name: String,
+                        val relPath: String,
+                        val isDir: Boolean,
+                        val sizeBytes: Long,
+                        val modifiedMs: Long
+                    )
 
-            val rows = mutableListOf<TreeRow>()
-            val seenRelPaths = HashSet<String>()
-            var dirCount = 0
-            var fileCount = 0
-            val stack = ArrayDeque<Triple<String, String, Int>>()
-            stack.addLast(Triple(startDocId, startPrefix, 0))
+                    val rows = mutableListOf<TreeRow>()
+                    val seenRelPaths = HashSet<String>()
+                    var dirCount = 0
+                    var fileCount = 0
+                    val stack = ArrayDeque<Triple<String, String, Int>>()
+                    stack.addLast(Triple(startDocId, startPrefix, 0))
 
-            while (stack.isNotEmpty()) {
-                val (docId, prefix, depth) = stack.removeLast()
-                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(rootUri, docId)
-                activity.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
-                    val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                    val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                    val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                    val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
-                    val modIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
-                    val flagsIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
+                    while (stack.isNotEmpty()) {
+                        val (docId, prefix, depth) = stack.removeLast()
+                        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(rootUri, docId)
+                        activity.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                            val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                            val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                            val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                            val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                            val modIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                            val flagsIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
 
-                    while (cursor.moveToNext()) {
-                        if (idIdx < 0) continue
-                        val childDocId = cursor.getString(idIdx) ?: continue
-                        val rawName = if (nameIdx >= 0) cursor.getString(nameIdx) else null
-                        val name = rawName?.trim().orEmpty()
-                        if (name.isEmpty() || name == "." || name == ".." ||
-                            name.contains('/') || name.contains('\\') || name.contains('\u0000')
-                        ) {
-                            continue
-                        }
-                        val flags = if (flagsIdx >= 0 && !cursor.isNull(flagsIdx)) cursor.getInt(flagsIdx) else 0
-                        if ((flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) != 0) {
-                            continue
-                        }
-                        val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else null
-                        val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
-                        val nextRel = if (prefix.isEmpty()) name else "$prefix/$name"
-                        if (!seenRelPaths.add(nextRel)) {
-                            invoke.reject("duplicate path in shared folder")
-                            return
-                        }
-                        val modifiedMs = if (modIdx >= 0 && !cursor.isNull(modIdx)) {
-                            cursor.getLong(modIdx).coerceAtLeast(0L)
-                        } else {
-                            0L
-                        }
+                            while (cursor.moveToNext()) {
+                                if (idIdx < 0) continue
+                                val childDocId = cursor.getString(idIdx) ?: continue
+                                val rawName = if (nameIdx >= 0) cursor.getString(nameIdx) else null
+                                val name = SafShareHelper.normalizeSafDisplayName(rawName) ?: continue
+                                val flags = if (flagsIdx >= 0 && !cursor.isNull(flagsIdx)) cursor.getInt(flagsIdx) else 0
+                                if ((flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) != 0) {
+                                    continue
+                                }
+                                val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else null
+                                val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
+                                val nextRel = if (prefix.isEmpty()) name else "$prefix/$name"
+                                if (!seenRelPaths.add(nextRel)) {
+                                    invoke.reject("duplicate path in shared folder")
+                                    return@Thread
+                                }
+                                val modifiedMs = if (modIdx >= 0 && !cursor.isNull(modIdx)) {
+                                    cursor.getLong(modIdx).coerceAtLeast(0L)
+                                } else {
+                                    0L
+                                }
 
-                        if (isDir) {
-                            if (depth >= maxDepth) {
-                                invoke.reject("folder exceeds maximum depth ($maxDepth)")
-                                return
+                                if (isDir) {
+                                    if (depth >= maxDepth) {
+                                        invoke.reject("folder exceeds maximum depth ($maxDepth)")
+                                        return@Thread
+                                    }
+                                    if (dirCount >= maxFiles) {
+                                        invoke.reject("folder exceeds maximum directory count ($maxFiles)")
+                                        return@Thread
+                                    }
+                                    dirCount++
+                                    rows.add(TreeRow(name, nextRel, true, 0L, modifiedMs))
+                                    stack.addLast(Triple(childDocId, nextRel, depth + 1))
+                                } else {
+                                    if (fileCount >= maxFiles) {
+                                        invoke.reject("folder exceeds maximum file count ($maxFiles)")
+                                        return@Thread
+                                    }
+                                    val cursorSize = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                                        cursor.getLong(sizeIdx)
+                                    } else {
+                                        null
+                                    }
+                                    val docUri by lazy(LazyThreadSafetyMode.NONE) {
+                                        DocumentsContract.buildDocumentUriUsingTree(rootUri, childDocId)
+                                    }
+                                    val sizeBytes = SafShareHelper.resolveSafFileSize(
+                                        fileName = name,
+                                        cursorSize = cursorSize,
+                                        statSizeProvider = {
+                                            runCatching {
+                                                activity.contentResolver.openFileDescriptor(docUri, "r")?.use { it.statSize } ?: -1L
+                                            }.getOrDefault(-1L)
+                                        },
+                                        streamByteCounter = {
+                                            runCatching {
+                                                activity.contentResolver.openInputStream(docUri)?.use { SafShareHelper.countStreamBytes(it) }
+                                            }.getOrNull()
+                                        }
+                                    )
+                                    fileCount++
+                                    rows.add(TreeRow(name, nextRel, false, sizeBytes, modifiedMs))
+                                }
                             }
-                            if (dirCount >= maxFiles) {
-                                invoke.reject("folder exceeds maximum directory count ($maxFiles)")
-                                return
-                            }
-                            dirCount++
-                            rows.add(TreeRow(name, nextRel, true, 0L, modifiedMs))
-                            stack.addLast(Triple(childDocId, nextRel, depth + 1))
-                        } else {
-                            if (fileCount >= maxFiles) {
-                                invoke.reject("folder exceeds maximum file count ($maxFiles)")
-                                return
-                            }
-                            var sizeBytes = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
-                                cursor.getLong(sizeIdx)
-                            } else {
-                                -1L
-                            }
-                            if (sizeBytes < 0L) {
-                                val docUri = DocumentsContract.buildDocumentUriUsingTree(rootUri, childDocId)
-                                sizeBytes = runCatching {
-                                    activity.contentResolver.openFileDescriptor(docUri, "r")?.use { it.statSize } ?: -1L
-                                }.getOrDefault(-1L)
-                            }
-                            if (sizeBytes < 0L) continue
-                            fileCount++
-                            rows.add(TreeRow(name, nextRel, false, sizeBytes, modifiedMs))
                         }
                     }
-                }
-            }
 
-            rows.sortBy { it.relPath }
-            val arr = JSArray()
-            for (row in rows) {
-                val obj = JSObject()
-                obj.put("name", row.name)
-                obj.put("relPath", row.relPath)
-                obj.put("isDir", row.isDir)
-                obj.put("sizeBytes", row.sizeBytes)
-                obj.put("modifiedMs", row.modifiedMs)
-                arr.put(obj)
-            }
-            val res = JSObject()
-            res.put("entries", arr)
-            invoke.resolve(res)
+                    rows.sortBy { it.relPath }
+                    val arr = JSArray()
+                    for (row in rows) {
+                        val obj = JSObject()
+                        obj.put("name", row.name)
+                        obj.put("relPath", row.relPath)
+                        obj.put("isDir", row.isDir)
+                        obj.put("sizeBytes", row.sizeBytes)
+                        obj.put("modifiedMs", row.modifiedMs)
+                        arr.put(obj)
+                    }
+                    val res = JSObject()
+                    res.put("entries", arr)
+                    invoke.resolve(res)
+                } catch (ex: Exception) {
+                    invoke.reject(ex.message ?: "Failed to traverse shared folder")
+                }
+            }.start()
         } catch (ex: Exception) {
             invoke.reject(ex.message ?: "Failed to traverse shared folder")
         }
@@ -1886,8 +2039,24 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                 return
             }
             val statSize = runCatching { pfd.statSize }.getOrDefault(-1L)
-            val sizeBytes = if (meta.sizeBytes > 0L) meta.sizeBytes else statSize.coerceAtLeast(0L)
-            val fd = pfd.detachFd()
+            val (finalPfd, sizeBytes) = if (statSize > 0L) {
+                pfd to statSize
+            } else {
+                val tempFile = File.createTempFile("saf_share_", ".bin", activity.cacheDir)
+                try {
+                    val copiedBytes = ParcelFileDescriptor.AutoCloseInputStream(pfd).use { input ->
+                        SafShareHelper.copyStreamToTempFile(input, tempFile)
+                    }
+                    val tempPfd = ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                    tempFile.delete()
+                    tempPfd to copiedBytes
+                } catch (ex: Exception) {
+                    tempFile.delete()
+                    runCatching { pfd.close() }
+                    throw ex
+                }
+            }
+            val fd = finalPfd.detachFd()
 
             val res = JSObject()
             res.put("fd", fd)
@@ -1906,22 +2075,8 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         val modifiedMs: Long
     )
 
-    private fun parseSafeRelSegments(relPath: String): List<String> {
-        val trimmed = relPath.trim()
-        if (trimmed.isEmpty() || trimmed == "." || trimmed == "/") {
-            return emptyList()
-        }
-        if (trimmed.contains('\\') || trimmed.contains('\u0000')) {
-            throw IllegalArgumentException("Invalid relative path")
-        }
-        val parts = trimmed.split('/').filter { it.isNotEmpty() }
-        for (part in parts) {
-            if (part == "." || part == "..") {
-                throw IllegalArgumentException("Path traversal is not allowed")
-            }
-        }
-        return parts
-    }
+    private fun parseSafeRelSegments(relPath: String): List<String> =
+        SafShareHelper.parseSafeRelSegments(relPath)
 
     private fun resolveSafTreeDocId(
         treeUri: Uri,
@@ -1954,7 +2109,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                     if ((flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) != 0) {
                         continue
                     }
-                    val name = cursor.getString(nameIdx)?.trim() ?: continue
+                    val name = SafShareHelper.normalizeSafDisplayName(cursor.getString(nameIdx)) ?: continue
                     if (name == seg) {
                         matchedDocId = cursor.getString(idIdx)
                         val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else null
@@ -2555,11 +2710,12 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         for (uri in uris) {
             copyUriToCache(uri, shareDir)?.let { copied.add(it) }
         }
+        val existingCopied = ShareCacheQuota.filterExistingPaths(copied)
 
         intent.action = null
-        if (copied.isNotEmpty()) {
+        if (existingCopied.isNotEmpty()) {
             synchronized(lock) {
-                pendingSharedPaths.addAll(copied)
+                pendingSharedPaths.addAll(existingCopied)
             }
             dispatchWebEvent("landa-share-intent")
         }
@@ -2567,50 +2723,70 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun copyUriToCache(uri: Uri, shareDir: File): String? {
         return try {
-            val rawName = queryDisplayName(uri) ?: "shared_${UUID.randomUUID().toString().take(8)}"
-            val safeName = rawName.replace(Regex("[^A-Za-z0-9._-]"), "_").take(100)
+            val (rawName, knownSize) = queryDisplayNameAndSize(uri)
+            val baseName = rawName ?: "shared_${UUID.randomUUID().toString().take(8)}"
+            val safeName = baseName.replace(Regex("[^A-Za-z0-9._-]"), "_").take(100)
                 .ifEmpty { "shared_file" }
-            val target = File(shareDir, "${UUID.randomUUID().toString().take(8)}_$safeName")
+            val targetName = "${UUID.randomUUID().toString().take(8)}_$safeName"
             activity.contentResolver.openInputStream(uri)?.use { input ->
-                FileOutputStream(target).use { out ->
-                    input.copyTo(out, 64 * 1024)
-                }
-            } ?: return null
-            target.absolutePath
+                ShareCacheQuota.copyStreamWithQuota(
+                    input = input,
+                    shareDir = shareDir,
+                    targetName = targetName,
+                    maxBytes = ShareCacheQuota.MAX_SHARE_INTENT_CACHE_BYTES,
+                    knownSizeBytes = knownSize
+                )?.absolutePath
+            }
         } catch (_: Exception) {
             null
         }
     }
 
-    private fun queryDisplayName(uri: Uri): String? {
+    private fun queryDisplayName(uri: Uri): String? = queryDisplayNameAndSize(uri).first
+
+    private fun queryDisplayNameAndSize(uri: Uri): Pair<String?, Long?> {
         return try {
             activity.contentResolver.query(
                 uri,
-                arrayOf(OpenableColumns.DISPLAY_NAME),
+                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
                 null,
                 null,
                 null
             )?.use { cursor ->
                 if (cursor.moveToFirst()) {
-                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (idx >= 0) cursor.getString(idx) else null
-                } else null
-            }
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    val name = if (nameIdx >= 0) cursor.getString(nameIdx) else null
+                    val size = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else null
+                    name to size
+                } else null to null
+            } ?: (null to null)
         } catch (_: Exception) {
-            null
+            null to null
         }
     }
 
     private fun sweepOldShareCache() {
         try {
+            val now = System.currentTimeMillis()
+            val safCutoff = now - 60L * 60L * 1000L
+            activity.cacheDir.listFiles()?.forEach { file ->
+                if (file.isFile && file.name.startsWith("saf_share_") && file.name.endsWith(".bin") &&
+                    file.lastModified() < safCutoff
+                ) {
+                    file.delete()
+                }
+            }
+
             val shareDir = File(activity.cacheDir, "share_intent")
             if (!shareDir.exists()) return
-            val cutoff = System.currentTimeMillis() - 24L * 60L * 60L * 1000L
+            val cutoff = now - 24L * 60L * 60L * 1000L
             shareDir.listFiles()?.forEach { file ->
                 if (file.isFile && file.lastModified() < cutoff) {
                     file.delete()
                 }
             }
+            ShareCacheQuota.enforceLimit(shareDir, ShareCacheQuota.MAX_SHARE_INTENT_CACHE_BYTES)
         } catch (_: Exception) {
         }
     }

@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use landa_proto::path_policy::validate_relative_path;
@@ -252,6 +253,7 @@ pub async fn download_and_verify_update(
     }
 
     let part_path = updates_dir.join(format!("{safe_name}.part"));
+    let _active_guard = ActiveUpdateGuard::new(vec![part_path.clone(), target_path.clone()]);
     let _ = tokio::fs::remove_file(&part_path).await;
 
     emit_progress(app, "downloading", 0, asset.size, None, None);
@@ -479,7 +481,17 @@ pub async fn install_update(app: &AppHandle, file_path: &str) -> Result<(), Stri
         if let Some(bridge) = app.try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>() {
             bridge
                 .install_apk_update_async(&canonical_file.to_string_lossy())
-                .await
+                .await?;
+            register_launched_update_path(&canonical_file);
+            // Only remove APKs whose version is already <= current_version; never touch
+            // active .part downloads, non-APK files, newer APKs, or the just-launched APK.
+            cleanup_updates_dir_apks_only(
+                &updates_dir,
+                env!("CARGO_PKG_VERSION"),
+                Some(&canonical_file),
+            )
+            .await;
+            Ok(())
         } else {
             Err("Android bridge unavailable".into())
         }
@@ -495,13 +507,141 @@ pub async fn install_update(app: &AppHandle, file_path: &str) -> Result<(), Stri
     }
 }
 
-fn resolve_updates_dir(app: &AppHandle) -> Result<PathBuf, String> {
+static ACTIVE_UPDATE_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn active_update_set() -> &'static Mutex<HashSet<PathBuf>> {
+    ACTIVE_UPDATE_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct ActiveUpdateGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl ActiveUpdateGuard {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        let mut set = active_update_set().lock().expect("active_update_set poisoned");
+        for p in &paths {
+            set.insert(p.clone());
+        }
+        Self { paths }
+    }
+}
+
+impl Drop for ActiveUpdateGuard {
+    fn drop(&mut self) {
+        let mut set = active_update_set().lock().expect("active_update_set poisoned");
+        for p in &self.paths {
+            set.remove(p);
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn register_launched_update_path(path: &Path) {
+    let mut set = active_update_set().lock().expect("active_update_set poisoned");
+    set.insert(path.to_path_buf());
+}
+
+pub fn active_update_paths_snapshot() -> HashSet<PathBuf> {
+    active_update_set()
+        .lock()
+        .expect("active_update_set poisoned")
+        .clone()
+}
+
+pub fn resolve_updates_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .path()
         .app_cache_dir()
         .or_else(|_| app.path().app_data_dir())
         .map_err(|e| format!("Failed to resolve cache directory: {e}"))?;
     Ok(base.join("updates"))
+}
+
+pub async fn cleanup_updates_cache(app: &AppHandle) {
+    let Ok(dir) = resolve_updates_dir(app) else {
+        return;
+    };
+    cleanup_updates_dir(&dir, env!("CARGO_PKG_VERSION")).await;
+}
+
+pub async fn cleanup_updates_dir(updates_dir: &Path, current_version: &str) {
+    cleanup_updates_dir_inner(updates_dir, current_version, true, None).await;
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+async fn cleanup_updates_dir_apks_only(
+    updates_dir: &Path,
+    current_version: &str,
+    exclude_path: Option<&Path>,
+) {
+    cleanup_updates_dir_inner(updates_dir, current_version, false, exclude_path).await;
+}
+
+async fn cleanup_updates_dir_inner(
+    updates_dir: &Path,
+    current_version: &str,
+    remove_parts: bool,
+    exclude_path: Option<&Path>,
+) {
+    if !updates_dir.exists() {
+        return;
+    }
+    let exclude_canon = exclude_path.and_then(|p| p.canonicalize().ok());
+    let current_semver = parse_semver(current_version);
+    let Ok(mut entries) = tokio::fs::read_dir(updates_dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if let Some(ex) = exclude_path {
+            if path == ex {
+                continue;
+            }
+        }
+        if let Some(ref ex_c) = exclude_canon {
+            if path.canonicalize().ok().as_ref() == Some(ex_c) {
+                continue;
+            }
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".part") {
+            if remove_parts {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+            continue;
+        }
+        let is_apk = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("apk"));
+        if !is_apk {
+            continue;
+        }
+        if let (Some(cur), Some(file_ver)) = (current_semver, extract_version_from_filename(name)) {
+            if cur >= file_ver {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+    }
+}
+
+fn extract_version_from_filename(name: &str) -> Option<(u64, u64, u64)> {
+    let stem = Path::new(name).file_stem()?.to_str()?;
+    for token in stem.split(['-', '_']) {
+        if let Some(ver) = parse_semver(token) {
+            return Some(ver);
+        }
+    }
+    None
 }
 
 fn emit_progress(
@@ -723,6 +863,73 @@ mod tests {
         assert!(
             resolve_verified_update_file(&updates_dir, &updates_dir.to_string_lossy()).is_err()
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn cleanup_updates_dir_removes_installed_and_older_apks_and_parts() {
+        let base = std::env::temp_dir().join(format!(
+            "landa-updater-clean-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let updates_dir = base.join("updates");
+        std::fs::create_dir_all(&updates_dir).unwrap();
+
+        let older_apk = updates_dir.join("landa-v0.4.9-android-arm64-v8a.apk");
+        let same_apk = updates_dir.join("landa-v0.5.0-android-arm64-v8a.apk");
+        let newer_apk = updates_dir.join("landa-v0.5.1-android-arm64-v8a.apk");
+        let part_file = updates_dir.join("landa-v0.5.1-android-arm64-v8a.apk.part");
+
+        std::fs::write(&older_apk, b"old").unwrap();
+        std::fs::write(&same_apk, b"same").unwrap();
+        std::fs::write(&newer_apk, b"new").unwrap();
+        std::fs::write(&part_file, b"part").unwrap();
+
+        cleanup_updates_dir(&updates_dir, "0.5.0").await;
+
+        assert!(!older_apk.exists(), "older APK must be removed");
+        assert!(!same_apk.exists(), "already-installed APK must be removed");
+        assert!(!part_file.exists(), "incomplete .part file must be removed");
+        assert!(newer_apk.exists(), "newer pending APK must be kept");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn cleanup_updates_dir_apks_only_preserves_non_apk_and_excluded_apk() {
+        let base = std::env::temp_dir().join(format!(
+            "landa-updater-apks-only-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let updates_dir = base.join("updates");
+        std::fs::create_dir_all(&updates_dir).unwrap();
+
+        let older_apk = updates_dir.join("landa-v0.4.9-android-arm64-v8a.apk");
+        let launched_apk = updates_dir.join("landa-v0.5.0-android-arm64-v8a.apk");
+        let non_apk_with_ver = updates_dir.join("landa-v0.4.9-release-notes.txt");
+        let active_part = updates_dir.join("landa-v0.5.1-android-arm64-v8a.apk.part");
+
+        std::fs::write(&older_apk, b"old").unwrap();
+        std::fs::write(&launched_apk, b"launched").unwrap();
+        std::fs::write(&non_apk_with_ver, b"notes").unwrap();
+        std::fs::write(&active_part, b"part").unwrap();
+
+        cleanup_updates_dir_apks_only(&updates_dir, "0.5.0", Some(&launched_apk)).await;
+
+        assert!(!older_apk.exists(), "older APK must be removed");
+        assert!(launched_apk.exists(), "excluded launched APK must be preserved");
+        assert!(
+            non_apk_with_ver.exists(),
+            "non-APK file with version in name must be preserved"
+        );
+        assert!(active_part.exists(), "active .part file must be preserved");
 
         let _ = std::fs::remove_dir_all(&base);
     }

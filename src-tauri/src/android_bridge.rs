@@ -250,6 +250,21 @@ struct CancelFriendRequestNotifArgs {
     peer_id: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardReceivedNotifArgs {
+    peer_name: String,
+    is_image: bool,
+    lang: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardNotificationResponse {
+    #[serde(default)]
+    shown: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemClipboardReadResponse {
@@ -475,6 +490,26 @@ impl<R: Runtime> AndroidBridge<R> {
             .await;
     }
 
+    pub async fn show_clipboard_received_notification_async(
+        &self,
+        peer_name: &str,
+        is_image: bool,
+        lang: &str,
+    ) -> Result<bool, String> {
+        self.handle
+            .run_mobile_plugin_async::<ClipboardNotificationResponse>(
+                "showClipboardReceivedNotification",
+                ClipboardReceivedNotifArgs {
+                    peer_name: peer_name.to_string(),
+                    is_image,
+                    lang: lang.to_string(),
+                },
+            )
+            .await
+            .map(|r| r.shown)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn take_pending_focus_target(&self) -> Result<Option<PendingFocusTarget>, String> {
         self.handle
             .run_mobile_plugin::<PendingFocusResponse>("takePendingFocusTarget", ())
@@ -560,6 +595,13 @@ impl<R: Runtime> AndroidBridge<R> {
     pub fn take_pending_shared_files(&self) -> Result<Vec<String>, String> {
         self.handle
             .run_mobile_plugin::<SharedFilesResponse>("takePendingSharedFiles", ())
+            .map(|r| r.paths)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn peek_pending_shared_files(&self) -> Result<Vec<String>, String> {
+        self.handle
+            .run_mobile_plugin::<SharedFilesResponse>("peekPendingSharedFiles", ())
             .map(|r| r.paths)
             .map_err(|e| e.to_string())
     }

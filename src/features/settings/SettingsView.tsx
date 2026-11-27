@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Copy, FileText, FolderOpen, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { api } from "../../core/api";
+import { api, formatBytes } from "../../core/api";
 import type {
   AppSettings,
   LanInterfaceInfo,
@@ -40,6 +40,9 @@ export function SettingsView({
   const [targets, setTargets] = useState<ManualTarget[]>([]);
   const [lanInterfaces, setLanInterfaces] = useState<LanInterfaceInfo[]>([]);
   const [newIp, setNewIp] = useState("");
+  const [cacheSize, setCacheSize] = useState<number | null>(null);
+  const [clearingCache, setClearingCache] = useState(false);
+  const isAndroid = navigator.userAgent.toLowerCase().includes("android");
 
   useEffect(() => {
     setDraft(settings);
@@ -61,9 +64,18 @@ export function SettingsView({
     }
   };
 
+  const loadCacheSize = async () => {
+    try {
+      setCacheSize(await api.getCacheSize());
+    } catch (e) {
+      onError(String(e));
+    }
+  };
+
   useEffect(() => {
     loadTargets();
     loadLanInterfaces();
+    loadCacheSize();
   }, []);
 
   const save = async (next: AppSettings, notify = false) => {
@@ -145,6 +157,27 @@ export function SettingsView({
     }
   };
 
+  const handleClearCache = async () => {
+    setClearingCache(true);
+    try {
+      const res = await api.clearCache();
+      setCacheSize(res.remainingBytes);
+      if (res.skippedFiles > 0 || res.failedFiles > 0) {
+        onNotice(
+          t.settings.cacheClearedPartial
+            .replace("{skipped}", String(res.skippedFiles))
+            .replace("{failed}", String(res.failedFiles))
+        );
+      } else {
+        onNotice(t.settings.cacheCleared);
+      }
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setClearingCache(false);
+    }
+  };
+
   const activeCidrs = new Set(lanInterfaces.map((i) => i.subnetCidr));
   const offlineExcludedSubnets = (draft.excludedSubnets ?? []).filter(
     (cidr) => !activeCidrs.has(cidr)
@@ -182,13 +215,18 @@ export function SettingsView({
               {t.settings.downloadDir}
             </label>
             <div className="flex gap-2">
-              <GlassInput value={draft.downloadDir} readOnly />
-              <GlassButton
-                onClick={handlePickDownloadDir}
-                title={t.settings.chooseDir}
-              >
-                <FolderOpen className="h-4 w-4" />
-              </GlassButton>
+              <GlassInput
+                value={isAndroid ? "Downloads/Landa" : draft.downloadDir}
+                readOnly
+              />
+              {!isAndroid && (
+                <GlassButton
+                  onClick={handlePickDownloadDir}
+                  title={t.settings.chooseDir}
+                >
+                  <FolderOpen className="h-4 w-4" />
+                </GlassButton>
+              )}
             </div>
           </div>
         </div>
@@ -198,6 +236,11 @@ export function SettingsView({
             checked={draft.autoAcceptFromFriends}
             onChange={(v) => save({ ...draft, autoAcceptFromFriends: v })}
             label={t.settings.autoAccept}
+          />
+          <GlassToggle
+            checked={draft.autoCopyClipboard ?? true}
+            onChange={(v) => save({ ...draft, autoCopyClipboard: v })}
+            label={t.settings.autoCopyClipboard}
           />
           <GlassToggle
             checked={draft.minimizeToTray}
@@ -378,6 +421,28 @@ export function SettingsView({
             ))}
           </div>
         )}
+      </GlassCard>
+
+      {/* App Cache */}
+      <GlassCard className="p-5 space-y-3">
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-700/65 dark:text-white/50">
+          {t.settings.cacheTitle}
+        </h2>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="text-sm text-slate-900/90 dark:text-white/90">
+            {t.settings.cacheSize}:{" "}
+            <span className="font-mono font-medium">
+              {cacheSize === null ? "—" : formatBytes(cacheSize)}
+            </span>
+          </div>
+          <GlassButton
+            onClick={handleClearCache}
+            disabled={clearingCache}
+          >
+            <Trash2 className="h-4 w-4" />
+            <span>{t.settings.clearCache}</span>
+          </GlassButton>
+        </div>
       </GlassCard>
 
       {/* Diagnostics & Logs */}

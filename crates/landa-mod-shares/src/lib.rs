@@ -20,7 +20,7 @@ use landa_proto::path_policy::{
 use landa_proto::wire::{read_frame, write_frame, StreamKind, MAX_CONTROL_FRAME_BYTES};
 use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -503,11 +503,18 @@ impl SharesModule {
             _ => return Err(CoreError::InvalidInput("unexpected share response".into())),
         };
 
+        struct TempFileGuard(PathBuf);
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
         let safe_rel = validate_relative_path(&file_name)?;
-        let download_dir = PathBuf::from(engine.get_settings().download_dir);
-        tokio::fs::create_dir_all(&download_dir).await?;
-        let dest = resolve_within_root(&download_dir, &safe_rel)?;
-        let temp_path = download_dir.join(format!(".landa-part-{}", Uuid::new_v4()));
+        let incoming_temp_dir = engine.app_data_dir().join("incoming_temp");
+        tokio::fs::create_dir_all(&incoming_temp_dir).await?;
+        let temp_path = incoming_temp_dir.join(format!(".landa-part-{}", Uuid::new_v4()));
+        let _temp_guard = TempFileGuard(temp_path.clone());
 
         let mut file = tokio::fs::File::create(&temp_path).await?;
         let mut hasher = blake3::Hasher::new();
@@ -531,24 +538,40 @@ impl SharesModule {
 
         let mut expected_digest = [0u8; 32];
         if let Err(err) = recv.read_exact(&mut expected_digest).await {
-            let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(CoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 err,
             )));
         }
         if hasher.finalize().as_bytes() != &expected_digest {
-            let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(CoreError::IntegrityMismatch(file_name));
         }
 
-        let final_dest = unique_path(&dest);
-        if tokio::fs::rename(&temp_path, &final_dest).await.is_err() {
-            tokio::fs::copy(&temp_path, &final_dest).await?;
+        let saved_str = if let Some(publish) = engine.receive_publish_hook() {
+            let src = temp_path.clone();
+            let rel = safe_rel.clone();
+            let published = tokio::task::spawn_blocking(move || publish(&src, &rel))
+                .await
+                .map_err(|e| CoreError::Io(std::io::Error::other(e)))?
+                .ok_or_else(|| {
+                    CoreError::Io(std::io::Error::other(format!(
+                        "failed to publish downloaded file {}",
+                        safe_rel.display()
+                    )))
+                })?;
             let _ = tokio::fs::remove_file(&temp_path).await;
-        }
-
-        let saved_str = final_dest.to_string_lossy().to_string();
+            published
+        } else {
+            let download_dir = PathBuf::from(engine.get_settings().download_dir);
+            let src = temp_path.clone();
+            let rel = safe_rel.clone();
+            let final_dest = tokio::task::spawn_blocking(move || {
+                publish_to_unique_dest(&src, &download_dir, &rel)
+            })
+            .await
+            .map_err(|e| CoreError::Io(std::io::Error::other(e)))??;
+            final_dest.to_string_lossy().to_string()
+        };
         let record = TransferHistoryRecord {
             id: Uuid::new_v4().to_string(),
             direction: "receive".to_string(),
@@ -764,6 +787,7 @@ impl SharesModule {
         rel_path: &str,
         cache_dir: &Path,
         max_bytes: u64,
+        max_cache_bytes: u64,
     ) -> Result<String, CoreError> {
         if !self.is_enabled() {
             return Err(CoreError::ModuleDisabled("shares".into()));
@@ -821,6 +845,12 @@ impl SharesModule {
         }
 
         let temp_path = cache_dir.join(format!(".preview-part-{}", Uuid::new_v4()));
+        let _reservation = engine.preview_quota().reserve(
+            cache_dir,
+            size_bytes,
+            max_cache_bytes,
+            &[temp_path.clone(), cache_path.clone()],
+        )?;
         let mut file = tokio::fs::File::create(&temp_path).await?;
         let mut hasher = blake3::Hasher::new();
         let mut remaining = size_bytes;
@@ -1005,6 +1035,107 @@ impl SharesModule {
             }
         };
 
+        struct SpoolFileGuard(PathBuf);
+        impl Drop for SpoolFileGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let spool_path = std::env::temp_dir().join(format!("landa-folder-spool-{}.bin", Uuid::new_v4()));
+        let _spool_guard = SpoolFileGuard(spool_path.clone());
+        let mut spool_opts = tokio::fs::OpenOptions::new();
+        spool_opts.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            spool_opts.mode(0o600);
+        }
+        let mut spool_file = match spool_opts.open(&spool_path).await {
+            Ok(f) => f,
+            Err(err) => {
+                send_response(send, &ShareResponse::Error(err.to_string())).await?;
+                return Ok(());
+            }
+        };
+
+        let mut copy_buf = vec![0u8; CHUNK_SIZE];
+        for (meta, source_rel) in built.files.iter().zip(built.source_rel_paths.iter()) {
+            let (mut file, actual_size) = match self
+                .open_folder_entry_file(&root, local_root_canon.as_ref(), is_content_uri, source_rel)
+                .await
+            {
+                Ok(res) => res,
+                Err(err) => {
+                    send_response(send, &ShareResponse::Error(err.to_string())).await?;
+                    return Ok(());
+                }
+            };
+            if actual_size != meta.size_bytes {
+                let msg = format!(
+                    "file size mismatch for '{}': manifest expected {} bytes, actual {} bytes",
+                    meta.rel_path, meta.size_bytes, actual_size
+                );
+                send_response(send, &ShareResponse::Error(msg)).await?;
+                return Ok(());
+            }
+            let mut remaining = actual_size;
+            while remaining > 0 {
+                let to_read = (remaining as usize).min(copy_buf.len());
+                let n = match file.read(&mut copy_buf[..to_read]).await {
+                    Ok(n) => n,
+                    Err(err) => {
+                        send_response(send, &ShareResponse::Error(err.to_string())).await?;
+                        return Ok(());
+                    }
+                };
+                if n == 0 {
+                    let read_so_far = actual_size - remaining;
+                    let msg = format!(
+                        "file size mismatch for '{}': manifest expected {} bytes, actual {} bytes",
+                        meta.rel_path, meta.size_bytes, read_so_far
+                    );
+                    send_response(send, &ShareResponse::Error(msg)).await?;
+                    return Ok(());
+                }
+                if let Err(err) = spool_file.write_all(&copy_buf[..n]).await {
+                    send_response(send, &ShareResponse::Error(err.to_string())).await?;
+                    return Ok(());
+                }
+                remaining -= n as u64;
+            }
+            let mut extra_bytes = 0u64;
+            loop {
+                let n = match file.read(&mut copy_buf).await {
+                    Ok(n) => n,
+                    Err(err) => {
+                        send_response(send, &ShareResponse::Error(err.to_string())).await?;
+                        return Ok(());
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+                extra_bytes = extra_bytes.saturating_add(n as u64);
+            }
+            if extra_bytes > 0 {
+                let total_actual = actual_size.saturating_add(extra_bytes);
+                let msg = format!(
+                    "file size mismatch for '{}': manifest expected {} bytes, actual {} bytes",
+                    meta.rel_path, meta.size_bytes, total_actual
+                );
+                send_response(send, &ShareResponse::Error(msg)).await?;
+                return Ok(());
+            }
+        }
+        if let Err(err) = spool_file.flush().await {
+            send_response(send, &ShareResponse::Error(err.to_string())).await?;
+            return Ok(());
+        }
+        if let Err(err) = spool_file.seek(std::io::SeekFrom::Start(0)).await {
+            send_response(send, &ShareResponse::Error(err.to_string())).await?;
+            return Ok(());
+        }
+
         let manifest = ShareResponse::FolderManifest {
             folder_name,
             dirs: built.dirs,
@@ -1016,41 +1147,48 @@ impl SharesModule {
             return Ok(());
         }
 
-        for (meta, source_rel) in built.files.iter().zip(built.source_rel_paths.iter()) {
-            let stream_res: Result<(), CoreError> = async {
-                let mut file = if is_content_uri {
-                    let provider = self.get_content_provider()?;
-                    let uri = root.path.clone();
-                    let rel_owned = source_rel.clone();
-                    let opened = tokio::task::spawn_blocking(move || {
-                        provider.open_file(&uri, true, &rel_owned)
-                    })
-                    .await
-                    .map_err(|e| CoreError::InvalidInput(e.to_string()))??;
-                    tokio::fs::File::from_std(opened.file)
-                } else {
-                    let root_canon = local_root_canon.clone().ok_or_else(|| {
-                        CoreError::InvalidInput("missing local share root".into())
-                    })?;
-                    let rel_owned = source_rel.clone();
-                    let std_file = tokio::task::spawn_blocking(move || {
-                        open_local_share_file(&root_canon, &rel_owned)
-                    })
-                    .await
-                    .map_err(|e| CoreError::InvalidInput(e.to_string()))??;
-                    tokio::fs::File::from_std(std_file)
-                };
-                stream_exact_file_with_blake3(&mut file, meta.size_bytes, send).await
-            }
-            .await;
-
-            if let Err(err) = stream_res {
+        for meta in &built.files {
+            if let Err(err) = stream_exact_file_with_blake3(&mut spool_file, meta.size_bytes, send).await {
                 let _ = send.reset(1u32.into());
                 return Err(err);
             }
         }
 
         Ok(())
+    }
+
+    async fn open_folder_entry_file(
+        &self,
+        root: &LocalShareRoot,
+        local_root_canon: Option<&PathBuf>,
+        is_content_uri: bool,
+        source_rel: &str,
+    ) -> Result<(tokio::fs::File, u64), CoreError> {
+        if is_content_uri {
+            let provider = self.get_content_provider()?;
+            let uri = root.path.clone();
+            let rel_owned = source_rel.to_string();
+            let opened = tokio::task::spawn_blocking(move || {
+                provider.open_file(&uri, true, &rel_owned)
+            })
+            .await
+            .map_err(|e| CoreError::InvalidInput(e.to_string()))??;
+            let actual_size = opened.size_bytes;
+            Ok((tokio::fs::File::from_std(opened.file), actual_size))
+        } else {
+            let root_canon = local_root_canon
+                .cloned()
+                .ok_or_else(|| CoreError::InvalidInput("missing local share root".into()))?;
+            let rel_owned = source_rel.to_string();
+            let std_file = tokio::task::spawn_blocking(move || {
+                open_local_share_file(&root_canon, &rel_owned)
+            })
+            .await
+            .map_err(|e| CoreError::InvalidInput(e.to_string()))??;
+            let file = tokio::fs::File::from_std(std_file);
+            let actual_size = file.metadata().await?.len();
+            Ok((file, actual_size))
+        }
     }
 
     async fn collect_folder_entries(
@@ -1597,26 +1735,6 @@ fn modified_ms(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn unique_path(path: &Path) -> PathBuf {
-    if !path.exists() {
-        return path.to_path_buf();
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = path.extension().and_then(|e| e.to_str());
-    for idx in 1..10_000 {
-        let name = match ext {
-            Some(e) if !e.is_empty() => format!("{stem} ({idx}).{e}"),
-            _ => format!("{stem} ({idx})"),
-        };
-        let candidate = parent.join(name);
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    path.to_path_buf()
-}
-
 struct FolderDownloadGuard<'a> {
     engine: &'a LandaEngine,
     transfer_id: String,
@@ -1675,7 +1793,10 @@ fn build_folder_manifest(
                 })?
                 .to_string()
         };
-        let safe_rel = validate_relative_path(&manifest_rel)?;
+        let sanitized_rel = sanitize_relative_path(&manifest_rel)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let safe_rel = validate_relative_path(&sanitized_rel)?;
         let clean_manifest_rel = safe_rel.to_string_lossy().replace('\\', "/");
         if entry.is_dir {
             if !seen_dirs.insert(clean_manifest_rel.clone()) {
@@ -2061,7 +2182,9 @@ async fn stream_exact_file_with_blake3(
         if n == 0 {
             return Err(CoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "shared file truncated during folder stream",
+                format!(
+                    "shared file truncated during folder stream (expected {size_bytes} bytes, missing {remaining} bytes)"
+                ),
             )));
         }
         hasher.update(&buf[..n]);
@@ -2070,6 +2193,37 @@ async fn stream_exact_file_with_blake3(
     }
     send.write_all(hasher.finalize().as_bytes()).await?;
     Ok(())
+}
+
+fn validate_source_relative_path(raw: &str) -> Result<String, CoreError> {
+    if raw.is_empty() || raw.len() > 1024 {
+        return Err(CoreError::InvalidInput(
+            "empty or overly long share entry path".into(),
+        ));
+    }
+    if raw.chars().any(|c| c == '\0' || (c as u32) < 0x20) {
+        return Err(CoreError::InvalidInput(
+            "control characters in share entry path".into(),
+        ));
+    }
+    if raw.starts_with('/') || raw.starts_with('\\') || raw.contains('\\') {
+        return Err(CoreError::InvalidInput(
+            "invalid separator or absolute share entry path".into(),
+        ));
+    }
+    let mut segments = Vec::new();
+    for part in raw.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(CoreError::InvalidInput(
+                "invalid segment in share entry path".into(),
+            ));
+        }
+        segments.push(part);
+    }
+    if segments.is_empty() {
+        return Err(CoreError::InvalidInput("empty share entry path".into()));
+    }
+    Ok(segments.join("/"))
 }
 
 fn validate_tree_entries(
@@ -2090,8 +2244,7 @@ fn validate_tree_entries(
     let mut file_count = 0usize;
 
     for entry in entries {
-        let clean = validate_relative_path(&entry.rel_path)?;
-        let clean_str = clean.to_string_lossy().replace('\\', "/");
+        let clean_str = validate_source_relative_path(&entry.rel_path)?;
         let rel_to_requested = if expected_prefix.is_empty() {
             clean_str.as_str()
         } else {
@@ -2099,8 +2252,8 @@ fn validate_tree_entries(
                 CoreError::InvalidInput("share entry path escapes requested directory".into())
             })?
         };
-        let rel_components = validate_relative_path(rel_to_requested)?
-            .components()
+        let rel_components = validate_source_relative_path(rel_to_requested)?
+            .split('/')
             .count();
 
         if entry.is_dir {
@@ -2264,4 +2417,492 @@ fn allocate_unique_destination(root: &Path, rel_path: &Path) -> Result<PathBuf, 
     Err(CoreError::InvalidInput(
         "too many filename collisions".into(),
     ))
+}
+
+fn is_cross_device_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::CrossesDevices {
+        return true;
+    }
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(18) {
+        return true;
+    }
+    #[cfg(windows)]
+    if err.raw_os_error() == Some(17) {
+        return true;
+    }
+    false
+}
+
+#[cfg(windows)]
+fn move_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+    }
+    let src_w: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
+    let dst_w: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe { MoveFileExW(src_w.as_ptr(), dst_w.as_ptr(), 0) };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn move_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    extern "C" {
+        fn renameat2(
+            olddirfd: core::ffi::c_int,
+            oldpath: *const core::ffi::c_char,
+            newdirfd: core::ffi::c_int,
+            newpath: *const core::ffi::c_char,
+            flags: core::ffi::c_uint,
+        ) -> core::ffi::c_int;
+    }
+    const AT_FDCWD: core::ffi::c_int = -100;
+    const RENAME_NOREPLACE: core::ffi::c_uint = 1;
+
+    let src_c = CString::new(src.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let rc = unsafe {
+        renameat2(
+            AT_FDCWD,
+            src_c.as_ptr(),
+            AT_FDCWD,
+            dst_c.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn move_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    extern "C" {
+        fn renamex_np(
+            from: *const core::ffi::c_char,
+            to: *const core::ffi::c_char,
+            flags: core::ffi::c_uint,
+        ) -> core::ffi::c_int;
+    }
+    const RENAME_EXCL: core::ffi::c_uint = 0x0000_0004;
+
+    let src_c = CString::new(src.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let rc = unsafe { renamex_np(src_c.as_ptr(), dst_c.as_ptr(), RENAME_EXCL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn move_no_replace(_src: &Path, _dst: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+fn publish_to_unique_dest(
+    temp_path: &Path,
+    download_dir: &Path,
+    safe_rel: &Path,
+) -> Result<PathBuf, CoreError> {
+    publish_to_unique_dest_impl(
+        temp_path,
+        download_dir,
+        safe_rel,
+        |src, dst| std::fs::hard_link(src, dst),
+        |src, dst_file| {
+            let mut reader = std::fs::File::open(src)?;
+            std::io::copy(&mut reader, dst_file)?;
+            Ok(())
+        },
+    )
+}
+
+fn publish_to_unique_dest_impl<H, C>(
+    temp_path: &Path,
+    download_dir: &Path,
+    safe_rel: &Path,
+    mut hard_link_fn: H,
+    mut copy_fn: C,
+) -> Result<PathBuf, CoreError>
+where
+    H: FnMut(&Path, &Path) -> std::io::Result<()>,
+    C: FnMut(&Path, &mut std::fs::File) -> std::io::Result<()>,
+{
+    struct StagingGuard(Option<PathBuf>);
+    impl Drop for StagingGuard {
+        fn drop(&mut self) {
+            if let Some(path) = self.0.take() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    fn stage_on_dest_volume<C>(
+        src_path: &Path,
+        parent: &Path,
+        copy_fn: &mut C,
+    ) -> Result<(PathBuf, StagingGuard), CoreError>
+    where
+        C: FnMut(&Path, &mut std::fs::File) -> std::io::Result<()>,
+    {
+        let dest_stage = parent.join(format!(".landa-part-{}", Uuid::new_v4()));
+        let mut out = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&dest_stage)?;
+        let guard = StagingGuard(Some(dest_stage.clone()));
+        copy_fn(src_path, &mut out)?;
+        out.sync_all()?;
+        drop(out);
+        Ok((dest_stage, guard))
+    }
+
+    fn finish_publish(
+        temp_path: &Path,
+        dest_guard: &mut StagingGuard,
+        moved_staged: bool,
+    ) {
+        if moved_staged {
+            // The staged file was moved to the final destination; if it was a
+            // destination-volume copy, disarm its guard and remove temp_path.
+            if dest_guard.0.take().is_some() {
+                let _ = std::fs::remove_file(temp_path);
+            }
+        } else {
+            if let Some(dest_stage) = dest_guard.0.as_ref() {
+                if std::fs::remove_file(dest_stage).is_ok() {
+                    dest_guard.0 = None;
+                }
+            }
+            let _ = std::fs::remove_file(temp_path);
+        }
+    }
+
+    std::fs::create_dir_all(download_dir)?;
+    let base_dest = resolve_within_root(download_dir, safe_rel)?;
+    let parent = base_dest.parent().unwrap_or(download_dir);
+    std::fs::create_dir_all(parent)?;
+
+    let mut dest_guard = StagingGuard(None);
+    let mut staged_path = temp_path.to_path_buf();
+    let mut hard_link_unsupported = false;
+
+    let stem = base_dest
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let ext = base_dest.extension().and_then(|e| e.to_str());
+
+    for idx in 0..10_000 {
+        let candidate = if idx == 0 {
+            base_dest.clone()
+        } else {
+            let name = match ext {
+                Some(e) if !e.is_empty() => format!("{stem} ({idx}).{e}"),
+                _ => format!("{stem} ({idx})"),
+            };
+            parent.join(name)
+        };
+
+        if !hard_link_unsupported {
+            match hard_link_fn(&staged_path, &candidate) {
+                Ok(()) => {
+                    finish_publish(temp_path, &mut dest_guard, false);
+                    return Ok(candidate);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) if dest_guard.0.is_none() && is_cross_device_error(&err) => {
+                    let (dest_stage, guard) =
+                        stage_on_dest_volume(temp_path, parent, &mut copy_fn)?;
+                    dest_guard = guard;
+                    staged_path = dest_stage;
+                    match hard_link_fn(&staged_path, &candidate) {
+                        Ok(()) => {
+                            finish_publish(temp_path, &mut dest_guard, false);
+                            return Ok(candidate);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                            hard_link_unsupported = true;
+                        }
+                        Err(e) => return Err(CoreError::Io(e)),
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+                    hard_link_unsupported = true;
+                }
+                Err(err) => return Err(CoreError::Io(err)),
+            }
+        }
+
+        if dest_guard.0.is_none() {
+            let (dest_stage, guard) = stage_on_dest_volume(temp_path, parent, &mut copy_fn)?;
+            dest_guard = guard;
+            staged_path = dest_stage;
+        }
+        match move_no_replace(&staged_path, &candidate) {
+            Ok(()) => {
+                finish_publish(temp_path, &mut dest_guard, true);
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(CoreError::Io(err)),
+        }
+    }
+
+    Err(CoreError::InvalidInput(
+        "too many filename collisions".into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_manifest_sanitizes_android_names_and_preserves_source_rel() {
+        let entries = vec![
+            ShareEntry {
+                name: "sub:dir.".into(),
+                rel_path: "sub:dir.".into(),
+                is_dir: true,
+                size_bytes: 0,
+                modified_ms: 0,
+            },
+            ShareEntry {
+                name: "shot 12:30:00.png ".into(),
+                rel_path: "sub:dir./shot 12:30:00.png ".into(),
+                is_dir: false,
+                size_bytes: 42,
+                modified_ms: 0,
+            },
+        ];
+
+        let validated = validate_tree_entries(entries, "", MAX_TREE_DEPTH, MAX_TREE_FILES)
+            .expect("tree entries with colons and trailing dots should validate");
+        let built = build_folder_manifest(validated, "").expect("manifest should build");
+
+        assert_eq!(built.dirs, vec!["sub_dir"]);
+        assert_eq!(built.files.len(), 1);
+        assert_eq!(built.files[0].rel_path, "sub_dir/shot 12_30_00.png");
+        assert_eq!(built.source_rel_paths, vec!["sub:dir./shot 12:30:00.png "]);
+    }
+
+    #[test]
+    fn publish_to_unique_dest_concurrent_same_name_never_overwrites() {
+        let root = std::env::temp_dir().join(format!("landa-pub-conc-{}", Uuid::new_v4()));
+        let dl_dir = root.join("downloads");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let src1 = root.join("part1.bin");
+        let src2 = root.join("part2.bin");
+        std::fs::write(&src1, b"payload-one").unwrap();
+        std::fs::write(&src2, b"payload-two").unwrap();
+
+        let dl1 = dl_dir.clone();
+        let dl2 = dl_dir.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        let h1 = std::thread::spawn(move || {
+            b1.wait();
+            publish_to_unique_dest(&src1, &dl1, Path::new("report.pdf")).unwrap()
+        });
+        let h2 = std::thread::spawn(move || {
+            b2.wait();
+            publish_to_unique_dest(&src2, &dl2, Path::new("report.pdf")).unwrap()
+        });
+
+        let p1 = h1.join().unwrap();
+        let p2 = h2.join().unwrap();
+        assert_ne!(p1, p2, "concurrent saves must claim distinct paths");
+
+        let mut contents = vec![std::fs::read(&p1).unwrap(), std::fs::read(&p2).unwrap()];
+        contents.sort();
+        assert_eq!(
+            contents,
+            vec![b"payload-one".to_vec(), b"payload-two".to_vec()]
+        );
+        assert!(dl_dir.join("report.pdf").exists());
+        assert!(dl_dir.join("report (1).pdf").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn publish_to_unique_dest_error_leaves_no_partial_file() {
+        let root = std::env::temp_dir().join(format!("landa-pub-err-{}", Uuid::new_v4()));
+        let dl_dir = root.join("downloads");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+
+        let missing_src = root.join("does-not-exist.bin");
+        let err = publish_to_unique_dest(&missing_src, &dl_dir, Path::new("report.pdf"))
+            .expect_err("missing source must fail");
+        assert!(matches!(err, CoreError::Io(_)));
+        assert!(
+            std::fs::read_dir(&dl_dir).unwrap().next().is_none(),
+            "download_dir must remain empty on publish error"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn publish_to_unique_dest_collision_does_not_invoke_copy() {
+        let root = std::env::temp_dir().join(format!("landa-pub-nocopy-{}", Uuid::new_v4()));
+        let dl_dir = root.join("downloads");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+
+        let existing = dl_dir.join("report.pdf");
+        std::fs::write(&existing, b"existing-foreign-content").unwrap();
+
+        let src = root.join("part.bin");
+        std::fs::write(&src, b"new-payload").unwrap();
+
+        let mut copy_called = false;
+        let published = publish_to_unique_dest_impl(
+            &src,
+            &dl_dir,
+            Path::new("report.pdf"),
+            |s, d| std::fs::hard_link(s, d),
+            |_src_path, _dst_file| {
+                copy_called = true;
+                Err(std::io::Error::other("copy must not be called on same-volume collision"))
+            },
+        )
+        .unwrap();
+
+        assert!(!copy_called, "same-volume collision must not invoke copy_fn");
+        assert_eq!(
+            published.canonicalize().unwrap(),
+            dl_dir.join("report (1).pdf").canonicalize().unwrap()
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing-foreign-content");
+        assert_eq!(std::fs::read(&published).unwrap(), b"new-payload");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn publish_to_unique_dest_unsupported_hard_link_handles_collision_without_overwrite() {
+        let root = std::env::temp_dir().join(format!("landa-pub-unsup-{}", Uuid::new_v4()));
+        let dl_dir = root.join("downloads");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+
+        let existing = dl_dir.join("report.pdf");
+        std::fs::write(&existing, b"existing-foreign-content").unwrap();
+
+        let src = root.join("part.bin");
+        std::fs::write(&src, b"new-payload").unwrap();
+
+        let final_candidate = dl_dir.join("report (1).pdf");
+        let mut saw_final_during_copy = false;
+        let published = publish_to_unique_dest_impl(
+            &src,
+            &dl_dir,
+            Path::new("report.pdf"),
+            |_src, _dst| Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+            |src_path, dst_file| {
+                if final_candidate.exists() {
+                    saw_final_during_copy = true;
+                }
+                let mut reader = std::fs::File::open(src_path)?;
+                std::io::copy(&mut reader, dst_file)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !saw_final_during_copy,
+            "final destination name must not exist while staging copy is being written"
+        );
+        assert_eq!(
+            published.canonicalize().unwrap(),
+            final_candidate.canonicalize().unwrap()
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing-foreign-content");
+        assert_eq!(std::fs::read(&published).unwrap(), b"new-payload");
+        assert!(!src.exists(), "source temp file must be removed");
+
+        let entries: Vec<_> = std::fs::read_dir(&dl_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries.len(), 2, "no temp files may remain: {entries:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn publish_to_unique_dest_partial_write_failure_cleans_up_all_temp_and_partial_files() {
+        use std::io::Write;
+
+        let root = std::env::temp_dir().join(format!("landa-pub-partfail-{}", Uuid::new_v4()));
+        let dl_dir = root.join("downloads");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+
+        let src = root.join("part.bin");
+        std::fs::write(&src, b"twelve-bytes").unwrap();
+
+        // Case 1: cross-device staging fails after writing partial bytes.
+        let err_exdev = publish_to_unique_dest_impl(
+            &src,
+            &dl_dir,
+            Path::new("report.pdf"),
+            |_src, _dst| Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices)),
+            |_src_path, dst_file| {
+                dst_file.write_all(b"partial")?;
+                Err(std::io::Error::other("simulated disk full"))
+            },
+        )
+        .expect_err("partial write during cross-device staging must fail");
+        assert!(matches!(err_exdev, CoreError::Io(_)));
+        assert!(
+            std::fs::read_dir(&dl_dir).unwrap().next().is_none(),
+            "no partial or staging files may remain after cross-device write failure"
+        );
+
+        // Case 2: Unsupported hard_link fallback fails after writing partial bytes.
+        let err_unsup = publish_to_unique_dest_impl(
+            &src,
+            &dl_dir,
+            Path::new("report.pdf"),
+            |_src, _dst| Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+            |_src_path, dst_file| {
+                dst_file.write_all(b"partial")?;
+                Err(std::io::Error::other("simulated disk full"))
+            },
+        )
+        .expect_err("partial write during Unsupported fallback must fail");
+        assert!(matches!(err_unsup, CoreError::Io(_)));
+        assert!(
+            std::fs::read_dir(&dl_dir).unwrap().next().is_none(),
+            "no partial staging file may remain after Unsupported write failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

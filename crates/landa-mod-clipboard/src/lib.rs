@@ -282,9 +282,14 @@ impl ClipboardModule {
             self.remove_image_file_if_owned(&path);
         }
 
+        let event_name = if item.source_peer_id.is_some() {
+            "received"
+        } else {
+            "updated"
+        };
         let _ = self.events.send(CoreEvent::ModuleEvent {
             module_id: "clipboard".to_string(),
-            event_name: "updated".to_string(),
+            event_name: event_name.to_string(),
             data: serde_json::to_value(&item).unwrap_or(serde_json::Value::Null),
         });
     }

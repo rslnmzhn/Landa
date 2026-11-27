@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   Clipboard,
@@ -10,6 +10,7 @@ import {
 import { api, formatBytes } from "./core/api";
 import type {
   AppSettings,
+  ClipboardItem,
   FriendRequestInfo,
   IncomingTransferOfferInfo,
   LocalIdentityInfo,
@@ -79,6 +80,8 @@ export function App() {
     kind: "error" | "notice";
     text: string;
   } | null>(null);
+  const langRef = useRef<"ru" | "en">("ru");
+  langRef.current = settings?.language === "en" ? "en" : "ru";
 
   const showToast = (kind: "error" | "notice", text: string) => {
     setToast({ kind, text });
@@ -97,6 +100,10 @@ export function App() {
       if (!focus) return;
       if (focus.target === "activity") {
         setActiveTab("activity");
+        return;
+      }
+      if (focus.target === "clipboard") {
+        setActiveTab("clipboard");
         return;
       }
       if (focus.target === "transfer_offer") {
@@ -197,6 +204,20 @@ export function App() {
           case "moduleEvent":
             if (ev.payload.moduleId === "clipboard") {
               setClipboardTick((n) => n + 1);
+              if (
+                ev.payload.eventName === "received" &&
+                ev.payload.data &&
+                typeof ev.payload.data === "object"
+              ) {
+                const item = ev.payload.data as Partial<ClipboardItem>;
+                const dict = translations[langRef.current].clipboard;
+                const peerName = item.sourcePeerName || "Peer";
+                if (item.kind === "image") {
+                  showToast("notice", `${dict.receivedImage} ${peerName}`);
+                } else if (typeof item.text === "string" && item.text.trim()) {
+                  showToast("notice", `${dict.receivedText} ${peerName}`);
+                }
+              }
             }
             break;
         }

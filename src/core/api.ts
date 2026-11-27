@@ -164,6 +164,14 @@ export const api = {
     invoke<string>("download_update", { asset }),
   installUpdate: (filePath: string) =>
     invoke<void>("install_update", { filePath }),
+  getCacheSize: () => invoke<number>("get_cache_size"),
+  clearCache: () =>
+    invoke<{
+      remainingBytes: number;
+      deletedFiles: number;
+      skippedFiles: number;
+      failedFiles: number;
+    }>("clear_cache"),
 
   // In-App File Preview
   prepareFilePreview: (pathOrUri: string) =>
