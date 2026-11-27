@@ -779,6 +779,7 @@ impl SharesModule {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn preview_remote_file(
         &self,
         engine: &LandaEngine,

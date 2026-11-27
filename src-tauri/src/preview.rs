@@ -167,6 +167,7 @@ pub async fn sweep_old_preview_cache(app: &AppHandle) {
     .await;
 }
 
+#[cfg(test)]
 pub async fn enforce_preview_cache_limit(dir: &Path, max_bytes: u64) {
     sweep_preview_cache_dir(dir, Duration::from_secs(24 * 60 * 60), max_bytes, false).await;
 }
