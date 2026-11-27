@@ -784,7 +784,7 @@ async fn shares_folder_download_uses_publish_hook_and_enforces_depth_limit() {
             "staged temp file must exist before publish"
         );
         published_rels_clone.lock().unwrap().push(rel_str.clone());
-        Some(format!("content://media/external/downloads/{rel_str}"))
+        Ok(format!("content://media/external/downloads/{rel_str}"))
     }));
 
     let shares_a = SharesModule::new(Arc::clone(engine_a.storage()));
@@ -875,8 +875,8 @@ async fn shares_folder_download_uses_publish_hook_and_enforces_depth_limit() {
         "MediaStore cannot represent an empty folder with zero files"
     );
 
-    // If publish_hook fails (returns None), folder download must fail explicitly instead of falling back
-    engine_a.set_receive_publish_hook(Arc::new(|_, _| None));
+    // If publish_hook fails (returns Err), folder download must fail explicitly instead of falling back
+    engine_a.set_receive_publish_hook(Arc::new(|_, _| Err("failed to publish".to_string())));
     let hook_fail = shares_a
         .download_remote_folder(&engine_a, &info_b.peer_id, &root.id, "trip")
         .await;
@@ -2017,7 +2017,7 @@ async fn shares_single_file_download_uses_publish_hook_and_cleans_temp() {
             .lock()
             .unwrap()
             .push((source.to_path_buf(), rel_str.clone(), bytes));
-        Some(format!("content://media/external/downloads/{rel_str}"))
+        Ok(format!("content://media/external/downloads/{rel_str}"))
     }));
 
     let shares_a = SharesModule::new(Arc::clone(engine_a.storage()));
@@ -2098,8 +2098,8 @@ async fn shares_single_file_download_uses_publish_hook_and_cleans_temp() {
     );
     assert_eq!(history[0].relative_paths, vec!["report.pdf".to_string()]);
 
-    // If publish hook fails (returns None), download must fail and clean up temp file.
-    engine_a.set_receive_publish_hook(Arc::new(|_, _| None));
+    // If publish hook fails (returns Err), download must fail and clean up temp file.
+    engine_a.set_receive_publish_hook(Arc::new(|_, _| Err("failed to publish".to_string())));
     let err = shares_a
         .download_remote_file(&engine_a, &info_b.peer_id, &root.id, "report.pdf")
         .await

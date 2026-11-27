@@ -677,13 +677,13 @@ async fn prepare_receive_dirs(
     download_dir: &Path,
     hook: Option<&ReceivePublishHook>,
 ) -> Result<(), CoreError> {
+    if hook.is_none() && download_dir.to_string_lossy().starts_with("content://") {
+        return Err(CoreError::Io(std::io::Error::other(
+            "cannot write directly to content:// URI without SAF publish hook",
+        )));
+    }
     tokio::fs::create_dir_all(temp_dir).await?;
     if hook.is_none() {
-        if download_dir.to_string_lossy().starts_with("content://") {
-            return Err(CoreError::Io(std::io::Error::other(
-                "cannot write directly to content:// URI without SAF publish hook",
-            )));
-        }
         tokio::fs::create_dir_all(download_dir).await?;
     }
     Ok(())
@@ -952,11 +952,8 @@ mod tests {
         assert!(msg.contains("content://"), "unexpected error: {msg}");
         assert!(msg.contains("SAF"), "unexpected error: {msg}");
         assert!(
-            !Path::new("content:").exists()
-                && !Path::new("content://com.android.externalstorage.documents").exists(),
-            "no local directory should be created for content:// URI"
+            !temp_dir.exists() && !root.exists(),
+            "temp_dir must not be created when content:// without hook is rejected"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }
