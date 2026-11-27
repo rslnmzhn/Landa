@@ -581,22 +581,19 @@ impl<R: Runtime> AndroidBridge<R> {
         source: &Path,
         relative: &Path,
         target_tree_uri: Option<String>,
-    ) -> Option<String> {
+    ) -> Result<String, String> {
         let args = PublishArgs {
             source_path: source.to_string_lossy().to_string(),
             relative_path: relative.to_string_lossy().replace('\\', "/"),
             target_tree_uri,
         };
-        match self
-            .handle
+        self.handle
             .run_mobile_plugin::<PublishResponse>("publishToDownloads", args)
-        {
-            Ok(res) => Some(res.published_path),
-            Err(err) => {
-                tracing::warn!("Android MediaStore publish failed: {err}");
-                None
-            }
-        }
+            .map(|res| res.published_path)
+            .map_err(|err| {
+                tracing::warn!("Android publish failed: {err}");
+                err.to_string()
+            })
     }
 
     pub fn take_pending_shared_files(&self) -> Result<Vec<String>, String> {
@@ -937,8 +934,10 @@ pub fn make_publish_hook<R: Runtime>(app: tauri::AppHandle<R>) -> ReceivePublish
             .try_state::<crate::commands::AppState>()
             .map(|state| state.engine.get_settings().download_dir)
             .filter(|dir| dir.starts_with("content://"));
-        app.try_state::<AndroidBridge<R>>()
-            .and_then(|bridge| bridge.publish_to_downloads(source, relative, target_tree_uri))
+        let bridge = app
+            .try_state::<AndroidBridge<R>>()
+            .ok_or_else(|| "Android bridge unavailable".to_string())?;
+        bridge.publish_to_downloads(source, relative, target_tree_uri)
     })
 }
 

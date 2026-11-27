@@ -2297,15 +2297,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             val cleanRel = sanitizeRelativePath(args.relativePath)
             val treeUriStr = args.targetTreeUri?.trim()?.takeIf { it.startsWith("content://") }
             val published = if (treeUriStr != null) {
-                try {
-                    publishViaSafTree(sourceFile, cleanRel, treeUriStr)
-                } catch (_: Exception) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        publishViaMediaStore(sourceFile, cleanRel)
-                    } else {
-                        publishLegacyDownloads(sourceFile, cleanRel)
-                    }
-                }
+                publishViaSafTree(sourceFile, cleanRel, treeUriStr)
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 publishViaMediaStore(sourceFile, cleanRel)
             } else {

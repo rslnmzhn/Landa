@@ -77,3 +77,17 @@ test("resolveTabSwipe switches tabs on horizontal swipe and ignores vertical scr
   assert.equal(resolveTabSwipe(tabs, "shares", -40, 60, 200), null);
   assert.equal(resolveTabSwipe(tabs, "shares", -42, 5, 80), "clipboard");
 });
+
+test("moving lens indicator uses CSS liquid-lens-track and respects prefers-reduced-motion", () => {
+  const css = fs.readFileSync(path.join(rootDir, "src/styles/glass.css"), "utf8");
+  const primitives = fs.readFileSync(
+    path.join(rootDir, "src/components/glass/GlassPrimitives.tsx"),
+    "utf8"
+  );
+  assert.match(primitives, /liquid-lens-track/);
+  assert.doesNotMatch(primitives, /transition:\s*"transform 320ms/);
+  assert.match(
+    css,
+    /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.liquid-lens-track[\s\S]*transition:\s*none;/
+  );
+});

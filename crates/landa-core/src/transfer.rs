@@ -36,7 +36,7 @@ pub struct OutgoingFileItem {
     pub size_bytes: u64,
 }
 
-pub type ReceivePublishHook = Arc<dyn Fn(&Path, &Path) -> Option<String> + Send + Sync>;
+pub type ReceivePublishHook = Arc<dyn Fn(&Path, &Path) -> Result<String, String> + Send + Sync>;
 pub type OpenSourceHook = Arc<dyn Fn(&str) -> Option<std::fs::File> + Send + Sync>;
 
 pub struct TransferManager {
@@ -677,33 +677,47 @@ impl TransferManager {
             .expect("publish_hook lock poisoned")
             .clone();
 
-        let mut saved_paths = Vec::with_capacity(staged_files.len());
-        for (temp_path, rel_path) in staged_files {
-            if let Some(ref publish) = hook {
-                let publish_fn = Arc::clone(publish);
-                let src = temp_path.clone();
-                let rel = rel_path.clone();
-                if let Ok(Some(published)) =
-                    tokio::task::spawn_blocking(move || publish_fn(&src, &rel)).await
-                {
-                    saved_paths.push(published);
-                    continue;
-                }
-            }
+        publish_staged_files(staged_files, download_dir, hook.as_ref()).await
+    }
+}
 
-            let target = allocate_unique_destination(download_dir, &rel_path)?;
-            if let Some(parent) = target.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            if tokio::fs::rename(&temp_path, &target).await.is_err() {
-                tokio::fs::copy(&temp_path, &target).await?;
-                let _ = tokio::fs::remove_file(&temp_path).await;
-            }
-            saved_paths.push(target.to_string_lossy().to_string());
+async fn publish_staged_files(
+    staged_files: Vec<(PathBuf, PathBuf)>,
+    download_dir: &Path,
+    hook: Option<&ReceivePublishHook>,
+) -> Result<Vec<String>, CoreError> {
+    let mut saved_paths = Vec::with_capacity(staged_files.len());
+    for (temp_path, rel_path) in staged_files {
+        if let Some(publish) = hook {
+            let publish_fn = Arc::clone(publish);
+            let src = temp_path.clone();
+            let rel = rel_path.clone();
+            let published = tokio::task::spawn_blocking(move || publish_fn(&src, &rel))
+                .await
+                .map_err(|e| CoreError::Io(std::io::Error::other(e)))?
+                .map_err(|err| CoreError::Io(std::io::Error::other(err)))?;
+            saved_paths.push(published);
+            continue;
         }
 
-        Ok(saved_paths)
+        if download_dir.to_string_lossy().starts_with("content://") {
+            return Err(CoreError::Io(std::io::Error::other(
+                "cannot write directly to content:// URI without publish hook",
+            )));
+        }
+
+        let target = allocate_unique_destination(download_dir, &rel_path)?;
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        if tokio::fs::rename(&temp_path, &target).await.is_err() {
+            tokio::fs::copy(&temp_path, &target).await?;
+            let _ = tokio::fs::remove_file(&temp_path).await;
+        }
+        saved_paths.push(target.to_string_lossy().to_string());
     }
+
+    Ok(saved_paths)
 }
 
 fn sanitize_transfer_id(raw: &str) -> String {
@@ -868,6 +882,49 @@ mod tests {
             std::fs::read_dir(&temp_root).unwrap().next().is_none(),
             "all orphaned files and directories inside incoming_temp must be removed before TransferManager::new returns"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn publish_staged_files_propagates_hook_error_without_local_fallback() {
+        let root = std::env::temp_dir().join(format!("landa-saf-fail-{}", Uuid::new_v4()));
+        let temp_dir = root.join("temp");
+        let download_dir = root.join("downloads");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::create_dir_all(&download_dir).unwrap();
+
+        let staged = temp_dir.join("photo.jpg");
+        std::fs::write(&staged, b"image-bytes").unwrap();
+
+        let hook: ReceivePublishHook =
+            Arc::new(|_, _| Err("SAF permission denied for tree URI".to_string()));
+
+        let err = publish_staged_files(
+            vec![(staged.clone(), PathBuf::from("photo.jpg"))],
+            &download_dir,
+            Some(&hook),
+        )
+        .await
+        .expect_err("hook failure must fail publication instead of falling back");
+
+        assert!(
+            err.to_string().contains("SAF permission denied"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !download_dir.join("photo.jpg").exists(),
+            "local fallback copy must not be created when publish hook fails"
+        );
+
+        let content_uri_err = publish_staged_files(
+            vec![(staged, PathBuf::from("photo.jpg"))],
+            Path::new("content://com.android.externalstorage.documents/tree/primary%3ADownload"),
+            None,
+        )
+        .await
+        .expect_err("content:// download_dir without hook must fail");
+        assert!(content_uri_err.to_string().contains("content://"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

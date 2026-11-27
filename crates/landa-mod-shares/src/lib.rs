@@ -553,12 +553,7 @@ impl SharesModule {
             let published = tokio::task::spawn_blocking(move || publish(&src, &rel))
                 .await
                 .map_err(|e| CoreError::Io(std::io::Error::other(e)))?
-                .ok_or_else(|| {
-                    CoreError::Io(std::io::Error::other(format!(
-                        "failed to publish downloaded file {}",
-                        safe_rel.display()
-                    )))
-                })?;
+                .map_err(|err| CoreError::Io(std::io::Error::other(err)))?;
             let _ = tokio::fs::remove_file(&temp_path).await;
             published
         } else {
@@ -2097,12 +2092,7 @@ async fn publish_staged_files(
             let published = tokio::task::spawn_blocking(move || publish_fn(&src, &rel))
                 .await
                 .map_err(|e| CoreError::Io(std::io::Error::other(e)))?
-                .ok_or_else(|| {
-                    CoreError::Io(std::io::Error::other(format!(
-                        "failed to publish downloaded file {}",
-                        combined_rel.display()
-                    )))
-                })?;
+                .map_err(|err| CoreError::Io(std::io::Error::other(err)))?;
             saved_paths.push(published);
         }
         return Ok((saved_paths, published_via_hook));

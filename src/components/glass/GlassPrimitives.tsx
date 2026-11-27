@@ -256,14 +256,12 @@ export const GlassPillNav = React.memo(function GlassPillNav({
       {lens.ready && (
         <div
           aria-hidden="true"
-          className={`pointer-events-none absolute bottom-1.5 top-1.5 left-0 rounded-full ${
+          className={`liquid-lens-track pointer-events-none absolute bottom-1.5 top-1.5 left-0 rounded-full ${
             stretching ? "liquid-lens-stretching" : ""
           }`}
           style={{
             width: `${lens.width}px`,
             transform: `translate3d(${lens.left}px, 0, 0)`,
-            transition:
-              "transform 320ms cubic-bezier(0.22, 1.2, 0.36, 1), width 320ms cubic-bezier(0.22, 1.2, 0.36, 1)",
           }}
         >
           <div className="liquid-lens liquid-lens-inner" />
@@ -336,14 +334,12 @@ export function GlassSegmented({
       {lens.ready && (
         <div
           aria-hidden="true"
-          className={`pointer-events-none absolute bottom-1 top-1 left-0 rounded-full ${
+          className={`liquid-lens-track pointer-events-none absolute bottom-1 top-1 left-0 rounded-full ${
             stretching ? "liquid-lens-stretching" : ""
           }`}
           style={{
             width: `${lens.width}px`,
             transform: `translate3d(${lens.left}px, 0, 0)`,
-            transition:
-              "transform 320ms cubic-bezier(0.22, 1.2, 0.36, 1), width 320ms cubic-bezier(0.22, 1.2, 0.36, 1)",
           }}
         >
           <div className="liquid-lens liquid-lens-inner" />
