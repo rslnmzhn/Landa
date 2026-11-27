@@ -7,6 +7,9 @@
 
 -keep class dev.landa.app.** { *; }
 -keep class app.tauri.** { *; }
+-keep class com.google.mlkit.** { *; }
+-keep class * implements com.google.firebase.components.ComponentRegistrar { *; }
+-keep class androidx.camera.** { *; }
 
 -keep @app.tauri.annotation.TauriPlugin class * { *; }
 -keep @app.tauri.annotation.InvokeArg class * { *; }

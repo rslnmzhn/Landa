@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   Clipboard,
@@ -8,6 +8,7 @@ import {
   Settings,
 } from "lucide-react";
 import { api, formatBytes } from "./core/api";
+import { resolveTabSwipe } from "./core/tabSwipe";
 import type {
   AppSettings,
   ClipboardItem,
@@ -283,12 +284,16 @@ export function App() {
   const lang = settings?.language === "en" ? "en" : "ru";
   const t = translations[lang];
 
+  const isAndroid =
+    identity?.os === "android" ||
+    navigator.userAgent.toLowerCase().includes("android");
+
   const isModuleEnabled = (id: string) =>
     modules.find((m) => m.id === id)?.enabled ?? false;
 
   const sharesEnabled = isModuleEnabled("shares");
   const clipboardEnabled = isModuleEnabled("clipboard");
-  const videolinkEnabled = isModuleEnabled("videolink");
+  const videolinkEnabled = !isAndroid && isModuleEnabled("videolink");
 
   useEffect(() => {
     if (activeTab === "shares" && !sharesEnabled) setActiveTab("devices");
@@ -301,13 +306,18 @@ export function App() {
     [activeTransfers]
   );
 
+  const incomingFriendCount = useMemo(
+    () => friendRequests.filter((r) => r.direction === "incoming").length,
+    [friendRequests]
+  );
+
   const navItems: NavTabItem[] = useMemo(() => {
     const items: NavTabItem[] = [
       {
         id: "devices",
         label: t.nav.devices,
         icon: <Laptop className="h-4 w-4" />,
-        badge: friendRequests.filter((r) => r.direction === "incoming").length,
+        badge: incomingFriendCount,
       },
     ];
     if (sharesEnabled) {
@@ -348,9 +358,30 @@ export function App() {
     sharesEnabled,
     clipboardEnabled,
     videolinkEnabled,
-    friendRequests,
+    incomingFriendCount,
     activeTransferList.length,
   ]);
+
+  const tabIds = useMemo(() => navItems.map((item) => item.id), [navItems]);
+  const tabDirectionRef = useRef<-1 | 0 | 1>(0);
+  const swipeRef = useRef<{
+    x: number;
+    y: number;
+    time: number;
+    locked: "none" | "horizontal" | "vertical";
+  } | null>(null);
+
+  const selectTab = useCallback(
+    (nextId: string) => {
+      if (nextId === activeTab) return;
+      const curIdx = tabIds.indexOf(activeTab);
+      const nextIdx = tabIds.indexOf(nextId);
+      tabDirectionRef.current =
+        curIdx >= 0 && nextIdx >= 0 ? (nextIdx > curIdx ? 1 : -1) : 0;
+      setActiveTab(nextId as TabId);
+    },
+    [activeTab, tabIds]
+  );
 
   const currentOffer = pendingOffers[0] ?? null;
 
@@ -415,20 +446,107 @@ export function App() {
     }
   };
 
+  const handleTouchStart = (e: React.TouchEvent<HTMLElement>) => {
+    if (
+      e.touches.length !== 1 ||
+      currentOffer !== null ||
+      previewData !== null ||
+      previewLoading
+    ) {
+      swipeRef.current = null;
+      return;
+    }
+    let el = e.target as HTMLElement | null;
+    while (el && el !== e.currentTarget) {
+      const tag = el.tagName;
+      if (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        el.hasAttribute("data-no-swipe")
+      ) {
+        swipeRef.current = null;
+        return;
+      }
+      if (el.scrollWidth > el.clientWidth + 2) {
+        const overflowX = window.getComputedStyle(el).overflowX;
+        if (overflowX === "auto" || overflowX === "scroll") {
+          swipeRef.current = null;
+          return;
+        }
+      }
+      el = el.parentElement;
+    }
+    const touch = e.touches[0];
+    swipeRef.current = {
+      x: touch.clientX,
+      y: touch.clientY,
+      time: Date.now(),
+      locked: "none",
+    };
+  };
+
+  const handleTouchMove = (e: React.TouchEvent<HTMLElement>) => {
+    const s = swipeRef.current;
+    if (!s || e.touches.length !== 1) return;
+    if (s.locked !== "none") return;
+    const dx = e.touches[0].clientX - s.x;
+    const dy = e.touches[0].clientY - s.y;
+    if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+    if (Math.abs(dy) >= Math.abs(dx) * 0.85) {
+      s.locked = "vertical";
+      swipeRef.current = null;
+    } else {
+      s.locked = "horizontal";
+    }
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent<HTMLElement>) => {
+    const s = swipeRef.current;
+    swipeRef.current = null;
+    if (!s || s.locked === "vertical" || e.changedTouches.length !== 1) return;
+    const touch = e.changedTouches[0];
+    const nextTab = resolveTabSwipe(
+      tabIds,
+      activeTab,
+      touch.clientX - s.x,
+      touch.clientY - s.y,
+      Date.now() - s.time
+    );
+    if (nextTab) {
+      selectTab(nextTab);
+    }
+  };
+
   return (
     <div className="relative min-h-screen w-full text-slate-900/90 dark:text-white/90">
       <MeshCanvas />
 
       {/* Main Scrollable Content */}
-      <main className="safe-top mx-auto max-w-5xl px-4 pb-28 pt-6 sm:px-6">
-        <div key={activeTab} className="animate-glass-view">
+      <main
+        className="safe-top mx-auto max-w-5xl px-4 pb-28 pt-6 sm:px-6"
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        onTouchCancel={() => {
+          swipeRef.current = null;
+        }}
+      >
+        <div
+          key={activeTab}
+          className="animate-glass-view"
+          style={
+            {
+              "--tab-enter-x": `${tabDirectionRef.current * 20}px`,
+            } as React.CSSProperties
+          }
+        >
           {activeTab === "devices" && (
             <DevicesView
               t={t}
               identity={identity}
               peers={peers}
               friendRequests={friendRequests}
-              leftHanded={settings?.leftHandedMode ?? false}
               updateInfo={updateInfo}
               updateProgress={updateProgress}
               onUpdateInfoChange={setUpdateInfo}
@@ -462,7 +580,7 @@ export function App() {
               onNotice={(m) => showToast("notice", m)}
             />
           )}
-          {activeTab === "videolink" && (
+          {activeTab === "videolink" && !isAndroid && (
             <VideoLinkView
               t={t}
               enabled={videolinkEnabled}
@@ -504,7 +622,7 @@ export function App() {
           <GlassPillNav
             items={navItems}
             activeId={activeTab}
-            onSelect={(id) => setActiveTab(id as TabId)}
+            onSelect={selectTab}
           />
         </div>
       </div>

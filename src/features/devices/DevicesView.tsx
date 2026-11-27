@@ -44,7 +44,6 @@ interface DevicesViewProps {
   identity: LocalIdentityInfo | null;
   peers: PeerInfo[];
   friendRequests: FriendRequestInfo[];
-  leftHanded: boolean;
   updateInfo: UpdateCheckResult | null;
   updateProgress: UpdateProgressEvent | null;
   onUpdateInfoChange: (next: UpdateCheckResult | null) => void;
@@ -62,7 +61,6 @@ export function DevicesView({
   identity,
   peers,
   friendRequests,
-  leftHanded,
   updateInfo,
   updateProgress,
   onUpdateInfoChange,
@@ -330,16 +328,8 @@ export function DevicesView({
   return (
     <div className="space-y-5">
       {/* Minimal Header */}
-      <div
-        className={`flex items-center justify-between gap-3 ${
-          leftHanded ? "flex-row-reverse" : ""
-        }`}
-      >
-        <div
-          className={`flex flex-1 items-center min-w-0 ${
-            leftHanded ? "justify-end" : ""
-          }`}
-        >
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex flex-1 items-center min-w-0">
           {identity && (
             <GlassBadge tone="neutral">
               <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-400" />

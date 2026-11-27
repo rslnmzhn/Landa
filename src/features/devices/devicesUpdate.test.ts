@@ -81,7 +81,6 @@ async function loadDevicesViewComponent() {
     identity: LocalIdentityInfo | null;
     peers: [];
     friendRequests: [];
-    leftHanded: boolean;
     updateInfo: UpdateCheckResult | null;
     updateProgress: UpdateProgressEvent | null;
     onUpdateInfoChange: (next: UpdateCheckResult | null) => void;
@@ -189,7 +188,6 @@ test("DevicesView on Android runs unified download -> verify -> install_update f
           identity: androidIdentity,
           peers: [],
           friendRequests: [],
-          leftHanded: false,
           updateInfo: sampleUpdateInfo,
           updateProgress: null,
           onUpdateInfoChange: () => {},
@@ -274,7 +272,6 @@ test("DevicesView on Android shows permissionHint on INSTALL_PERMISSION_REQUIRED
           identity: androidIdentity,
           peers: [],
           friendRequests: [],
-          leftHanded: false,
           updateInfo: sampleUpdateInfo,
           updateProgress: null,
           onUpdateInfoChange: () => {},

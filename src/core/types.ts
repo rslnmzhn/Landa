@@ -88,7 +88,6 @@ export interface AppSettings {
   autoAcceptFromFriends: boolean;
   autoCopyClipboard?: boolean;
   minimizeToTray: boolean;
-  leftHandedMode: boolean;
   theme: "dark" | "light" | "system";
   language: "ru" | "en";
   discoveryIntervalSecs: number;

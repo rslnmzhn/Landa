@@ -95,11 +95,29 @@ export function SettingsView({
     save({ ...draft, deviceName: trimmed }, true);
   };
 
+  const formatAndroidDownloadDir = (downloadDir: string): string => {
+    if (!downloadDir.startsWith("content://")) return "Downloads/Landa";
+    const treeMarker = "/tree/";
+    const idx = downloadDir.indexOf(treeMarker);
+    if (idx < 0) return downloadDir;
+    try {
+      const decoded = decodeURIComponent(
+        downloadDir.slice(idx + treeMarker.length)
+      );
+      const colonIdx = decoded.indexOf(":");
+      return colonIdx >= 0 ? decoded.slice(colonIdx + 1) || decoded : decoded;
+    } catch {
+      return downloadDir;
+    }
+  };
+
   const handlePickDownloadDir = async () => {
     try {
-      const selected = await open({ directory: true, multiple: false });
+      const selected = isAndroid
+        ? await api.pickDownloadDirAndroid()
+        : await open({ directory: true, multiple: false });
       if (!selected || Array.isArray(selected)) return;
-      await save({ ...draft, downloadDir: selected });
+      await save({ ...draft, downloadDir: selected }, true);
     } catch (e) {
       onError(String(e));
     }
@@ -216,17 +234,20 @@ export function SettingsView({
             </label>
             <div className="flex gap-2">
               <GlassInput
-                value={isAndroid ? "Downloads/Landa" : draft.downloadDir}
+                value={
+                  isAndroid
+                    ? formatAndroidDownloadDir(draft.downloadDir)
+                    : draft.downloadDir
+                }
                 readOnly
               />
-              {!isAndroid && (
-                <GlassButton
-                  onClick={handlePickDownloadDir}
-                  title={t.settings.chooseDir}
-                >
-                  <FolderOpen className="h-4 w-4" />
-                </GlassButton>
-              )}
+              <GlassButton
+                onClick={handlePickDownloadDir}
+                title={t.settings.chooseDir}
+                aria-label={t.settings.chooseDir}
+              >
+                <FolderOpen className="h-4 w-4" />
+              </GlassButton>
             </div>
           </div>
         </div>
@@ -246,11 +267,6 @@ export function SettingsView({
             checked={draft.minimizeToTray}
             onChange={(v) => save({ ...draft, minimizeToTray: v })}
             label={t.settings.minimizeToTray}
-          />
-          <GlassToggle
-            checked={draft.leftHandedMode}
-            onChange={(v) => save({ ...draft, leftHandedMode: v })}
-            label={t.settings.leftHanded}
           />
         </div>
 
@@ -292,7 +308,9 @@ export function SettingsView({
           {t.settings.modules}
         </h2>
         <div className="divide-y divide-white/15 dark:divide-white/10">
-          {modules.map((mod) => {
+          {modules
+            .filter((mod) => !(isAndroid && mod.id === "videolink"))
+            .map((mod) => {
             const label =
               mod.id === "shares"
                 ? t.settings.modShares

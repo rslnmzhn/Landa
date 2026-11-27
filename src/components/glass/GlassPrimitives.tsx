@@ -1,19 +1,37 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-export function MeshCanvas() {
+export const MeshCanvas = React.memo(function MeshCanvas() {
   return (
     <div
       aria-hidden="true"
-      className="pointer-events-none fixed inset-0 -z-10 overflow-hidden bg-[#eef2ff] dark:bg-[#070913] transition-colors duration-500"
+      className="pointer-events-none fixed inset-0 -z-10 overflow-hidden bg-[#eef2ff] dark:bg-[#070913] transition-colors duration-300"
     >
-      <div className="animate-float-slow absolute -left-24 -top-24 h-[460px] w-[460px] rounded-full bg-indigo-400/40 dark:bg-indigo-600/35 blur-[110px]" />
-      <div className="animate-float-reverse absolute -right-20 top-12 h-[420px] w-[420px] rounded-full bg-sky-300/45 dark:bg-cyan-500/25 blur-[110px]" />
-      <div className="animate-float-slow absolute -bottom-32 left-1/3 h-[500px] w-[500px] rounded-full bg-violet-300/45 dark:bg-fuchsia-600/25 blur-[130px]" />
+      <div
+        className="absolute -left-24 -top-24 h-[520px] w-[520px] rounded-full opacity-70 dark:opacity-55"
+        style={{
+          background:
+            "radial-gradient(circle, rgba(129,140,248,0.45) 0%, rgba(129,140,248,0) 70%)",
+        }}
+      />
+      <div
+        className="absolute -right-20 top-12 h-[480px] w-[480px] rounded-full opacity-70 dark:opacity-50"
+        style={{
+          background:
+            "radial-gradient(circle, rgba(56,189,248,0.4) 0%, rgba(56,189,248,0) 70%)",
+        }}
+      />
+      <div
+        className="absolute -bottom-32 left-1/3 h-[560px] w-[560px] rounded-full opacity-70 dark:opacity-50"
+        style={{
+          background:
+            "radial-gradient(circle, rgba(192,132,252,0.4) 0%, rgba(192,132,252,0) 70%)",
+        }}
+      />
       <div className="absolute inset-0 bg-gradient-to-b from-white/20 via-transparent to-black/5 dark:from-white/[0.02] dark:via-transparent dark:to-black/40" />
     </div>
   );
-}
+});
 
 interface GlassCardProps extends React.HTMLAttributes<HTMLDivElement> {
   elevated?: boolean;
@@ -30,7 +48,7 @@ export function GlassCard({
     <div
       className={`${
         elevated ? "liquid-glass-elevated" : "liquid-glass"
-      } rounded-3xl transition-all duration-300 ${className}`}
+      } rounded-3xl transition-colors duration-200 ${className}`}
       {...rest}
     >
       {children}
@@ -53,7 +71,7 @@ export function GlassButton({
   ...rest
 }: GlassButtonProps) {
   const base =
-    "inline-flex items-center justify-center gap-2 rounded-full font-medium transition-all duration-200 active:scale-[0.96] disabled:opacity-40 disabled:pointer-events-none select-none";
+    "inline-flex items-center justify-center gap-2 rounded-full font-medium transition-[transform,opacity,background-color,border-color] duration-150 active:scale-[0.96] disabled:opacity-40 disabled:pointer-events-none select-none";
   const sizing =
     size === "sm"
       ? "min-h-[44px] px-4 text-sm"
@@ -101,7 +119,7 @@ export function GlassBadge({
   };
   return (
     <span
-      className={`inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium backdrop-blur-md ${tones[tone]} ${className}`}
+      className={`inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium ${tones[tone]} ${className}`}
     >
       {children}
     </span>
@@ -114,7 +132,7 @@ export function GlassInput(
   const { className = "", ...rest } = props;
   return (
     <input
-      className={`min-h-[44px] w-full rounded-2xl border border-white/30 dark:border-white/15 bg-white/35 dark:bg-white/[0.06] px-4 text-sm text-slate-900/90 dark:text-white/90 placeholder:text-slate-500/70 dark:placeholder:text-white/40 backdrop-blur-xl focus:outline-none focus:ring-2 focus:ring-indigo-400/50 ${className}`}
+      className={`min-h-[44px] w-full rounded-2xl border border-white/30 dark:border-white/15 bg-white/35 dark:bg-white/[0.06] px-4 text-sm text-slate-900/90 dark:text-white/90 placeholder:text-slate-500/70 dark:placeholder:text-white/40 focus:outline-none focus:ring-2 focus:ring-indigo-400/50 ${className}`}
       {...rest}
     />
   );
@@ -215,7 +233,7 @@ export interface NavTabItem {
   badge?: number;
 }
 
-export function GlassPillNav({
+export const GlassPillNav = React.memo(function GlassPillNav({
   items,
   activeId,
   onSelect,
@@ -245,7 +263,7 @@ export function GlassPillNav({
             width: `${lens.width}px`,
             transform: `translate3d(${lens.left}px, 0, 0)`,
             transition:
-              "transform 440ms cubic-bezier(0.22, 1.28, 0.36, 1), width 440ms cubic-bezier(0.22, 1.28, 0.36, 1)",
+              "transform 320ms cubic-bezier(0.22, 1.2, 0.36, 1), width 320ms cubic-bezier(0.22, 1.2, 0.36, 1)",
           }}
         >
           <div className="liquid-lens liquid-lens-inner" />
@@ -262,14 +280,14 @@ export function GlassPillNav({
             }}
             type="button"
             onClick={() => onSelect(item.id)}
-            className={`relative z-10 flex min-h-[44px] items-center gap-2 rounded-full px-4 text-sm font-medium transition-all duration-200 active:scale-95 ${
+            className={`relative z-10 flex min-h-[44px] items-center gap-2 rounded-full px-4 text-sm font-medium transition-colors duration-150 active:scale-95 ${
               active
                 ? "text-slate-950 dark:text-white"
                 : "text-slate-700/75 dark:text-white/60 hover:text-slate-950 dark:hover:text-white/90"
             }`}
           >
             <span
-              className={`transition-transform duration-300 ease-[cubic-bezier(0.22,1.28,0.36,1)] ${
+              className={`transition-transform duration-200 ease-[cubic-bezier(0.22,1.2,0.36,1)] ${
                 active ? "scale-110" : "scale-100"
               }`}
             >
@@ -286,7 +304,7 @@ export function GlassPillNav({
       })}
     </nav>
   );
-}
+});
 
 export interface SegmentedOption {
   id: string;
@@ -313,7 +331,7 @@ export function GlassSegmented({
   return (
     <div
       ref={containerRef}
-      className={`relative inline-flex items-center gap-1 rounded-full border border-white/25 dark:border-white/15 bg-white/25 dark:bg-white/[0.05] p-1 backdrop-blur-xl ${className}`}
+      className={`relative inline-flex items-center gap-1 rounded-full border border-white/25 dark:border-white/15 bg-white/25 dark:bg-white/[0.05] p-1 ${className}`}
     >
       {lens.ready && (
         <div
@@ -325,7 +343,7 @@ export function GlassSegmented({
             width: `${lens.width}px`,
             transform: `translate3d(${lens.left}px, 0, 0)`,
             transition:
-              "transform 400ms cubic-bezier(0.22, 1.28, 0.36, 1), width 400ms cubic-bezier(0.22, 1.28, 0.36, 1)",
+              "transform 320ms cubic-bezier(0.22, 1.2, 0.36, 1), width 320ms cubic-bezier(0.22, 1.2, 0.36, 1)",
           }}
         >
           <div className="liquid-lens liquid-lens-inner" />

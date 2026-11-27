@@ -23,6 +23,7 @@ pub struct AppSettings {
     #[serde(default = "default_true")]
     pub auto_copy_clipboard: bool,
     pub minimize_to_tray: bool,
+    #[serde(default)]
     pub left_handed_mode: bool,
     pub theme: String,
     pub language: String,

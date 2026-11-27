@@ -258,12 +258,74 @@ pub async fn unfriend(state: State<'_, AppState>, peer_id: String) -> Result<(),
         .map_err(|e| e.to_string())
 }
 
+#[cfg(any(target_os = "android", test))]
+async fn collect_send_items_with_content_resolver<F, Fut>(
+    paths: Vec<String>,
+    mut resolve_content_uri: F,
+) -> Result<Vec<landa_core::OutgoingFileItem>, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(String, u64), String>>,
+{
+    let mut items = Vec::with_capacity(paths.len());
+    for raw in paths {
+        if raw.starts_with("content://") {
+            let (name, size_bytes) = resolve_content_uri(raw.clone()).await?;
+            let clean_name = std::path::Path::new(&name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::trim)
+                .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+                .unwrap_or("file")
+                .to_string();
+            items.push(landa_core::OutgoingFileItem {
+                source_path: PathBuf::from(&raw),
+                source_uri: Some(raw),
+                relative_path: clean_name,
+                size_bytes,
+            });
+        } else {
+            let local_items =
+                landa_core::transfer::TransferManager::collect_outgoing_items(&[PathBuf::from(raw)])
+                    .map_err(|e| e.to_string())?;
+            items.extend(local_items);
+        }
+    }
+    Ok(items)
+}
+
 #[tauri::command]
 pub async fn send_files(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     peer_id: String,
     paths: Vec<String>,
 ) -> Result<TransferHistoryRecord, String> {
+    #[cfg(target_os = "android")]
+    {
+        if paths.iter().any(|p| p.starts_with("content://")) {
+            use tauri::Manager;
+            let bridge = app
+                .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+                .ok_or_else(|| "Android bridge unavailable".to_string())?;
+            let items = collect_send_items_with_content_resolver(paths, |uri| {
+                let bridge = bridge.inner().clone();
+                async move {
+                    let meta = bridge.get_content_uri_meta_async(&uri).await?;
+                    Ok((meta.name, meta.size_bytes))
+                }
+            })
+            .await?;
+            return state
+                .engine
+                .send_items(&peer_id, items)
+                .await
+                .map_err(|e| e.to_string());
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = app;
+
     let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     state
         .engine
@@ -362,6 +424,23 @@ pub fn update_settings(
         .engine
         .update_settings(settings)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn pick_download_dir_android(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        let bridge = app
+            .try_state::<crate::android_bridge::AndroidBridge<tauri::Wry>>()
+            .ok_or_else(|| "Android bridge unavailable".to_string())?;
+        bridge.pick_download_folder_async().await
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Err("pick_download_dir_android is only supported on Android".into())
+    }
 }
 
 #[tauri::command]
@@ -1997,6 +2076,40 @@ mod tests {
         assert!(active_preview.exists());
         assert!(active_apk.exists());
         assert!(queued_share.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn collect_send_items_resolves_content_uris_and_local_files() {
+        let root = std::env::temp_dir().join(format!("landa-send-items-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let local_file = root.join("hello.txt");
+        std::fs::write(&local_file, b"hello").unwrap();
+
+        let items = collect_send_items_with_content_resolver(
+            vec![
+                "content://media/external/file/42".to_string(),
+                local_file.to_string_lossy().to_string(),
+            ],
+            |uri| async move {
+                assert_eq!(uri, "content://media/external/file/42");
+                Ok(("../photo.jpg".to_string(), 1234))
+            },
+        )
+        .await
+        .expect("should resolve both content URI and local file");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].source_uri.as_deref(),
+            Some("content://media/external/file/42")
+        );
+        assert_eq!(items[0].relative_path, "photo.jpg");
+        assert_eq!(items[0].size_bytes, 1234);
+        assert_eq!(items[1].source_uri, None);
+        assert_eq!(items[1].relative_path, "hello.txt");
+        assert_eq!(items[1].size_bytes, 5);
 
         let _ = std::fs::remove_dir_all(&root);
     }

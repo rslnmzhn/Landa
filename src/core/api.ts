@@ -157,6 +157,8 @@ export const api = {
   takePendingFocusTarget: () =>
     invoke<PendingFocusTarget | null>("take_pending_focus_target"),
   ensureStartupPermissions: () => invoke<void>("ensure_startup_permissions"),
+  pickDownloadDirAndroid: () =>
+    invoke<string | null>("pick_download_dir_android"),
 
   // App Auto-Update
   checkForUpdates: () => invoke<UpdateCheckResult>("check_for_updates"),

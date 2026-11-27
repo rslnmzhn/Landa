@@ -57,6 +57,7 @@ import java.util.concurrent.ConcurrentHashMap
 class PublishToDownloadsArgs {
     lateinit var sourcePath: String
     lateinit var relativePath: String
+    var targetTreeUri: String? = null
 }
 
 @InvokeArg
@@ -1642,6 +1643,66 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun pickDownloadFolder(invoke: Invoke) {
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+                )
+            }
+            startActivityForResult(invoke, intent, "pickDownloadFolderResult")
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to open folder picker")
+        }
+    }
+
+    @ActivityCallback
+    fun pickDownloadFolderResult(invoke: Invoke, result: ActivityResult) {
+        if (result.resultCode == Activity.RESULT_CANCELED) {
+            val res = JSObject()
+            res.put("cancelled", true)
+            invoke.resolve(res)
+            return
+        }
+        if (result.resultCode != Activity.RESULT_OK) {
+            invoke.reject("Folder picker failed")
+            return
+        }
+        val treeUri = result.data?.data
+        if (treeUri == null) {
+            val res = JSObject()
+            res.put("cancelled", true)
+            invoke.resolve(res)
+            return
+        }
+
+        try {
+            activity.contentResolver.takePersistableUriPermission(
+                treeUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "Failed to persist folder permission")
+            return
+        }
+
+        val rootDocUri = DocumentsContract.buildDocumentUriUsingTree(
+            treeUri,
+            DocumentsContract.getTreeDocumentId(treeUri)
+        )
+        val name = queryDisplayName(rootDocUri)?.trim()?.ifEmpty { null } ?: "Folder"
+        val res = JSObject()
+        res.put("cancelled", false)
+        res.put("uri", treeUri.toString())
+        res.put("name", name)
+        res.put("isDir", true)
+        invoke.resolve(res)
+    }
+
+    @Command
     fun pickShareFolder(invoke: Invoke) {
         try {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
@@ -2234,7 +2295,18 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             }
 
             val cleanRel = sanitizeRelativePath(args.relativePath)
-            val published = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val treeUriStr = args.targetTreeUri?.trim()?.takeIf { it.startsWith("content://") }
+            val published = if (treeUriStr != null) {
+                try {
+                    publishViaSafTree(sourceFile, cleanRel, treeUriStr)
+                } catch (_: Exception) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        publishViaMediaStore(sourceFile, cleanRel)
+                    } else {
+                        publishLegacyDownloads(sourceFile, cleanRel)
+                    }
+                }
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 publishViaMediaStore(sourceFile, cleanRel)
             } else {
                 publishLegacyDownloads(sourceFile, cleanRel)
@@ -2248,6 +2320,91 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (ex: Exception) {
             invoke.reject(ex.message ?: "Failed to publish file to Downloads")
         }
+    }
+
+    private fun publishViaSafTree(
+        sourceFile: File,
+        cleanRel: String,
+        treeUriStr: String,
+    ): PublishedDownload {
+        val resolver = activity.contentResolver
+        val treeUri = Uri.parse(treeUriStr)
+        var currentDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        val parts = cleanRel.split('/').filter { it.isNotEmpty() }
+        val fileName = parts.lastOrNull() ?: sourceFile.name
+
+        for (dirName in parts.dropLast(1)) {
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, currentDocId)
+            var existingDirId: String? = null
+            resolver.query(
+                childrenUri,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                ),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                while (cursor.moveToNext()) {
+                    val name = if (nameIdx >= 0) cursor.getString(nameIdx) else null
+                    val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else null
+                    if (name == dirName && mime == DocumentsContract.Document.MIME_TYPE_DIR && idIdx >= 0) {
+                        existingDirId = cursor.getString(idIdx)
+                        break
+                    }
+                }
+            }
+            currentDocId = existingDirId ?: run {
+                val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, currentDocId)
+                val created = DocumentsContract.createDocument(
+                    resolver,
+                    parentUri,
+                    DocumentsContract.Document.MIME_TYPE_DIR,
+                    dirName,
+                ) ?: throw IllegalStateException("Failed to create SAF directory: $dirName")
+                DocumentsContract.getDocumentId(created)
+            }
+        }
+
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+            ?: "application/octet-stream"
+        val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, currentDocId)
+        val fileUri = DocumentsContract.createDocument(resolver, parentUri, mimeType, fileName)
+            ?: throw IllegalStateException("Failed to create SAF file: $fileName")
+
+        try {
+            resolver.openOutputStream(fileUri)?.use { out ->
+                FileInputStream(sourceFile).use { input ->
+                    input.copyTo(out, 64 * 1024)
+                }
+            } ?: throw IllegalStateException("Failed to open SAF output stream")
+        } catch (ex: Exception) {
+            try {
+                DocumentsContract.deleteDocument(resolver, fileUri)
+            } catch (_: Exception) {
+            }
+            throw ex
+        }
+
+        val uriStr = fileUri.toString()
+        publishedUris[uriStr] = Pair(fileUri, mimeType)
+        val displayName = queryDisplayName(fileUri)?.trim()?.ifEmpty { null } ?: fileName
+        val displayPath = if (parts.size > 1) {
+            (parts.dropLast(1) + displayName).joinToString("/")
+        } else {
+            displayName
+        }
+        publishedDisplayPaths[uriStr] = displayPath
+        return PublishedDownload(
+            publishedPath = uriStr,
+            displayPath = displayPath,
+        )
     }
 
     private fun publishViaMediaStore(sourceFile: File, cleanRel: String): PublishedDownload {

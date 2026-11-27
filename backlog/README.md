@@ -6,16 +6,18 @@
 
 | # | Файл | Задача | Приоритет |
 |---|---|---|---|
-| 17 | [17-clipboard-sync-and-ui-fix.md](./17-clipboard-sync-and-ui-fix.md) | Починка модуля буфера обмена (`Clipboard`) и бага отправки текста целевому устройству | P0 (Критический) |
-| 18 | [18-android-to-pc-shares-folder-download.md](./18-android-to-pc-shares-folder-download.md) | Починка скачивания папок из `Shares` с Android на ПК | P1 (Высокий) |
-| 19 | [19-downloads-storage-and-app-size-accounting.md](./19-downloads-storage-and-app-size-accounting.md) | Исключение скачанных файлов и кэшей из «веса приложения» на Android | P1 (Высокий) |
-| 20 | [20-svg-app-icon-and-android-launcher.md](./20-svg-app-icon-and-android-launcher.md) | Переделка PNG-иконки в SVG и замена иконки приложения везде (включая Android) | P1 (Высокий) |
-| 21 | [21-android-apk-size-reduction.md](./21-android-apk-size-reduction.md) | Уменьшение веса Android APK | P2 (Средний) |
+| 22 | [22-android-qr-scanner-and-direct-send-fix.md](./22-android-qr-scanner-and-direct-send-fix.md) | Починка краша QR-сканера и прямой отправки файлов с Android на ПК | P0 (Критический) |
+| 23 | [23-ui-ux-cleanup-and-performance.md](./23-ui-ux-cleanup-and-performance.md) | Очистка UI/UX, платформенные доработки Android и оптимизация анимаций | P1 (Высокий) |
 
 ## Done
 
 | # | Файл | Задача | Status |
 |---|---|---|---|
+| 21 | [21-android-apk-size-reduction.md](./21-android-apk-size-reduction.md) | Уменьшение веса Android APK | Done |
+| 20 | [20-svg-app-icon-and-android-launcher.md](./20-svg-app-icon-and-android-launcher.md) | Переделка PNG-иконки в SVG и замена иконки приложения везде (включая Android) | Done |
+| 19 | [19-downloads-storage-and-app-size-accounting.md](./19-downloads-storage-and-app-size-accounting.md) | Исключение скачанных файлов и кэшей из «веса приложения» на Android | Done |
+| 18 | [18-android-to-pc-shares-folder-download.md](./18-android-to-pc-shares-folder-download.md) | Починка скачивания папок из `Shares` с Android на ПК | Done |
+| 17 | [17-clipboard-sync-and-ui-fix.md](./17-clipboard-sync-and-ui-fix.md) | Починка модуля буфера обмена (`Clipboard`) и бага отправки текста целевому устройству | Done |
 | 16 | [16-android-connection-and-shares-recovery.md](./16-android-connection-and-shares-recovery.md) | Стабильность подключения на Android и восстановление видимости устройств и `Shares` | Done |
 | 15 | [15-android-automatic-update.md](./15-android-automatic-update.md) | Автоматический запуск установки обновлений на Android | Done |
 | 14 | [14-shares-folder-download-and-paths.md](./14-shares-folder-download-and-paths.md) | Скачивание папок целиком в `Shares` и отображение путей к файлам | Done |

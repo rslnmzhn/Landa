@@ -449,6 +449,7 @@ pub fn run() {
             commands::shares_add_local,
             commands::shares_pick_folder_android,
             commands::shares_pick_file_android,
+            commands::pick_download_dir_android,
             commands::shares_remove_local,
             commands::shares_browse_remote_roots,
             commands::shares_browse_remote_dir,

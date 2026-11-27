@@ -16,6 +16,7 @@ use tauri::{Manager, Runtime};
 struct PublishArgs {
     source_path: String,
     relative_path: String,
+    target_tree_uri: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -575,10 +576,16 @@ impl<R: Runtime> AndroidBridge<R> {
             .await;
     }
 
-    pub fn publish_to_downloads(&self, source: &Path, relative: &Path) -> Option<String> {
+    pub fn publish_to_downloads(
+        &self,
+        source: &Path,
+        relative: &Path,
+        target_tree_uri: Option<String>,
+    ) -> Option<String> {
         let args = PublishArgs {
             source_path: source.to_string_lossy().to_string(),
             relative_path: relative.to_string_lossy().replace('\\', "/"),
+            target_tree_uri,
         };
         match self
             .handle
@@ -604,6 +611,22 @@ impl<R: Runtime> AndroidBridge<R> {
             .run_mobile_plugin::<SharedFilesResponse>("peekPendingSharedFiles", ())
             .map(|r| r.paths)
             .map_err(|e| e.to_string())
+    }
+
+    pub async fn pick_download_folder_async(&self) -> Result<Option<String>, String> {
+        let res = self
+            .handle
+            .run_mobile_plugin_async::<PickShareResponse>("pickDownloadFolder", ())
+            .await
+            .map_err(|e| e.to_string())?;
+        if res.cancelled {
+            return Ok(None);
+        }
+        let uri = res
+            .uri
+            .filter(|u| !u.trim().is_empty())
+            .ok_or_else(|| "Missing folder URI".to_string())?;
+        Ok(Some(uri))
     }
 
     pub async fn pick_share_folder_async(&self) -> Result<Option<(String, String, bool)>, String> {
@@ -910,8 +933,12 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
 
 pub fn make_publish_hook<R: Runtime>(app: tauri::AppHandle<R>) -> ReceivePublishHook {
     Arc::new(move |source: &Path, relative: &Path| {
+        let target_tree_uri = app
+            .try_state::<crate::commands::AppState>()
+            .map(|state| state.engine.get_settings().download_dir)
+            .filter(|dir| dir.starts_with("content://"));
         app.try_state::<AndroidBridge<R>>()
-            .and_then(|bridge| bridge.publish_to_downloads(source, relative))
+            .and_then(|bridge| bridge.publish_to_downloads(source, relative, target_tree_uri))
     })
 }
 

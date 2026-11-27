@@ -585,7 +585,14 @@ impl TransferManager {
         cancel: &CancellationToken,
     ) -> Result<Vec<String>, CoreError> {
         tokio::fs::create_dir_all(temp_dir).await?;
-        tokio::fs::create_dir_all(download_dir).await?;
+        let has_publish_hook = self
+            .publish_hook
+            .read()
+            .expect("publish_hook lock poisoned")
+            .is_some();
+        if !has_publish_hook {
+            tokio::fs::create_dir_all(download_dir).await?;
+        }
 
         let started = Instant::now();
         let mut last_emit = Instant::now();
