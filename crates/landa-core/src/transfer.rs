@@ -584,15 +584,12 @@ impl TransferManager {
         download_dir: &Path,
         cancel: &CancellationToken,
     ) -> Result<Vec<String>, CoreError> {
-        tokio::fs::create_dir_all(temp_dir).await?;
-        let has_publish_hook = self
+        let hook = self
             .publish_hook
             .read()
             .expect("publish_hook lock poisoned")
-            .is_some();
-        if !has_publish_hook {
-            tokio::fs::create_dir_all(download_dir).await?;
-        }
+            .clone();
+        prepare_receive_dirs(temp_dir, download_dir, hook.as_ref()).await?;
 
         let started = Instant::now();
         let mut last_emit = Instant::now();
@@ -671,14 +668,25 @@ impl TransferManager {
             staged_files.push((temp_file_path, rel_path.clone()));
         }
 
-        let hook = self
-            .publish_hook
-            .read()
-            .expect("publish_hook lock poisoned")
-            .clone();
-
         publish_staged_files(staged_files, download_dir, hook.as_ref()).await
     }
+}
+
+async fn prepare_receive_dirs(
+    temp_dir: &Path,
+    download_dir: &Path,
+    hook: Option<&ReceivePublishHook>,
+) -> Result<(), CoreError> {
+    tokio::fs::create_dir_all(temp_dir).await?;
+    if hook.is_none() {
+        if download_dir.to_string_lossy().starts_with("content://") {
+            return Err(CoreError::Io(std::io::Error::other(
+                "cannot write directly to content:// URI without SAF publish hook",
+            )));
+        }
+        tokio::fs::create_dir_all(download_dir).await?;
+    }
+    Ok(())
 }
 
 async fn publish_staged_files(
@@ -925,6 +933,29 @@ mod tests {
         .await
         .expect_err("content:// download_dir without hook must fail");
         assert!(content_uri_err.to_string().contains("content://"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn prepare_receive_dirs_rejects_content_uri_without_hook_before_creating_dirs() {
+        let root = std::env::temp_dir().join(format!("landa-prep-saf-{}", Uuid::new_v4()));
+        let temp_dir = root.join("temp");
+        let content_uri =
+            Path::new("content://com.android.externalstorage.documents/tree/primary%3ADownload");
+
+        let err = prepare_receive_dirs(&temp_dir, content_uri, None)
+            .await
+            .expect_err("content:// download_dir without hook must fail before create_dir_all");
+
+        let msg = err.to_string();
+        assert!(msg.contains("content://"), "unexpected error: {msg}");
+        assert!(msg.contains("SAF"), "unexpected error: {msg}");
+        assert!(
+            !Path::new("content:").exists()
+                && !Path::new("content://com.android.externalstorage.documents").exists(),
+            "no local directory should be created for content:// URI"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
