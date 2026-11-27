@@ -7,12 +7,13 @@
 | # | Файл | Задача | Приоритет |
 |---|---|---|---|
 | 22 | [22-android-qr-scanner-and-direct-send-fix.md](./22-android-qr-scanner-and-direct-send-fix.md) | Починка краша QR-сканера и прямой отправки файлов с Android на ПК | P0 (Критический) |
-| 23 | [23-ui-ux-cleanup-and-performance.md](./23-ui-ux-cleanup-and-performance.md) | Очистка UI/UX, платформенные доработки Android и оптимизация анимаций | P1 (Высокий) |
+| 24 | [24-desktop-app-icon-update.md](./24-desktop-app-icon-update.md) | Обновление иконки в десктопных приложениях (Windows / Linux) | P1 (Высокий) |
 
 ## Done
 
 | # | Файл | Задача | Status |
 |---|---|---|---|
+| 23 | [23-ui-ux-cleanup-and-performance.md](./23-ui-ux-cleanup-and-performance.md) | Очистка UI/UX, платформенные доработки Android и оптимизация анимаций | Done |
 | 21 | [21-android-apk-size-reduction.md](./21-android-apk-size-reduction.md) | Уменьшение веса Android APK | Done |
 | 20 | [20-svg-app-icon-and-android-launcher.md](./20-svg-app-icon-and-android-launcher.md) | Переделка PNG-иконки в SVG и замена иконки приложения везде (включая Android) | Done |
 | 19 | [19-downloads-storage-and-app-size-accounting.md](./19-downloads-storage-and-app-size-accounting.md) | Исключение скачанных файлов и кэшей из «веса приложения» на Android | Done |
