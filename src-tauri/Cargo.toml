@@ -27,7 +27,7 @@ landa-mod-shares = { path = "../crates/landa-mod-shares", optional = true }
 landa-mod-clipboard = { path = "../crates/landa-mod-clipboard", optional = true }
 landa-mod-videolink = { path = "../crates/landa-mod-videolink", optional = true }
 qrcode = { version = "0.15", default-features = false, features = ["svg"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "http2", "charset"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -38,19 +38,19 @@ tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
 tokio = { version = "1.41", features = ["rt-multi-thread", "sync", "fs", "io-util", "net"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = "0.3"
 uuid = { version = "1.11", features = ["v4"] }
-webpki-roots = "0.26"
+webpki-roots = "1"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 arboard = "3.7"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 
 [profile.release]
-opt-level = "s"
-lto = "thin"
+opt-level = "z"
+lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"

@@ -39,6 +39,7 @@ enum PreviewSource {
     File(PathBuf),
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     ContentUri(String),
+    Bytes(Arc<[u8]>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +127,15 @@ impl PreviewServer {
         });
 
         Ok(server)
+    }
+
+    pub fn register_bytes(&self, mime_type: String, bytes: Arc<[u8]>) -> String {
+        let size_bytes = bytes.len() as u64;
+        self.register(PreviewEntry {
+            source: PreviewSource::Bytes(bytes),
+            mime_type,
+            size_bytes,
+        })
     }
 
     fn register(&self, entry: PreviewEntry) -> String {
@@ -372,7 +382,7 @@ pub async fn prepare_file_preview(
         return Err("Empty file path".into());
     }
 
-    authorize_preview_target(app, state, trimmed)?;
+    authorize_preview_target(app, state, trimmed).await?;
 
     if trimmed.starts_with("content://") {
         return prepare_content_uri_preview(app, server, trimmed).await;
@@ -478,67 +488,86 @@ pub async fn open_file_external(app: &AppHandle, path_or_uri: &str) -> Result<()
     }
 }
 
-fn authorize_preview_target(
+async fn authorize_preview_target(
     app: &AppHandle,
     state: &AppState,
     path_or_uri: &str,
 ) -> Result<(), String> {
-    let history = state.engine.list_history(500).map_err(|e| e.to_string())?;
-    if history
-        .iter()
-        .any(|rec| rec.saved_paths.iter().any(|p| p == path_or_uri))
-    {
-        return Ok(());
-    }
-
-    if path_or_uri.starts_with("content://") {
-        #[cfg(feature = "mod-shares")]
-        if let Ok(roots) = state.shares.list_local_shares() {
-            if roots.iter().any(|r| !r.is_dir && r.path == path_or_uri) {
-                return Ok(());
-            }
-        }
-        return Err("Unauthorized content URI".into());
-    }
-
-    let canonical = PathBuf::from(path_or_uri)
-        .canonicalize()
-        .map_err(|e| format!("File not found: {e}"))?;
-
-    let download_dir = PathBuf::from(state.engine.get_settings().download_dir);
-    if let Ok(dl_canon) = download_dir.canonicalize() {
-        if canonical.starts_with(&dl_canon) {
-            return Ok(());
-        }
-    }
-
-    if let Ok(cache_dir) = resolve_preview_cache_dir(app) {
-        if let Ok(cache_canon) = cache_dir.canonicalize() {
-            if canonical.starts_with(&cache_canon) {
-                return Ok(());
-            }
-        }
-    }
-
+    let engine = Arc::clone(&state.engine);
     #[cfg(feature = "mod-shares")]
-    if let Ok(roots) = state.shares.list_local_shares() {
-        for root in roots {
-            if let Ok(root_canon) = PathBuf::from(&root.path).canonicalize() {
-                if canonical == root_canon || canonical.starts_with(&root_canon) {
+    let shares = Arc::clone(&state.shares);
+    #[cfg(feature = "mod-clipboard")]
+    let clipboard = Arc::clone(&state.clipboard);
+    let cache_dir = resolve_preview_cache_dir(app).ok();
+    let target = path_or_uri.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        if target.starts_with("content://") {
+            #[cfg(feature = "mod-shares")]
+            if let Ok(roots) = shares.list_local_shares() {
+                if roots.iter().any(|r| !r.is_dir && r.path == target) {
+                    return Ok(());
+                }
+            }
+            let history = engine.list_history(500).map_err(|e| e.to_string())?;
+            if history
+                .iter()
+                .any(|rec| rec.saved_paths.iter().any(|p| p == &target))
+            {
+                return Ok(());
+            }
+            return Err("Unauthorized content URI".into());
+        }
+
+        let canonical = PathBuf::from(&target)
+            .canonicalize()
+            .map_err(|e| format!("File not found: {e}"))?;
+
+        let download_dir = PathBuf::from(engine.get_settings().download_dir);
+        if let Ok(dl_canon) = download_dir.canonicalize() {
+            if canonical.starts_with(&dl_canon) {
+                return Ok(());
+            }
+        }
+
+        if let Some(cache_dir) = cache_dir {
+            if let Ok(cache_canon) = cache_dir.canonicalize() {
+                if canonical.starts_with(&cache_canon) {
                     return Ok(());
                 }
             }
         }
-    }
 
-    #[cfg(feature = "mod-clipboard")]
-    if let Ok(clip_canon) = state.clipboard.images_dir().canonicalize() {
-        if canonical.starts_with(&clip_canon) {
+        #[cfg(feature = "mod-shares")]
+        if let Ok(roots) = shares.list_local_shares() {
+            for root in roots {
+                if let Ok(root_canon) = PathBuf::from(&root.path).canonicalize() {
+                    if canonical == root_canon || canonical.starts_with(&root_canon) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "mod-clipboard")]
+        if let Ok(clip_canon) = clipboard.images_dir().canonicalize() {
+            if canonical.starts_with(&clip_canon) {
+                return Ok(());
+            }
+        }
+
+        let history = engine.list_history(500).map_err(|e| e.to_string())?;
+        if history
+            .iter()
+            .any(|rec| rec.saved_paths.iter().any(|p| p == &target))
+        {
             return Ok(());
         }
-    }
 
-    Err("File is outside allowed preview directories".into())
+        Err("File is outside allowed preview directories".into())
+    })
+    .await
+    .map_err(|e| format!("authorize_preview_target task failed: {e}"))?
 }
 
 async fn read_text_preview(
@@ -632,6 +661,48 @@ async fn handle_http_connection(
         return Ok(());
     };
 
+    if let PreviewSource::Bytes(bytes) = &entry.source {
+        let total = bytes.len() as u64;
+        if total == 0 {
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                entry.mime_type
+            );
+            let _ = writer.write_all(headers.as_bytes()).await;
+            return Ok(());
+        }
+        let (status_line, start, end) = if let Some(ref range_val) = range_header {
+            match parse_byte_range(range_val, total) {
+                Some((s, e)) => ("206 Partial Content", s, e),
+                None => {
+                    let resp = format!(
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = writer.write_all(resp.as_bytes()).await;
+                    return Ok(());
+                }
+            }
+        } else {
+            ("200 OK", 0, total - 1)
+        };
+        let content_len = end - start + 1;
+        let mut headers = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: {}\r\nContent-Length: {content_len}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n",
+            entry.mime_type
+        );
+        if status_line.starts_with("206") {
+            headers.push_str(&format!("Content-Range: bytes {start}-{end}/{total}\r\n"));
+        }
+        headers.push_str("\r\n");
+        if writer.write_all(headers.as_bytes()).await.is_err() || method == "HEAD" {
+            return Ok(());
+        }
+        let _ = writer
+            .write_all(&bytes[start as usize..=end as usize])
+            .await;
+        return Ok(());
+    }
+
     let mut file = match &entry.source {
         PreviewSource::File(path) => match tokio::fs::File::open(path).await {
             Ok(f) => f,
@@ -665,6 +736,7 @@ async fn handle_http_connection(
                 return Ok(());
             }
         }
+        PreviewSource::Bytes(_) => unreachable!(),
     };
 
     let total = if entry.size_bytes > 0 {

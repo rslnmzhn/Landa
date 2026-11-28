@@ -9,6 +9,7 @@ import {
   X,
 } from "lucide-react";
 import { api, formatBytes } from "../../core/api";
+import { dataUrlToBlobUrl, revokeBlobUrl } from "../../core/blobUrl";
 import { processClipboardImagePaste } from "./clipboardPaste.ts";
 import type {
   ClipboardItem,
@@ -24,7 +25,77 @@ import {
   GlassSegmented,
 } from "../../components/glass/GlassPrimitives";
 
+const CLIPBOARD_PREVIEW_CACHE_LIMIT = 100;
 const imagePreviewCache = new Map<string, PreviewDescriptor>();
+const clipboardThumbObserverTargets = new Map<Element, () => void>();
+let sharedClipboardThumbObserver: IntersectionObserver | null = null;
+
+function getSharedClipboardThumbObserver(): IntersectionObserver | null {
+  if (typeof IntersectionObserver === "undefined") return null;
+  if (!sharedClipboardThumbObserver) {
+    sharedClipboardThumbObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const cb = clipboardThumbObserverTargets.get(entry.target);
+          if (cb) {
+            clipboardThumbObserverTargets.delete(entry.target);
+            sharedClipboardThumbObserver?.unobserve(entry.target);
+            cb();
+          }
+        }
+      },
+      { rootMargin: "120px" }
+    );
+  }
+  return sharedClipboardThumbObserver;
+}
+
+function observeClipboardThumb(el: Element, onVisible: () => void): () => void {
+  const observer = getSharedClipboardThumbObserver();
+  if (!observer) {
+    onVisible();
+    return () => {};
+  }
+  clipboardThumbObserverTargets.set(el, onVisible);
+  observer.observe(el);
+  return () => {
+    clipboardThumbObserverTargets.delete(el);
+    observer.unobserve(el);
+    if (clipboardThumbObserverTargets.size === 0 && sharedClipboardThumbObserver) {
+      sharedClipboardThumbObserver.disconnect();
+      sharedClipboardThumbObserver = null;
+    }
+  };
+}
+
+function cacheImagePreview(
+  cacheKey: string,
+  res: PreviewDescriptor
+): PreviewDescriptor {
+  const existing = imagePreviewCache.get(cacheKey);
+  if (existing) {
+    imagePreviewCache.delete(cacheKey);
+    if (existing.url !== res.url) {
+      revokeBlobUrl(existing.url);
+    }
+  }
+  const normalizedUrl =
+    res.url && res.url.startsWith("data:")
+      ? dataUrlToBlobUrl(res.url, res.mimeType)
+      : res.url;
+  const normalized: PreviewDescriptor =
+    normalizedUrl === res.url ? res : { ...res, url: normalizedUrl };
+
+  while (imagePreviewCache.size >= CLIPBOARD_PREVIEW_CACHE_LIMIT) {
+    const first = imagePreviewCache.entries().next().value;
+    if (!first) break;
+    imagePreviewCache.delete(first[0]);
+    revokeBlobUrl(first[1].url);
+  }
+  imagePreviewCache.set(cacheKey, normalized);
+  return normalized;
+}
 
 function ClipboardImageThumb({
   item,
@@ -51,30 +122,20 @@ function ClipboardImageThumb({
     if (!el) return;
 
     let cancelled = false;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (!entries.some((e) => e.isIntersecting)) return;
-        observer.disconnect();
-        api
-          .clipboardGetImagePreview(item.id, peerId)
-          .then((res) => {
-            if (cancelled) return;
-            if (imagePreviewCache.size >= 100) {
-              const firstKey = imagePreviewCache.keys().next().value;
-              if (firstKey) imagePreviewCache.delete(firstKey);
-            }
-            imagePreviewCache.set(cacheKey, res);
-            setDesc(res);
-          })
-          .catch(() => {});
-      },
-      { rootMargin: "120px" }
-    );
+    const unobserve = observeClipboardThumb(el, () => {
+      api
+        .clipboardGetImagePreview(item.id, peerId)
+        .then((res) => {
+          if (cancelled) return;
+          const cachedRes = cacheImagePreview(cacheKey, res);
+          setDesc(cachedRes);
+        })
+        .catch(() => {});
+    });
 
-    observer.observe(el);
     return () => {
       cancelled = true;
-      observer.disconnect();
+      unobserve();
     };
   }, [cacheKey, item.id, peerId]);
 
@@ -89,9 +150,9 @@ function ClipboardImageThumb({
           api
             .clipboardGetImagePreview(item.id, peerId)
             .then((res) => {
-              imagePreviewCache.set(cacheKey, res);
-              setDesc(res);
-              onOpenPreview(res);
+              const cachedRes = cacheImagePreview(cacheKey, res);
+              setDesc(cachedRes);
+              onOpenPreview(cachedRes);
             })
             .catch(() => {});
         }

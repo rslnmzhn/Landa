@@ -6,6 +6,9 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig({
   plugins: [react()],
   clearScreen: false,
+  build: {
+    target: ["es2021", "chrome105", "safari15"],
+  },
   server: {
     port: 1420,
     strictPort: true,

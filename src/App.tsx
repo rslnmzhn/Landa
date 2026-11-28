@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   Activity,
   Clipboard,
@@ -19,7 +27,6 @@ import type {
   PeerInfo,
   PendingFocusTarget,
   PreviewDescriptor,
-  TransferHistoryRecord,
   TransferProgressInfo,
   UpdateCheckResult,
   UpdateProgressEvent,
@@ -33,12 +40,35 @@ import {
   type NavTabItem,
 } from "./components/glass/GlassPrimitives";
 import { DevicesView } from "./features/devices/DevicesView";
-import { SharesView } from "./features/shares/SharesView";
-import { ClipboardView } from "./features/clipboard/ClipboardView";
-import { ActivityView } from "./features/activity/ActivityView";
-import { SettingsView } from "./features/settings/SettingsView";
-import { FilePreviewModal } from "./features/preview/FilePreviewModal";
-import { VideoLinkView } from "./features/videolink/VideoLinkView";
+
+const SharesView = lazy(() =>
+  import("./features/shares/SharesView").then((m) => ({ default: m.SharesView }))
+);
+const ClipboardView = lazy(() =>
+  import("./features/clipboard/ClipboardView").then((m) => ({
+    default: m.ClipboardView,
+  }))
+);
+const ActivityView = lazy(() =>
+  import("./features/activity/ActivityView").then((m) => ({
+    default: m.ActivityView,
+  }))
+);
+const SettingsView = lazy(() =>
+  import("./features/settings/SettingsView").then((m) => ({
+    default: m.SettingsView,
+  }))
+);
+const FilePreviewModal = lazy(() =>
+  import("./features/preview/FilePreviewModal").then((m) => ({
+    default: m.FilePreviewModal,
+  }))
+);
+const VideoLinkView = lazy(() =>
+  import("./features/videolink/VideoLinkView").then((m) => ({
+    default: m.VideoLinkView,
+  }))
+);
 
 type TabId =
   | "devices"
@@ -53,7 +83,7 @@ export function App() {
   const [identity, setIdentity] = useState<LocalIdentityInfo | null>(null);
   const [peers, setPeers] = useState<PeerInfo[]>([]);
   const [friendRequests, setFriendRequests] = useState<FriendRequestInfo[]>([]);
-  const [history, setHistory] = useState<TransferHistoryRecord[]>([]);
+  const [historyTick, setHistoryTick] = useState(0);
   const [activeTransfers, setActiveTransfers] = useState<
     Record<string, TransferProgressInfo>
   >({});
@@ -83,15 +113,29 @@ export function App() {
   } | null>(null);
   const langRef = useRef<"ru" | "en">("ru");
   langRef.current = settings?.language === "en" ? "en" : "ru";
+  const toastTimerRef = useRef<number | null>(null);
 
   const showToast = (kind: "error" | "notice", text: string) => {
     setToast({ kind, text });
-    setTimeout(() => {
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => {
+      toastTimerRef.current = null;
       setToast((prev) => (prev?.text === text ? null : prev));
     }, 4000);
   };
 
   useEffect(() => {
+    return () => {
+      if (toastTimerRef.current !== null) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     let unlistenIdentity: (() => void) | undefined;
     let unlistenUpdate: (() => void) | undefined;
@@ -130,47 +174,66 @@ export function App() {
     const bootstrap = async () => {
       try {
         await api.ensureStartupPermissions().catch(() => {});
-        const [id, p, reqs, hist, cfg, mods] = await Promise.all([
+        if (disposed) return;
+        const [id, p, reqs, cfg, mods] = await Promise.all([
           api.getLocalIdentity(),
           api.listPeers(),
           api.listFriendRequests(),
-          api.listHistory(100),
           api.getSettings(),
           api.listModules(),
         ]);
+        if (disposed) return;
         setIdentity(id);
         setPeers(p);
         setFriendRequests(reqs);
-        setHistory(hist);
         setSettings(cfg);
         setModules(mods);
         api.triggerScan().catch(() => {});
-        api.checkForUpdates().then(setUpdateInfo).catch(() => {});
+        api.checkForUpdates().then((info) => {
+          if (!disposed) setUpdateInfo(info);
+        }).catch(() => {});
 
         const shared = await api.takePendingSharedFiles().catch(() => []);
+        if (disposed) return;
         if (shared.length > 0) {
           setPendingSharedPaths((prev) => [...prev, ...shared]);
         }
         const focus = await api.takePendingFocusTarget().catch(() => null);
+        if (disposed) return;
         applyFocusTarget(focus);
       } catch (e) {
-        showToast("error", String(e));
+        if (!disposed) showToast("error", String(e));
       }
 
-      unlistenIdentity = await api.onIdentityUpdated(() => {
+      const uIdentity = await api.onIdentityUpdated(() => {
         api.getLocalIdentity().then(setIdentity).catch(() => {});
         api.getSettings().then(setSettings).catch(() => {});
       });
+      if (disposed) {
+        uIdentity();
+        return;
+      }
+      unlistenIdentity = uIdentity;
 
-      unlistenUpdate = await api.onUpdateProgress((ev) => {
+      const uUpdate = await api.onUpdateProgress((ev) => {
         setUpdateProgress(ev);
       });
+      if (disposed) {
+        uUpdate();
+        return;
+      }
+      unlistenUpdate = uUpdate;
 
-      unlistenFocus = await api.onFocusTarget((focus) => {
+      const uFocus = await api.onFocusTarget((focus) => {
         applyFocusTarget(focus);
       });
+      if (disposed) {
+        uFocus();
+        return;
+      }
+      unlistenFocus = uFocus;
 
-      unlisten = await api.onCoreEvent((ev) => {
+      const uCore = await api.onCoreEvent((ev) => {
         switch (ev.type) {
           case "peersChanged":
             api.listPeers().then(setPeers).catch(() => {});
@@ -179,7 +242,7 @@ export function App() {
             api.listFriendRequests().then(setFriendRequests).catch(() => {});
             break;
           case "historyChanged":
-            api.listHistory(100).then(setHistory).catch(() => {});
+            setHistoryTick((n) => n + 1);
             break;
           case "incomingTransferOffer":
             setPendingOffers((prev) => [...prev, ev.payload]);
@@ -223,6 +286,11 @@ export function App() {
             break;
         }
       });
+      if (disposed) {
+        uCore();
+        return;
+      }
+      unlisten = uCore;
     };
 
     bootstrap();
@@ -244,6 +312,15 @@ export function App() {
         .then((focus) => applyFocusTarget(focus))
         .catch(() => {});
     };
+    let lastFocusScanAt = { value: 0 };
+    const FOCUS_SCAN_COOLDOWN_MS = 400;
+    const handleFocusOrVisibility = () => {
+      if (document.visibilityState !== "visible") return;
+      const now = Date.now();
+      if (now - lastFocusScanAt.value < FOCUS_SCAN_COOLDOWN_MS) return;
+      lastFocusScanAt.value = now;
+      checkSharedAndScan();
+    };
     const handleFocusIntentEvent = () => {
       api
         .takePendingFocusTarget()
@@ -253,18 +330,19 @@ export function App() {
     const handleNetworkChanged = () => {
       api.triggerScan().catch(() => {});
     };
-    window.addEventListener("focus", checkSharedAndScan);
+    window.addEventListener("focus", handleFocusOrVisibility);
     window.addEventListener("landa-share-intent", checkSharedAndScan);
     window.addEventListener("landa-focus-target", handleFocusIntentEvent);
     window.addEventListener("landa-network-changed", handleNetworkChanged);
-    document.addEventListener("visibilitychange", checkSharedAndScan);
+    document.addEventListener("visibilitychange", handleFocusOrVisibility);
 
     return () => {
-      window.removeEventListener("focus", checkSharedAndScan);
+      disposed = true;
+      window.removeEventListener("focus", handleFocusOrVisibility);
       window.removeEventListener("landa-share-intent", checkSharedAndScan);
       window.removeEventListener("landa-focus-target", handleFocusIntentEvent);
       window.removeEventListener("landa-network-changed", handleNetworkChanged);
-      document.removeEventListener("visibilitychange", checkSharedAndScan);
+      document.removeEventListener("visibilitychange", handleFocusOrVisibility);
       if (unlisten) unlisten();
       if (unlistenIdentity) unlistenIdentity();
       if (unlistenUpdate) unlistenUpdate();
@@ -541,78 +619,80 @@ export function App() {
             } as React.CSSProperties
           }
         >
-          {activeTab === "devices" && (
-            <DevicesView
-              t={t}
-              identity={identity}
-              peers={peers}
-              friendRequests={friendRequests}
-              updateInfo={updateInfo}
-              updateProgress={updateProgress}
-              onUpdateInfoChange={setUpdateInfo}
-              onError={(m) => showToast("error", m)}
-              onNotice={(m) => showToast("notice", m)}
-            />
-          )}
-          {activeTab === "shares" && (
-            <SharesView
-              t={t}
-              identity={identity}
-              peers={peers}
-              enabled={sharesEnabled}
-              activeTransfers={activeTransferList}
-              downloadingKey={downloadingShareKey}
-              onDownloadingKeyChange={setDownloadingShareKey}
-              onPreviewRemoteFile={openRemoteSharePreview}
-              onPreviewLocalPath={openLocalPreview}
-              onError={(m) => showToast("error", m)}
-              onNotice={(m) => showToast("notice", m)}
-            />
-          )}
-          {activeTab === "clipboard" && (
-            <ClipboardView
-              t={t}
-              peers={peers}
-              enabled={clipboardEnabled}
-              refreshTick={clipboardTick}
-              onPreviewDescriptor={(desc) => setPreviewData(desc)}
-              onError={(m) => showToast("error", m)}
-              onNotice={(m) => showToast("notice", m)}
-            />
-          )}
-          {activeTab === "videolink" && !isAndroid && (
-            <VideoLinkView
-              t={t}
-              enabled={videolinkEnabled}
-              onError={(m) => showToast("error", m)}
-              onNotice={(m) => showToast("notice", m)}
-            />
-          )}
-          {activeTab === "activity" && (
-            <ActivityView
-              t={t}
-              activeTransfers={activeTransferList}
-              history={history}
-              onPreviewPath={openLocalPreview}
-              onError={(m) => showToast("error", m)}
-            />
-          )}
-          {activeTab === "settings" && settings && (
-            <SettingsView
-              t={t}
-              settings={settings}
-              modules={modules}
-              onSettingsUpdated={(next) => {
-                setSettings(next);
-                setIdentity((prev) =>
-                  prev ? { ...prev, deviceName: next.deviceName } : prev
-                );
-              }}
-              onModulesUpdated={setModules}
-              onError={(m) => showToast("error", m)}
-              onNotice={(m) => showToast("notice", m)}
-            />
-          )}
+          <Suspense fallback={null}>
+            {activeTab === "devices" && (
+              <DevicesView
+                t={t}
+                identity={identity}
+                peers={peers}
+                friendRequests={friendRequests}
+                updateInfo={updateInfo}
+                updateProgress={updateProgress}
+                onUpdateInfoChange={setUpdateInfo}
+                onError={(m) => showToast("error", m)}
+                onNotice={(m) => showToast("notice", m)}
+              />
+            )}
+            {activeTab === "shares" && (
+              <SharesView
+                t={t}
+                identity={identity}
+                peers={peers}
+                enabled={sharesEnabled}
+                activeTransfers={activeTransferList}
+                downloadingKey={downloadingShareKey}
+                onDownloadingKeyChange={setDownloadingShareKey}
+                onPreviewRemoteFile={openRemoteSharePreview}
+                onPreviewLocalPath={openLocalPreview}
+                onError={(m) => showToast("error", m)}
+                onNotice={(m) => showToast("notice", m)}
+              />
+            )}
+            {activeTab === "clipboard" && (
+              <ClipboardView
+                t={t}
+                peers={peers}
+                enabled={clipboardEnabled}
+                refreshTick={clipboardTick}
+                onPreviewDescriptor={(desc) => setPreviewData(desc)}
+                onError={(m) => showToast("error", m)}
+                onNotice={(m) => showToast("notice", m)}
+              />
+            )}
+            {activeTab === "videolink" && !isAndroid && (
+              <VideoLinkView
+                t={t}
+                enabled={videolinkEnabled}
+                onError={(m) => showToast("error", m)}
+                onNotice={(m) => showToast("notice", m)}
+              />
+            )}
+            {activeTab === "activity" && (
+              <ActivityView
+                t={t}
+                activeTransfers={activeTransferList}
+                historyTick={historyTick}
+                onPreviewPath={openLocalPreview}
+                onError={(m) => showToast("error", m)}
+              />
+            )}
+            {activeTab === "settings" && settings && (
+              <SettingsView
+                t={t}
+                settings={settings}
+                modules={modules}
+                onSettingsUpdated={(next) => {
+                  setSettings(next);
+                  setIdentity((prev) =>
+                    prev ? { ...prev, deviceName: next.deviceName } : prev
+                  );
+                }}
+                onModulesUpdated={setModules}
+                onError={(m) => showToast("error", m)}
+                onNotice={(m) => showToast("notice", m)}
+              />
+            )}
+          </Suspense>
         </div>
       </main>
 
@@ -779,17 +859,21 @@ export function App() {
       </GlassModal>
 
       {/* In-App File Preview Modal */}
-      <FilePreviewModal
-        t={t}
-        preview={previewData}
-        loading={previewLoading}
-        onClose={() => {
-          setPreviewData(null);
-          setPreviewLoading(false);
-        }}
-        onError={(m) => showToast("error", m)}
-        onNotice={(m) => showToast("notice", m)}
-      />
+      {(previewData !== null || previewLoading) && (
+        <Suspense fallback={null}>
+          <FilePreviewModal
+            t={t}
+            preview={previewData}
+            loading={previewLoading}
+            onClose={() => {
+              setPreviewData(null);
+              setPreviewLoading(false);
+            }}
+            onError={(m) => showToast("error", m)}
+            onNotice={(m) => showToast("notice", m)}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

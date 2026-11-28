@@ -26,6 +26,28 @@ use tauri_plugin_notification::NotificationExt;
 pub fn run() {
     logging::init_tracing();
 
+    #[cfg(target_os = "android")]
+    let _android_tokio_rt = {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 4))
+            .unwrap_or(2);
+        match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .thread_stack_size(1024 * 1024)
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => {
+                tauri::async_runtime::set(rt.handle().clone());
+                Some(rt)
+            }
+            Err(err) => {
+                tracing::warn!("failed to build compact Android Tokio runtime: {err}");
+                None
+            }
+        }
+    };
+
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())

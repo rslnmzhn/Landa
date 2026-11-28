@@ -11,7 +11,7 @@ export interface PasteableClipboardItem {
 }
 
 export interface ClipboardPasteDeps<TItem> {
-  pushLocalImageBytes: (bytes: number[]) => Promise<TItem>;
+  pushLocalImageBytes: (bytes: Uint8Array) => Promise<TItem>;
   onImageSaved: (item: TItem) => Promise<void> | void;
   onError: (msg: string) => void;
   tooLargeMessage: string;
@@ -44,9 +44,7 @@ export async function processClipboardImagePaste<TItem>(
         deps.onError(deps.tooLargeMessage);
         return true;
       }
-      const saved = await deps.pushLocalImageBytes(
-        Array.from(new Uint8Array(buf))
-      );
+      const saved = await deps.pushLocalImageBytes(new Uint8Array(buf));
       await deps.onImageSaved(saved);
     } catch (err) {
       deps.onError(String(err));

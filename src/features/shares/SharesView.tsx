@@ -9,6 +9,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { api, formatBytes } from "../../core/api";
+import { dataUrlToBlobUrl, revokeBlobUrl } from "../../core/blobUrl";
 import type {
   LocalIdentityInfo,
   LocalShareRoot,
@@ -30,7 +31,61 @@ import {
 } from "./SharesSections";
 
 const THUMB_EXTS = new Set(["png", "jpg", "jpeg", "webp", "gif"]);
+const THUMB_CACHE_LIMIT = 120;
 const thumbMemoryCache = new Map<string, string>();
+const thumbObserverTargets = new Map<Element, () => void>();
+let sharedThumbObserver: IntersectionObserver | null = null;
+
+const VIRTUALIZE_THRESHOLD = 48;
+const LIST_ROW_HEIGHT = 70;
+const VIRTUAL_OVERSCAN = 4;
+const DEFAULT_VIEWPORT_HEIGHT = 600;
+
+function getSharedThumbObserver(): IntersectionObserver | null {
+  if (typeof IntersectionObserver === "undefined") return null;
+  if (!sharedThumbObserver) {
+    sharedThumbObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const cb = thumbObserverTargets.get(entry.target);
+          if (cb) {
+            thumbObserverTargets.delete(entry.target);
+            sharedThumbObserver?.unobserve(entry.target);
+            cb();
+          }
+        }
+      },
+      { rootMargin: "120px" }
+    );
+  }
+  return sharedThumbObserver;
+}
+
+function observeThumbnail(el: Element, onVisible: () => void): () => void {
+  const observer = getSharedThumbObserver();
+  if (!observer) {
+    onVisible();
+    return () => {};
+  }
+  thumbObserverTargets.set(el, onVisible);
+  observer.observe(el);
+  return () => {
+    thumbObserverTargets.delete(el);
+    observer.unobserve(el);
+    if (thumbObserverTargets.size === 0 && sharedThumbObserver) {
+      sharedThumbObserver.disconnect();
+      sharedThumbObserver = null;
+    }
+  };
+}
+
+function clearThumbMemoryCache(): void {
+  for (const url of thumbMemoryCache.values()) {
+    revokeBlobUrl(url);
+  }
+  thumbMemoryCache.clear();
+}
 
 function isThumbImage(name: string): boolean {
   const dot = name.lastIndexOf(".");
@@ -52,7 +107,7 @@ function LazyShareThumbnail({
   iconClass: string;
 }) {
   const cacheKey = `${peerId}:${rootId}:${entry.relPath}:${entry.modifiedMs}`;
-  const [dataUrl, setDataUrl] = useState<string | null>(
+  const [thumbUrl, setThumbUrl] = useState<string | null>(
     () => thumbMemoryCache.get(cacheKey) ?? null
   );
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -60,43 +115,43 @@ function LazyShareThumbnail({
 
   useEffect(() => {
     if (!canThumb) {
-      setDataUrl(null);
+      setThumbUrl(null);
       return;
     }
     const cached = thumbMemoryCache.get(cacheKey);
     if (cached) {
-      setDataUrl(cached);
+      setThumbUrl(cached);
       return;
     }
-    setDataUrl(null);
+    setThumbUrl(null);
     const el = containerRef.current;
     if (!el) return;
 
     let cancelled = false;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (!entries.some((e) => e.isIntersecting)) return;
-        observer.disconnect();
-        api
-          .sharesGetRemoteThumbnail(peerId, rootId, entry.relPath, 160)
-          .then((res) => {
-            if (cancelled) return;
-            if (thumbMemoryCache.size >= 300) {
-              const firstKey = thumbMemoryCache.keys().next().value;
-              if (firstKey) thumbMemoryCache.delete(firstKey);
+    const unobserve = observeThumbnail(el, () => {
+      api
+        .sharesGetRemoteThumbnail(peerId, rootId, entry.relPath, 160)
+        .then((res) => {
+          if (cancelled) return;
+          let resolvedUrl = thumbMemoryCache.get(cacheKey);
+          if (!resolvedUrl) {
+            resolvedUrl = res.url || dataUrlToBlobUrl(res.dataUrl, res.mimeType);
+            if (thumbMemoryCache.size >= THUMB_CACHE_LIMIT) {
+              const first = thumbMemoryCache.entries().next().value;
+              if (first) {
+                thumbMemoryCache.delete(first[0]);
+                revokeBlobUrl(first[1]);
+              }
             }
-            thumbMemoryCache.set(cacheKey, res.dataUrl);
-            setDataUrl(res.dataUrl);
-          })
-          .catch(() => {});
-      },
-      { rootMargin: "120px" }
-    );
-
-    observer.observe(el);
+            thumbMemoryCache.set(cacheKey, resolvedUrl);
+          }
+          setThumbUrl(resolvedUrl);
+        })
+        .catch(() => {});
+    });
     return () => {
       cancelled = true;
-      observer.disconnect();
+      unobserve();
     };
   }, [canThumb, cacheKey, peerId, rootId, entry.relPath]);
 
@@ -105,9 +160,9 @@ function LazyShareThumbnail({
       ref={containerRef}
       className={`relative flex shrink-0 items-center justify-center overflow-hidden bg-white/25 dark:bg-white/10 border border-white/20 dark:border-white/10 ${sizeClass}`}
     >
-      {dataUrl ? (
+      {thumbUrl ? (
         <img
-          src={dataUrl}
+          src={thumbUrl}
           alt={entry.name}
           className="h-full w-full object-cover transition-opacity duration-200"
         />
@@ -184,6 +239,40 @@ export function SharesView({
     null
   );
   const activeRootRef = useRef<ShareRootInfo | null>(null);
+  const virtualContainerRef = useRef<HTMLDivElement | null>(null);
+  const [virtualScrollTop, setVirtualScrollTop] = useState(0);
+  const [virtualViewport, setVirtualViewport] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    clearThumbMemoryCache();
+  }, [selectedPeerId]);
+
+  useEffect(() => {
+    return () => {
+      clearThumbMemoryCache();
+    };
+  }, []);
+
+  useEffect(() => {
+    setVirtualScrollTop(0);
+    if (virtualContainerRef.current) {
+      virtualContainerRef.current.scrollTop = 0;
+    }
+  }, [entries, viewMode]);
+
+  useEffect(() => {
+    if (entries.length <= VIRTUALIZE_THRESHOLD) return;
+    const el = virtualContainerRef.current;
+    if (!el) return;
+    const updateSize = () => {
+      setVirtualViewport({ width: el.clientWidth, height: el.clientHeight });
+    };
+    updateSize();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(updateSize);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [entries.length, viewMode]);
   activeRootRef.current = activeRoot;
   const relPathRef = useRef<string>("");
   relPathRef.current = relPath;
@@ -731,141 +820,199 @@ export function SharesView({
               <p className="text-sm text-slate-700/65 dark:text-white/50">
                 {t.shares.emptyDir}
               </p>
-            ) : viewMode === "grid" ? (
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4">
-                {entries.map((entry) => {
-                  const entryKey = `entry:${selectedPeerId}:${activeRoot.id}:${entry.relPath || entry.name}`;
-                  const isDownloading = downloadingKey === entryKey;
-                  const downloadLabel = entry.isDir
-                    ? t.shares.downloadFolder
-                    : t.shares.download;
-                  return (
-                    <div
-                      key={entry.relPath || entry.name}
-                      className="flex flex-col justify-between gap-2 rounded-2xl bg-white/20 dark:bg-white/5 p-2.5 transition hover:bg-white/25 dark:hover:bg-white/10"
-                    >
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (entry.isDir) {
-                            handleOpenDir(entry.relPath);
-                          } else {
-                            onPreviewRemoteFile(
-                              selectedPeerId,
-                              activeRoot.id,
-                              entry.relPath
-                            );
-                          }
-                        }}
-                        className="flex flex-col gap-2 text-left"
-                      >
-                        <LazyShareThumbnail
-                          peerId={selectedPeerId}
-                          rootId={activeRoot.id}
-                          entry={entry}
-                          sizeClass="aspect-square w-full rounded-xl"
-                          iconClass="h-8 w-8"
-                        />
-                        <div className="min-w-0 px-0.5">
-                          <div className="truncate text-xs font-medium text-slate-900/90 dark:text-white/90">
-                            {entry.name}
-                          </div>
-                          {!entry.isDir && (
-                            <div className="font-mono text-[11px] text-slate-700/65 dark:text-white/45">
-                              {formatBytes(entry.sizeBytes)}
-                            </div>
-                          )}
-                        </div>
-                      </button>
-                      <div className="flex items-center justify-end gap-1">
-                        <GlassButton
-                          size="sm"
-                          variant="glass"
-                          disabled={downloadingKey !== null}
-                          onClick={() => handleDownload(entry)}
-                          aria-label={`${downloadLabel}: ${entry.name}`}
-                          title={downloadLabel}
-                          className="min-w-[44px] px-2.5"
+            ) : (() => {
+              const isVirtualized = entries.length > VIRTUALIZE_THRESHOLD;
+              const width =
+                virtualViewport.width ||
+                (typeof window !== "undefined" ? window.innerWidth : 800);
+              const cols =
+                viewMode === "grid"
+                  ? width >= 768
+                    ? 4
+                    : width >= 640
+                      ? 3
+                      : 2
+                  : 1;
+              const rowHeight =
+                viewMode === "grid"
+                  ? Math.max(120, Math.floor((width - (cols - 1) * 12) / cols)) + 84
+                  : LIST_ROW_HEIGHT;
+              const totalRows = Math.ceil(entries.length / cols);
+              const viewportHeight = virtualViewport.height || DEFAULT_VIEWPORT_HEIGHT;
+              const startRow = isVirtualized
+                ? Math.max(0, Math.floor(virtualScrollTop / rowHeight) - VIRTUAL_OVERSCAN)
+                : 0;
+              const endRow = isVirtualized
+                ? Math.min(
+                    totalRows,
+                    Math.ceil((virtualScrollTop + viewportHeight) / rowHeight) +
+                      VIRTUAL_OVERSCAN
+                  )
+                : totalRows;
+              const visibleEntries = isVirtualized
+                ? entries.slice(startRow * cols, endRow * cols)
+                : entries;
+              const topSpacerHeight = isVirtualized ? startRow * rowHeight : 0;
+              const bottomSpacerHeight = isVirtualized
+                ? Math.max(0, (totalRows - endRow) * rowHeight)
+                : 0;
+
+              const listContent =
+                viewMode === "grid" ? (
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4">
+                    {visibleEntries.map((entry) => {
+                      const entryKey = `entry:${selectedPeerId}:${activeRoot.id}:${entry.relPath || entry.name}`;
+                      const isDownloading = downloadingKey === entryKey;
+                      const downloadLabel = entry.isDir
+                        ? t.shares.downloadFolder
+                        : t.shares.download;
+                      return (
+                        <div
+                          key={entry.relPath || entry.name}
+                          className="flex flex-col justify-between gap-2 rounded-2xl bg-white/20 dark:bg-white/5 p-2.5 transition hover:bg-white/25 dark:hover:bg-white/10"
                         >
-                          {isDownloading ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-                          ) : (
-                            <Download className="h-3.5 w-3.5" aria-hidden="true" />
-                          )}
-                        </GlassButton>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="space-y-1.5">
-                {entries.map((entry) => {
-                  const entryKey = `entry:${selectedPeerId}:${activeRoot.id}:${entry.relPath || entry.name}`;
-                  const isDownloading = downloadingKey === entryKey;
-                  const downloadLabel = entry.isDir
-                    ? t.shares.downloadFolder
-                    : t.shares.download;
-                  return (
-                    <div
-                      key={entry.relPath || entry.name}
-                      className="flex items-center justify-between gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2.5"
-                    >
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (entry.isDir) {
-                            handleOpenDir(entry.relPath);
-                          } else {
-                            onPreviewRemoteFile(
-                              selectedPeerId,
-                              activeRoot.id,
-                              entry.relPath
-                            );
-                          }
-                        }}
-                        className="flex min-h-[44px] min-w-0 flex-1 items-center gap-3 text-left"
-                      >
-                        <LazyShareThumbnail
-                          peerId={selectedPeerId}
-                          rootId={activeRoot.id}
-                          entry={entry}
-                          sizeClass="h-10 w-10 rounded-xl"
-                          iconClass="h-5 w-5"
-                        />
-                        <div className="min-w-0">
-                          <div className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
-                            {entry.name}
-                          </div>
-                          {!entry.isDir && (
-                            <div className="font-mono text-xs text-slate-700/65 dark:text-white/45">
-                              {formatBytes(entry.sizeBytes)}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (entry.isDir) {
+                                handleOpenDir(entry.relPath);
+                              } else {
+                                onPreviewRemoteFile(
+                                  selectedPeerId,
+                                  activeRoot.id,
+                                  entry.relPath
+                                );
+                              }
+                            }}
+                            className="flex flex-col gap-2 text-left"
+                          >
+                            <LazyShareThumbnail
+                              peerId={selectedPeerId}
+                              rootId={activeRoot.id}
+                              entry={entry}
+                              sizeClass="aspect-square w-full rounded-xl"
+                              iconClass="h-8 w-8"
+                            />
+                            <div className="min-w-0 px-0.5">
+                              <div className="truncate text-xs font-medium text-slate-900/90 dark:text-white/90">
+                                {entry.name}
+                              </div>
+                              {!entry.isDir && (
+                                <div className="font-mono text-[11px] text-slate-700/65 dark:text-white/45">
+                                  {formatBytes(entry.sizeBytes)}
+                                </div>
+                              )}
                             </div>
-                          )}
+                          </button>
+                          <div className="flex items-center justify-end gap-1">
+                            <GlassButton
+                              size="sm"
+                              variant="glass"
+                              disabled={downloadingKey !== null}
+                              onClick={() => handleDownload(entry)}
+                              aria-label={`${downloadLabel}: ${entry.name}`}
+                              title={downloadLabel}
+                              className="min-w-[44px] px-2.5"
+                            >
+                              {isDownloading ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                              ) : (
+                                <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                              )}
+                            </GlassButton>
+                          </div>
                         </div>
-                      </button>
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <GlassButton
-                          size="sm"
-                          variant="glass"
-                          disabled={downloadingKey !== null}
-                          onClick={() => handleDownload(entry)}
-                          aria-label={`${downloadLabel}: ${entry.name}`}
-                          title={downloadLabel}
-                          className="min-w-[44px]"
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="space-y-1.5">
+                    {visibleEntries.map((entry) => {
+                      const entryKey = `entry:${selectedPeerId}:${activeRoot.id}:${entry.relPath || entry.name}`;
+                      const isDownloading = downloadingKey === entryKey;
+                      const downloadLabel = entry.isDir
+                        ? t.shares.downloadFolder
+                        : t.shares.download;
+                      return (
+                        <div
+                          key={entry.relPath || entry.name}
+                          className="flex items-center justify-between gap-3 rounded-2xl bg-white/20 dark:bg-white/5 px-4 py-2.5"
                         >
-                          {isDownloading ? (
-                            <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                          ) : (
-                            <Download className="h-4 w-4" aria-hidden="true" />
-                          )}
-                        </GlassButton>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (entry.isDir) {
+                                handleOpenDir(entry.relPath);
+                              } else {
+                                onPreviewRemoteFile(
+                                  selectedPeerId,
+                                  activeRoot.id,
+                                  entry.relPath
+                                );
+                              }
+                            }}
+                            className="flex min-h-[44px] min-w-0 flex-1 items-center gap-3 text-left"
+                          >
+                            <LazyShareThumbnail
+                              peerId={selectedPeerId}
+                              rootId={activeRoot.id}
+                              entry={entry}
+                              sizeClass="h-10 w-10 rounded-xl"
+                              iconClass="h-5 w-5"
+                            />
+                            <div className="min-w-0">
+                              <div className="truncate text-sm font-medium text-slate-900/90 dark:text-white/90">
+                                {entry.name}
+                              </div>
+                              {!entry.isDir && (
+                                <div className="font-mono text-xs text-slate-700/65 dark:text-white/45">
+                                  {formatBytes(entry.sizeBytes)}
+                                </div>
+                              )}
+                            </div>
+                          </button>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <GlassButton
+                              size="sm"
+                              variant="glass"
+                              disabled={downloadingKey !== null}
+                              onClick={() => handleDownload(entry)}
+                              aria-label={`${downloadLabel}: ${entry.name}`}
+                              title={downloadLabel}
+                              className="min-w-[44px]"
+                            >
+                              {isDownloading ? (
+                                <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                              ) : (
+                                <Download className="h-4 w-4" aria-hidden="true" />
+                              )}
+                            </GlassButton>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+
+              if (!isVirtualized) return listContent;
+
+              return (
+                <div
+                  ref={virtualContainerRef}
+                  data-testid="shares-virtual-container"
+                  onScroll={(e) => setVirtualScrollTop(e.currentTarget.scrollTop)}
+                  className="max-h-[70vh] overflow-y-auto pr-1"
+                >
+                  {topSpacerHeight > 0 && (
+                    <div style={{ height: topSpacerHeight }} aria-hidden="true" />
+                  )}
+                  {listContent}
+                  {bottomSpacerHeight > 0 && (
+                    <div style={{ height: bottomSpacerHeight }} aria-hidden="true" />
+                  )}
+                </div>
+              );
+            })()}
           </div>
         )}
       </GlassCard>

@@ -30,8 +30,13 @@ const MAX_TREE_DEPTH: usize = 32;
 const MAX_TREE_FILES: usize = 10_000;
 const CHUNK_SIZE: usize = 64 * 1024;
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
-const THUMB_CACHE_MAX_BYTES: usize = 50 * 1024 * 1024;
+#[cfg(target_os = "android")]
+const THUMB_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(not(target_os = "android"))]
+const THUMB_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_THUMB_SOURCE_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_THUMB_IMAGE_DIMENSION: u32 = 8192;
+const MAX_THUMB_DECODE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_THUMB_SIZE: u32 = 160;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +70,8 @@ pub struct ShareEntry {
 #[serde(rename_all = "camelCase")]
 pub struct ShareThumbnail {
     pub mime_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     pub data_url: String,
 }
 
@@ -132,7 +139,7 @@ pub enum ShareResponse {
 #[derive(Clone)]
 struct CachedThumb {
     mime_type: String,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
 }
 
 struct ThumbnailCacheInner {
@@ -896,13 +903,27 @@ impl SharesModule {
         rel_path: &str,
         max_size: u32,
     ) -> Result<ShareThumbnail, CoreError> {
+        let (mime_type, bytes) = self
+            .get_remote_thumbnail_bytes(engine, peer_id, root_id, rel_path, max_size)
+            .await?;
+        Ok(to_share_thumbnail(&CachedThumb { mime_type, bytes }))
+    }
+
+    pub async fn get_remote_thumbnail_bytes(
+        &self,
+        engine: &LandaEngine,
+        peer_id: &str,
+        root_id: &str,
+        rel_path: &str,
+        max_size: u32,
+    ) -> Result<(String, Arc<[u8]>), CoreError> {
         if !self.is_enabled() {
             return Err(CoreError::ModuleDisabled("shares".into()));
         }
         let clamped_size = max_size.clamp(64, 320);
         let cache_key = format!("{peer_id}:{root_id}:{rel_path}:{clamped_size}");
         if let Some(cached) = self.remote_thumb_cache.get(&cache_key) {
-            return Ok(to_share_thumbnail(&cached));
+            return Ok((cached.mime_type, cached.bytes));
         }
 
         let (_, mut send, mut recv) = engine
@@ -922,9 +943,13 @@ impl SharesModule {
         let resp: ShareResponse = read_frame(&mut recv, MAX_CONTROL_FRAME_BYTES).await?;
         match resp {
             ShareResponse::Thumbnail { mime_type, bytes } => {
-                let entry = CachedThumb { mime_type, bytes };
-                self.remote_thumb_cache.insert(cache_key, entry.clone());
-                Ok(to_share_thumbnail(&entry))
+                let shared: Arc<[u8]> = Arc::from(bytes);
+                let entry = CachedThumb {
+                    mime_type: mime_type.clone(),
+                    bytes: Arc::clone(&shared),
+                };
+                self.remote_thumb_cache.insert(cache_key, entry);
+                Ok((mime_type, shared))
             }
             ShareResponse::Error(msg) => Err(CoreError::InvalidInput(msg)),
             _ => Err(CoreError::InvalidInput("unexpected share response".into())),
@@ -1495,7 +1520,7 @@ impl LandaModule for SharesModule {
                                         &mut send,
                                         &ShareResponse::Thumbnail {
                                             mime_type: cached.mime_type,
-                                            bytes: cached.bytes,
+                                            bytes: cached.bytes.to_vec(),
                                         },
                                     )
                                     .await?;
@@ -1515,7 +1540,7 @@ impl LandaModule for SharesModule {
                                                 cache_key,
                                                 CachedThumb {
                                                     mime_type: mime_type.clone(),
-                                                    bytes: bytes.clone(),
+                                                    bytes: Arc::from(bytes.as_slice()),
                                                 },
                                             );
                                             send_response(
@@ -1568,7 +1593,7 @@ impl LandaModule for SharesModule {
                                             &mut send,
                                             &ShareResponse::Thumbnail {
                                                 mime_type: cached.mime_type,
-                                                bytes: cached.bytes,
+                                                bytes: cached.bytes.to_vec(),
                                             },
                                         )
                                         .await?;
@@ -1586,7 +1611,7 @@ impl LandaModule for SharesModule {
                                                     cache_key,
                                                     CachedThumb {
                                                         mime_type: mime_type.clone(),
-                                                        bytes: bytes.clone(),
+                                                        bytes: Arc::from(bytes.as_slice()),
                                                     },
                                                 );
                                                 send_response(
@@ -1636,6 +1661,7 @@ fn to_share_thumbnail(entry: &CachedThumb) -> ShareThumbnail {
     let b64 = base64::engine::general_purpose::STANDARD.encode(&entry.bytes);
     ShareThumbnail {
         mime_type: entry.mime_type.clone(),
+        url: None,
         data_url: format!("data:{};base64,{b64}", entry.mime_type),
     }
 }
@@ -1667,9 +1693,15 @@ fn generate_image_thumbnail_from_reader<R: BufRead + Seek>(
     reader: R,
     max_size: u32,
 ) -> Result<(String, Vec<u8>), CoreError> {
-    let reader = image::ImageReader::new(reader)
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_THUMB_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_THUMB_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_THUMB_DECODE_ALLOC_BYTES);
+
+    let mut reader = image::ImageReader::new(reader)
         .with_guessed_format()
         .map_err(|e| CoreError::InvalidInput(format!("image format error: {e}")))?;
+    reader.limits(limits);
     let img = reader
         .decode()
         .map_err(|e| CoreError::InvalidInput(format!("image decode error: {e}")))?;

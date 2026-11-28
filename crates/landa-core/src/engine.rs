@@ -358,7 +358,15 @@ impl LandaEngine {
         peer_id_hex: &str,
         paths: Vec<PathBuf>,
     ) -> Result<TransferHistoryRecord, CoreError> {
-        let items = TransferManager::collect_outgoing_items(&paths)?;
+        let items = tokio::task::spawn_blocking(move || {
+            TransferManager::collect_outgoing_items(&paths)
+        })
+        .await
+        .map_err(|e| {
+            CoreError::Io(std::io::Error::other(format!(
+                "collect outgoing items task failed: {e}"
+            )))
+        })??;
         self.send_items(peer_id_hex, items).await
     }
 

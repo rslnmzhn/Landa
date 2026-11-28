@@ -129,8 +129,8 @@ export const api = {
   clipboardListLocal: () => invoke<ClipboardItem[]>("clipboard_list_local"),
   clipboardPushLocalText: (text: string) =>
     invoke<ClipboardItem>("clipboard_push_local_text", { text }),
-  clipboardPushLocalImageBytes: (bytes: number[]) =>
-    invoke<ClipboardItem>("clipboard_push_local_image_bytes", { bytes }),
+  clipboardPushLocalImageBytes: (bytes: Uint8Array) =>
+    invoke<ClipboardItem>("clipboard_push_local_image_bytes", bytes),
   clipboardDeleteLocal: (id: string) =>
     invoke<void>("clipboard_delete_local", { id }),
   clipboardSendToPeer: (peerId: string, text: string) =>

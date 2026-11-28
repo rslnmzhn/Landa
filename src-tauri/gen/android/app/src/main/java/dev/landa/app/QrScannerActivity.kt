@@ -14,21 +14,23 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import com.google.mlkit.vision.barcode.BarcodeScanner
-import com.google.mlkit.vision.barcode.BarcodeScannerOptions
-import com.google.mlkit.vision.barcode.BarcodeScanning
-import com.google.mlkit.vision.barcode.common.Barcode
-import com.google.mlkit.vision.common.InputImage
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.ChecksumException
+import com.google.zxing.DecodeHintType
+import com.google.zxing.FormatException
+import com.google.zxing.NotFoundException
+import com.google.zxing.PlanarYUVLuminanceSource
+import com.google.zxing.common.HybridBinarizer
+import com.google.zxing.qrcode.QRCodeReader
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -42,7 +44,11 @@ class QrScannerActivity : AppCompatActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var statusText: TextView
     private lateinit var cameraExecutor: ExecutorService
-    private lateinit var scanner: BarcodeScanner
+    private val qrReader = QRCodeReader()
+    private val decodeHints = mapOf(
+        DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
+        DecodeHintType.TRY_HARDER to true
+    )
     private val handled = AtomicBoolean(false)
 
     private val requestCameraPermission =
@@ -60,10 +66,6 @@ class QrScannerActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-        val options = BarcodeScannerOptions.Builder()
-            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
-            .build()
-        scanner = BarcodeScanning.getClient(options)
 
         val root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -175,45 +177,78 @@ class QrScannerActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    @OptIn(ExperimentalGetImage::class)
     private fun analyzeFrame(imageProxy: ImageProxy) {
-        if (handled.get()) {
-            imageProxy.close()
-            return
-        }
-        val mediaImage = imageProxy.image
-        if (mediaImage == null) {
-            imageProxy.close()
-            return
-        }
+        try {
+            if (handled.get()) return
+            val yPlane = imageProxy.planes.firstOrNull() ?: return
+            val width = imageProxy.width
+            val height = imageProxy.height
+            val yBytes = extractYPlane(yPlane, width, height)
+            val source = PlanarYUVLuminanceSource(yBytes, width, height, 0, 0, width, height, false)
+            val bitmap = BinaryBitmap(HybridBinarizer(source))
+            val result = try {
+                qrReader.decode(bitmap, decodeHints)
+            } catch (_: NotFoundException) {
+                null
+            } catch (_: ChecksumException) {
+                null
+            } catch (_: FormatException) {
+                null
+            } finally {
+                qrReader.reset()
+            } ?: return
 
-        val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-        scanner.process(inputImage)
-            .addOnSuccessListener { barcodes ->
-                if (handled.get()) return@addOnSuccessListener
-                for (barcode in barcodes) {
-                    val raw = barcode.rawValue?.trim() ?: continue
-                    if (raw.startsWith("landa2://connect?")) {
-                        if (handled.compareAndSet(false, true)) {
-                            val data = Intent().putExtra(EXTRA_QR_URI, raw)
-                            setResult(Activity.RESULT_OK, data)
-                            finish()
-                        }
-                        return@addOnSuccessListener
-                    } else {
-                        runOnUiThread {
-                            statusText.text = "Not a Landa QR"
-                        }
+            val raw = result.text?.trim() ?: return
+            if (raw.startsWith("landa2://connect?")) {
+                if (handled.compareAndSet(false, true)) {
+                    runOnUiThread {
+                        val data = Intent().putExtra(EXTRA_QR_URI, raw)
+                        setResult(Activity.RESULT_OK, data)
+                        finish()
+                    }
+                }
+            } else if (raw.isNotEmpty()) {
+                runOnUiThread {
+                    statusText.text = "Not a Landa QR"
+                }
+            }
+        } finally {
+            imageProxy.close()
+        }
+    }
+
+    private fun extractYPlane(plane: ImageProxy.PlaneProxy, width: Int, height: Int): ByteArray {
+        val buffer = plane.buffer
+        buffer.rewind()
+        val rowStride = plane.rowStride
+        val pixelStride = plane.pixelStride
+        val out = ByteArray(width * height)
+        if (pixelStride == 1 && rowStride == width) {
+            buffer.get(out)
+            return out
+        }
+        val rowBuffer = ByteArray(rowStride)
+        for (row in 0 until height) {
+            val remaining = buffer.remaining()
+            val toRead = minOf(rowStride, remaining)
+            if (toRead <= 0) break
+            buffer.get(rowBuffer, 0, toRead)
+            val dstOffset = row * width
+            if (pixelStride == 1) {
+                System.arraycopy(rowBuffer, 0, out, dstOffset, minOf(width, toRead))
+            } else {
+                for (col in 0 until width) {
+                    val srcIdx = col * pixelStride
+                    if (srcIdx < toRead) {
+                        out[dstOffset + col] = rowBuffer[srcIdx]
                     }
                 }
             }
-            .addOnCompleteListener {
-                imageProxy.close()
-            }
+        }
+        return out
     }
 
     override fun onDestroy() {
-        runCatching { scanner.close() }
         runCatching { cameraExecutor.shutdown() }
         super.onDestroy()
     }

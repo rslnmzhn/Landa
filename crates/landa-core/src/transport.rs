@@ -293,6 +293,16 @@ fn build_transport_config() -> Arc<TransportConfig> {
     if let Ok(idle) = Duration::from_secs(15).try_into() {
         cfg.max_idle_timeout(Some(idle));
     }
+    #[cfg(target_os = "android")]
+    {
+        cfg.stream_receive_window(quinn::VarInt::from_u32(512 * 1024));
+        cfg.receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        cfg.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
+        cfg.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
+    }
     Arc::new(cfg)
 }
 

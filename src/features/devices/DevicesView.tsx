@@ -93,6 +93,15 @@ export function DevicesView({
   tRef.current = t;
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
+  const scanTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (scanTimerRef.current !== null) {
+        window.clearTimeout(scanTimerRef.current);
+      }
+    };
+  }, []);
   const onNoticeRef = useRef(onNotice);
   onNoticeRef.current = onNotice;
 
@@ -181,7 +190,13 @@ export function DevicesView({
     } catch (e) {
       onError(String(e));
     } finally {
-      setTimeout(() => setScanning(false), 600);
+      if (scanTimerRef.current !== null) {
+        window.clearTimeout(scanTimerRef.current);
+      }
+      scanTimerRef.current = window.setTimeout(() => {
+        scanTimerRef.current = null;
+        setScanning(false);
+      }, 600);
     }
   };
 

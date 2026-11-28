@@ -1,7 +1,7 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -25,10 +25,34 @@ fn global_sink() -> &'static Arc<RotatingLogSink> {
     })
 }
 
+fn parse_rust_log_level_str(raw: &str) -> tracing_subscriber::filter::LevelFilter {
+    let token = raw
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .rsplit('=')
+        .next()
+        .unwrap_or("")
+        .trim();
+    match token.to_ascii_lowercase().as_str() {
+        "off" => tracing_subscriber::filter::LevelFilter::OFF,
+        "error" => tracing_subscriber::filter::LevelFilter::ERROR,
+        "warn" => tracing_subscriber::filter::LevelFilter::WARN,
+        "debug" => tracing_subscriber::filter::LevelFilter::DEBUG,
+        "trace" => tracing_subscriber::filter::LevelFilter::TRACE,
+        _ => tracing_subscriber::filter::LevelFilter::INFO,
+    }
+}
+
+fn parse_rust_log_level() -> tracing_subscriber::filter::LevelFilter {
+    std::env::var("RUST_LOG")
+        .map(|raw| parse_rust_log_level_str(&raw))
+        .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO)
+}
+
 pub fn init_tracing() {
     let _ = global_sink();
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let level_filter = parse_rust_log_level();
 
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
     let file_layer = tracing_subscriber::fmt::layer()
@@ -36,7 +60,7 @@ pub fn init_tracing() {
         .with_writer(GlobalLogMakeWriter);
 
     let _ = tracing_subscriber::registry()
-        .with(env_filter)
+        .with(level_filter)
         .with(stderr_layer)
         .with(file_layer)
         .try_init();
@@ -97,8 +121,26 @@ impl Drop for BufferedLogWriter {
     }
 }
 
-struct LogSinkInner {
+enum LogCommand {
+    Attach {
+        path: PathBuf,
+        reply: mpsc::SyncSender<std::io::Result<()>>,
+    },
+    Write(Vec<u8>),
+    EnsureFile {
+        reply: mpsc::SyncSender<Result<PathBuf, String>>,
+    },
+    ReadTail {
+        max_lines: usize,
+        reply: mpsc::SyncSender<String>,
+    },
+    #[cfg(test)]
+    Flush(mpsc::SyncSender<()>),
+}
+
+struct LogWorker {
     path: Option<PathBuf>,
+    writer: Option<BufWriter<File>>,
     pending: Vec<u8>,
     max_lines: usize,
     keep_lines: usize,
@@ -107,31 +149,39 @@ struct LogSinkInner {
     current_bytes: usize,
 }
 
-pub struct RotatingLogSink {
-    inner: Mutex<LogSinkInner>,
-}
-
-impl RotatingLogSink {
-    pub fn new(max_lines: usize, keep_lines: usize, max_bytes: usize) -> Self {
+impl LogWorker {
+    fn new(max_lines: usize, keep_lines: usize, max_bytes: usize) -> Self {
         Self {
-            inner: Mutex::new(LogSinkInner {
-                path: None,
-                pending: Vec::new(),
-                max_lines: max_lines.max(1),
-                keep_lines: keep_lines.max(1).min(max_lines.max(1)),
-                max_bytes: max_bytes.max(64),
-                current_lines: 0,
-                current_bytes: 0,
-            }),
+            path: None,
+            writer: None,
+            pending: Vec::new(),
+            max_lines: max_lines.max(1),
+            keep_lines: keep_lines.max(1).min(max_lines.max(1)),
+            max_bytes: max_bytes.max(64),
+            current_lines: 0,
+            current_bytes: 0,
         }
     }
 
-    pub fn attach_path(&self, path: PathBuf) -> std::io::Result<()> {
+    fn open_append_writer(path: &Path) -> std::io::Result<BufWriter<File>> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(BufWriter::new(file))
+    }
+
+    fn flush_writer(&mut self) {
+        if let Some(writer) = self.writer.as_mut() {
+            let _ = writer.flush();
+        }
+    }
+
+    fn attach_path(&mut self, path: PathBuf) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let mut guard = self.inner.lock().expect("log sink lock poisoned");
+        self.flush_writer();
+        self.writer = None;
+
         let existing = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -139,65 +189,72 @@ impl RotatingLogSink {
         };
 
         let mut combined = existing;
-        if !guard.pending.is_empty() {
-            combined.extend_from_slice(&guard.pending);
-            guard.pending.clear();
+        if !self.pending.is_empty() {
+            combined.extend_from_slice(&self.pending);
+            self.pending.clear();
         }
 
         let line_count = count_lines(&combined);
         let byte_count = combined.len();
-        if line_count > guard.max_lines || byte_count > guard.max_bytes {
-            let trimmed = trim_log_bytes(&combined, guard.keep_lines, guard.max_bytes);
+        if line_count > self.max_lines || byte_count > self.max_bytes {
+            let trimmed = trim_log_bytes(&combined, self.keep_lines, self.max_bytes);
             fs::write(&path, &trimmed)?;
-            guard.current_lines = count_lines(&trimmed);
-            guard.current_bytes = trimmed.len();
+            self.current_lines = count_lines(&trimmed);
+            self.current_bytes = trimmed.len();
         } else {
             if !combined.is_empty() || !path.exists() {
                 fs::write(&path, &combined)?;
             }
-            guard.current_lines = line_count;
-            guard.current_bytes = byte_count;
+            self.current_lines = line_count;
+            self.current_bytes = byte_count;
         }
 
-        guard.path = Some(path);
+        self.writer = Some(Self::open_append_writer(&path)?);
+        self.path = Some(path);
         Ok(())
     }
 
-    pub fn write_bytes(&self, data: &[u8]) {
+    fn write_bytes(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
         }
-        let mut guard = self.inner.lock().expect("log sink lock poisoned");
-        let Some(path) = guard.path.clone() else {
-            let remaining = MAX_PENDING_BYTES.saturating_sub(guard.pending.len());
+        let Some(path) = self.path.clone() else {
+            let remaining = MAX_PENDING_BYTES.saturating_sub(self.pending.len());
             if remaining > 0 {
                 let take = data.len().min(remaining);
-                guard.pending.extend_from_slice(&data[..take]);
+                self.pending.extend_from_slice(&data[..take]);
             }
             return;
         };
 
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-            if file.write_all(data).is_ok() {
-                guard.current_bytes = guard.current_bytes.saturating_add(data.len());
-                guard.current_lines = guard.current_lines.saturating_add(count_lines(data));
+        if self.writer.is_none() {
+            self.writer = Self::open_append_writer(&path).ok();
+        }
+
+        if let Some(writer) = self.writer.as_mut() {
+            if writer.write_all(data).is_ok() {
+                self.current_bytes = self.current_bytes.saturating_add(data.len());
+                self.current_lines = self.current_lines.saturating_add(count_lines(data));
             }
         }
 
-        if guard.current_lines > guard.max_lines || guard.current_bytes > guard.max_bytes {
+        if self.current_lines > self.max_lines || self.current_bytes > self.max_bytes {
+            self.flush_writer();
+            self.writer = None;
             if let Ok(raw) = fs::read(&path) {
-                let trimmed = trim_log_bytes(&raw, guard.keep_lines, guard.max_bytes);
+                let trimmed = trim_log_bytes(&raw, self.keep_lines, self.max_bytes);
                 if fs::write(&path, &trimmed).is_ok() {
-                    guard.current_lines = count_lines(&trimmed);
-                    guard.current_bytes = trimmed.len();
+                    self.current_lines = count_lines(&trimmed);
+                    self.current_bytes = trimmed.len();
                 }
             }
+            self.writer = Self::open_append_writer(&path).ok();
         }
     }
 
-    pub fn ensure_file(&self) -> Result<PathBuf, String> {
-        let guard = self.inner.lock().expect("log sink lock poisoned");
-        let path = guard
+    fn ensure_file(&mut self) -> Result<PathBuf, String> {
+        self.flush_writer();
+        let path = self
             .path
             .clone()
             .ok_or_else(|| "Log file path is not initialized".to_string())?;
@@ -207,13 +264,14 @@ impl RotatingLogSink {
         }
         if !path.exists() {
             fs::write(&path, b"").map_err(|e| format!("Failed to create log file: {e}"))?;
+            self.writer = Self::open_append_writer(&path).ok();
         }
         Ok(path)
     }
 
-    pub fn read_tail(&self, max_lines: usize) -> String {
-        let guard = self.inner.lock().expect("log sink lock poisoned");
-        let Some(path) = guard.path.as_ref() else {
+    fn read_tail(&mut self, max_lines: usize) -> String {
+        self.flush_writer();
+        let Some(path) = self.path.as_ref() else {
             return String::new();
         };
         let Ok(raw) = fs::read(path) else {
@@ -223,6 +281,104 @@ impl RotatingLogSink {
         let lines: Vec<&str> = text.lines().collect();
         let start = lines.len().saturating_sub(max_lines);
         lines[start..].join("\n")
+    }
+
+    fn handle(&mut self, cmd: LogCommand) {
+        match cmd {
+            LogCommand::Attach { path, reply } => {
+                let _ = reply.send(self.attach_path(path));
+            }
+            LogCommand::Write(data) => {
+                self.write_bytes(&data);
+            }
+            LogCommand::EnsureFile { reply } => {
+                let _ = reply.send(self.ensure_file());
+            }
+            LogCommand::ReadTail { max_lines, reply } => {
+                let _ = reply.send(self.read_tail(max_lines));
+            }
+            #[cfg(test)]
+            LogCommand::Flush(reply) => {
+                self.flush_writer();
+                let _ = reply.send(());
+            }
+        }
+    }
+}
+
+pub struct RotatingLogSink {
+    tx: mpsc::Sender<LogCommand>,
+}
+
+impl RotatingLogSink {
+    pub fn new(max_lines: usize, keep_lines: usize, max_bytes: usize) -> Self {
+        let (tx, rx) = mpsc::channel::<LogCommand>();
+        let mut worker = LogWorker::new(max_lines, keep_lines, max_bytes);
+        let _ = std::thread::Builder::new()
+            .name("landa-log-writer".to_string())
+            .spawn(move || {
+                while let Ok(cmd) = rx.recv() {
+                    worker.handle(cmd);
+                    while let Ok(next) = rx.try_recv() {
+                        worker.handle(next);
+                    }
+                    worker.flush_writer();
+                }
+            });
+        Self { tx }
+    }
+
+    pub fn attach_path(&self, path: PathBuf) -> std::io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(LogCommand::Attach {
+                path,
+                reply: reply_tx,
+            })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "log worker stopped"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "log worker stopped"))?
+    }
+
+    pub fn write_bytes(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(LogCommand::Write(data.to_vec()));
+    }
+
+    pub fn ensure_file(&self) -> Result<PathBuf, String> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(LogCommand::EnsureFile { reply: reply_tx })
+            .map_err(|_| "Log worker stopped".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "Log worker stopped".to_string())?
+    }
+
+    pub fn read_tail(&self, max_lines: usize) -> String {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        if self
+            .tx
+            .send(LogCommand::ReadTail {
+                max_lines,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return String::new();
+        }
+        reply_rx.recv().unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn flush(&self) {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        if self.tx.send(LogCommand::Flush(reply_tx)).is_ok() {
+            let _ = reply_rx.recv();
+        }
     }
 }
 
@@ -277,6 +433,7 @@ mod tests {
         for i in 1..=11 {
             sink.write_bytes(format!("line-{i}\n").as_bytes());
         }
+        sink.flush();
 
         let content_after_rotate = fs::read_to_string(&log_path).unwrap();
         let rotated_lines: Vec<&str> = content_after_rotate.lines().collect();
@@ -288,6 +445,7 @@ mod tests {
         for i in 12..=15 {
             sink.write_bytes(format!("line-{i}\n").as_bytes());
         }
+        sink.flush();
 
         let content = fs::read_to_string(&log_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -314,6 +472,7 @@ mod tests {
             let line = format!("entry-{i:02}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
             sink.write_bytes(line.as_bytes());
         }
+        sink.flush();
 
         let raw = fs::read(&log_path).unwrap();
         assert!(
@@ -344,5 +503,17 @@ mod tests {
         assert_eq!(lines, vec!["old-5", "early-1", "early-2"]);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn parses_rust_log_level_directives() {
+        use tracing_subscriber::filter::LevelFilter;
+        assert_eq!(parse_rust_log_level_str("debug"), LevelFilter::DEBUG);
+        assert_eq!(
+            parse_rust_log_level_str("landa_core=warn,hyper=error"),
+            LevelFilter::WARN
+        );
+        assert_eq!(parse_rust_log_level_str("OFF"), LevelFilter::OFF);
+        assert_eq!(parse_rust_log_level_str("unknown"), LevelFilter::INFO);
     }
 }

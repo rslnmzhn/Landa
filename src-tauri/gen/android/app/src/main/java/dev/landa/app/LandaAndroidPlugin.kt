@@ -50,8 +50,12 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.util.Collections
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 @InvokeArg
 class PublishToDownloadsArgs {
@@ -191,9 +195,24 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     private val pendingSharedPaths = mutableListOf<String>()
     private var pendingFocusTarget: JSObject? = null
     private val lock = Any()
-    private val publishedUris = ConcurrentHashMap<String, Pair<Uri, String>>()
-    private val publishedDisplayPaths = ConcurrentHashMap<String, String>()
-    private val lastProgressNotifMs = ConcurrentHashMap<String, Long>()
+    private val publishedUris = boundedLruMap<String, Pair<Uri, String>>(256)
+    private val publishedDisplayPaths = boundedLruMap<String, String>(256)
+    private val lastProgressNotifMs = boundedLruMap<String, Long>(64)
+    private val ioExecutor: ExecutorService = ThreadPoolExecutor(
+        0,
+        3,
+        30L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue()
+    )
+
+    private fun <K, V> boundedLruMap(maxEntries: Int): MutableMap<K, V> =
+        Collections.synchronizedMap(
+            object : LinkedHashMap<K, V>(32, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<K, V>?): Boolean =
+                    size > maxEntries
+            }
+        )
     private var lastFgUpdateMs: Long = 0L
     private var lastFgActiveCount: Int = 0
     private var fgServiceRunning: Boolean = false
@@ -256,6 +275,8 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         runOnMainThread {
             appInForeground = false
             releaseWifiLock()
+            // Release Chromium in-memory resource caches when UI goes to background
+            webViewRef?.clearCache(false)
         }
         super.onPause(activity)
     }
@@ -264,6 +285,8 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         runOnMainThread {
             isDestroyed = true
             appInForeground = false
+            webViewRef = null
+            lastProgressNotifMs.clear()
             startupPermissionsCoordinator.clearPending { pendingInvoke ->
                 pendingInvoke.reject("Plugin destroyed")
             }
@@ -272,6 +295,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             releaseMulticastLock()
             mainHandler.removeCallbacksAndMessages(null)
         }
+        ioExecutor.shutdownNow()
         stopTransferForegroundInternal()
         super.onDestroy(activity)
     }
@@ -956,7 +980,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                 val imageUri = imageIndex?.let { clip.getItemAt(it).uri }
 
                 if (imageUri != null) {
-                    Thread {
+                    ioExecutor.execute {
                         val tmpDir = File(activity.cacheDir, "clipboard_tmp").apply { mkdirs() }
                         val tmpFile = File(tmpDir, "${UUID.randomUUID()}.img")
                         try {
@@ -966,7 +990,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                             if (stream == null) {
                                 tmpFile.delete()
                                 invoke.reject("Unable to read clipboard image URI")
-                                return@Thread
+                                return@execute
                             }
                             stream.use { input ->
                                 FileOutputStream(tmpFile).use { out ->
@@ -978,7 +1002,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                                         if (total > maxBytes) {
                                             tmpFile.delete()
                                             invoke.reject("Clipboard image exceeds 10 MB limit")
-                                            return@Thread
+                                            return@execute
                                         }
                                         out.write(buf, 0, n)
                                     }
@@ -992,7 +1016,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                             tmpFile.delete()
                             invoke.reject(ex.message ?: "Failed to read clipboard image")
                         }
-                    }.start()
+                    }
                     return
                 }
 
@@ -1222,7 +1246,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             )
         }
 
-        Thread {
+        ioExecutor.execute {
             try {
                 val collected = collectSafTreeFiles(treeUri)
                 val arr = JSArray()
@@ -1240,7 +1264,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             } catch (ex: Exception) {
                 invoke.reject(ex.message ?: "Failed to read selected folder")
             }
-        }.start()
+        }
     }
 
     @Command
@@ -1936,7 +1960,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             val maxDepth = args.maxDepth.coerceIn(1, MAX_FOLDER_DEPTH)
             val maxFiles = args.maxFiles.coerceIn(1, MAX_FOLDER_FILES)
 
-            Thread {
+            ioExecutor.execute {
                 try {
                     val startDocId = resolveSafTreeDocId(rootUri, segments, expectDir = true)
                     val startPrefix = segments.joinToString("/")
@@ -1990,7 +2014,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                                 val nextRel = if (prefix.isEmpty()) name else "$prefix/$name"
                                 if (!seenRelPaths.add(nextRel)) {
                                     invoke.reject("duplicate path in shared folder")
-                                    return@Thread
+                                    return@execute
                                 }
                                 val modifiedMs = if (modIdx >= 0 && !cursor.isNull(modIdx)) {
                                     cursor.getLong(modIdx).coerceAtLeast(0L)
@@ -2001,11 +2025,11 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                                 if (isDir) {
                                     if (depth >= maxDepth) {
                                         invoke.reject("folder exceeds maximum depth ($maxDepth)")
-                                        return@Thread
+                                        return@execute
                                     }
                                     if (dirCount >= maxFiles) {
                                         invoke.reject("folder exceeds maximum directory count ($maxFiles)")
-                                        return@Thread
+                                        return@execute
                                     }
                                     dirCount++
                                     rows.add(TreeRow(name, nextRel, true, 0L, modifiedMs))
@@ -2013,7 +2037,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                                 } else {
                                     if (fileCount >= maxFiles) {
                                         invoke.reject("folder exceeds maximum file count ($maxFiles)")
-                                        return@Thread
+                                        return@execute
                                     }
                                     val cursorSize = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
                                         cursor.getLong(sizeIdx)
@@ -2061,7 +2085,7 @@ class LandaAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                 } catch (ex: Exception) {
                     invoke.reject(ex.message ?: "Failed to traverse shared folder")
                 }
-            }.start()
+            }
         } catch (ex: Exception) {
             invoke.reject(ex.message ?: "Failed to traverse shared folder")
         }

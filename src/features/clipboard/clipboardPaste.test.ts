@@ -56,7 +56,7 @@ test("rejects pasted image exceeding 10 MiB before calling arrayBuffer or pushLo
 test("reads and pushes pasted image within 10 MiB limit", async () => {
   let preventDefaultCalled = false;
   let arrayBufferCalled = false;
-  let pushedBytes: number[] | null = null;
+  let pushedBytes: Uint8Array | null = null;
   let savedItem: { id: string } | null = null;
   const errors: string[] = [];
 
@@ -97,7 +97,7 @@ test("reads and pushes pasted image within 10 MiB limit", async () => {
   assert.equal(handled, true);
   assert.equal(preventDefaultCalled, true);
   assert.equal(arrayBufferCalled, true);
-  assert.deepEqual(pushedBytes, [137, 80, 78, 71]);
+  assert.deepEqual(pushedBytes, payload);
   assert.deepEqual(savedItem, { id: "img-1" });
   assert.deepEqual(errors, []);
 });

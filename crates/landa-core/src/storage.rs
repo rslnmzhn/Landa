@@ -82,6 +82,8 @@ impl Storage {
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
+            PRAGMA cache_size = -1024;
+            PRAGMA journal_size_limit = 4194304;
             PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS peers (

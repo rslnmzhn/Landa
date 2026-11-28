@@ -21,7 +21,7 @@ use crate::events::{CoreEvent, PeerInfo};
 #[cfg(unix)]
 use crate::network::bind_socket_to_lan_network;
 use crate::network::{
-    enumerate_all_lan_interfaces, enumerate_lan_interfaces, is_ip_in_excluded_subnet,
+    enumerate_all_lan_interfaces, is_ip_in_excluded_subnet, LanInterface,
     DISCOVERY_MULTICAST_ADDR,
 };
 use crate::storage::Storage;
@@ -198,9 +198,11 @@ impl DiscoveryService {
         cancel: CancellationToken,
     ) -> Result<(), CoreError> {
         let mut current_socket = Arc::new(bind_discovery_socket()?);
-        rejoin_multicast_on_lan(&current_socket);
+        let (mut cached_all_ifaces, mut cached_lan_ifaces, mut last_lan_ips) =
+            snapshot_lan_interfaces();
+        rejoin_multicast_with_ifaces(&current_socket, &cached_all_ifaces, &cached_lan_ifaces);
         let (socket_tx, mut socket_rx) = watch::channel(Arc::clone(&current_socket));
-        let mut last_lan_ips = current_lan_ips();
+        let mut sender_sockets: HashMap<Ipv4Addr, UdpSocket> = HashMap::new();
 
         let recv_self = Arc::clone(&self);
         let recv_cancel = cancel.clone();
@@ -255,11 +257,29 @@ impl DiscoveryService {
         });
 
         // Initial burst so peers appear immediately on launch
-        self.send_beacon(&current_socket).await;
+        self.send_beacon(
+            &current_socket,
+            &cached_all_ifaces,
+            &cached_lan_ifaces,
+            &mut sender_sockets,
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(400)).await;
-        self.send_beacon(&current_socket).await;
+        self.send_beacon(
+            &current_socket,
+            &cached_all_ifaces,
+            &cached_lan_ifaces,
+            &mut sender_sockets,
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(800)).await;
-        self.send_beacon(&current_socket).await;
+        self.send_beacon(
+            &current_socket,
+            &cached_all_ifaces,
+            &cached_lan_ifaces,
+            &mut sender_sockets,
+        )
+        .await;
 
         loop {
             let secs = (*interval_secs.read().expect("interval lock poisoned")).clamp(2, 3600);
@@ -270,26 +290,43 @@ impl DiscoveryService {
             }
 
             let rebind_flag = self.rebind_requested.swap(false, Ordering::AcqRel);
-            let now_lan_ips = current_lan_ips();
+            let (now_all_ifaces, now_lan_ifaces, now_lan_ips) = snapshot_lan_interfaces();
             let ifaces_changed = now_lan_ips != last_lan_ips;
             if rebind_flag || ifaces_changed {
+                cached_all_ifaces = now_all_ifaces;
+                cached_lan_ifaces = now_lan_ifaces;
                 last_lan_ips = now_lan_ips;
+                sender_sockets.clear();
                 match bind_discovery_socket() {
                     Ok(new_sock) => {
                         let new_arc = Arc::new(new_sock);
-                        rejoin_multicast_on_lan(&new_arc);
+                        rejoin_multicast_with_ifaces(
+                            &new_arc,
+                            &cached_all_ifaces,
+                            &cached_lan_ifaces,
+                        );
                         current_socket = Arc::clone(&new_arc);
                         let _ = socket_tx.send(new_arc);
                     }
                     Err(err) => {
                         debug!("discovery socket rebind fallback to multicast rejoin: {err}");
                         bind_socket_to_lan(&current_socket);
-                        rejoin_multicast_on_lan(&current_socket);
+                        rejoin_multicast_with_ifaces(
+                            &current_socket,
+                            &cached_all_ifaces,
+                            &cached_lan_ifaces,
+                        );
                     }
                 }
             }
 
-            self.send_beacon(&current_socket).await;
+            self.send_beacon(
+                &current_socket,
+                &cached_all_ifaces,
+                &cached_lan_ifaces,
+                &mut sender_sockets,
+            )
+            .await;
         }
 
         recv_task.abort();
@@ -314,23 +351,32 @@ impl DiscoveryService {
         .ok()
     }
 
-    async fn send_beacon(&self, socket: &UdpSocket) {
-        bind_socket_to_lan(socket);
-        join_multicast_on_lan(socket);
-
+    async fn send_beacon(
+        &self,
+        socket: &UdpSocket,
+        all_interfaces: &[LanInterface],
+        interfaces: &[LanInterface],
+        sender_sockets: &mut HashMap<Ipv4Addr, UdpSocket>,
+    ) {
         let Some(packet) = self.build_beacon_packet() else {
             return;
         };
 
-        let interfaces = enumerate_lan_interfaces();
         let global_bcast = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, DISCOVERY_PORT));
         let multicast_addr =
             SocketAddr::V4(SocketAddrV4::new(DISCOVERY_MULTICAST_ADDR, DISCOVERY_PORT));
 
         // Send from each physical LAN interface IP so VPN default routes cannot hijack LAN broadcasts
-        for iface in &interfaces {
+        for iface in interfaces {
             let bcast_addr = SocketAddr::V4(SocketAddrV4::new(iface.broadcast, DISCOVERY_PORT));
-            if let Ok(iface_sock) = bind_interface_sender_socket(iface.ip) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                sender_sockets.entry(iface.ip)
+            {
+                if let Ok(sock) = bind_interface_sender_socket(iface.ip) {
+                    entry.insert(sock);
+                }
+            }
+            if let Some(iface_sock) = sender_sockets.get(&iface.ip) {
                 let _ = iface_sock.send_to(&packet, bcast_addr).await;
                 let _ = iface_sock.send_to(&packet, global_bcast).await;
                 let _ = iface_sock.send_to(&packet, multicast_addr).await;
@@ -339,13 +385,16 @@ impl DiscoveryService {
             }
         }
 
-        if interfaces.is_empty() && enumerate_all_lan_interfaces().is_empty() {
+        if interfaces.is_empty() && all_interfaces.is_empty() {
             let _ = socket.send_to(&packet, global_bcast).await;
             let _ = socket.send_to(&packet, multicast_addr).await;
         }
 
         // Manual targets (e.g. VPN / routed subnets) go through the default socket
-        if let Ok(manual) = self.storage.list_manual_targets() {
+        let storage = Arc::clone(&self.storage);
+        if let Ok(Ok(manual)) =
+            tokio::task::spawn_blocking(move || storage.list_manual_targets()).await
+        {
             for target in manual {
                 if let Ok(ip) = target.ip.parse::<Ipv4Addr>() {
                     let addr = SocketAddr::V4(SocketAddrV4::new(ip, DISCOVERY_PORT));
@@ -370,11 +419,16 @@ impl DiscoveryService {
         let ip = *v4.ip();
         let ip_str = ip.to_string();
         if is_ip_in_excluded_subnet(ip) {
-            let is_manual = self
-                .storage
-                .list_manual_targets()
-                .map(|targets| targets.iter().any(|t| t.ip == ip_str))
-                .unwrap_or(false);
+            let storage = Arc::clone(&self.storage);
+            let ip_check = ip_str.clone();
+            let is_manual = tokio::task::spawn_blocking(move || {
+                storage
+                    .list_manual_targets()
+                    .map(|targets| targets.iter().any(|t| t.ip == ip_check))
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
             if !is_manual {
                 return;
             }
@@ -387,6 +441,9 @@ impl DiscoveryService {
                     existing.ip != ip
                         || existing.quic_port != beacon.quic_port
                         || existing.device_name != beacon.device_name
+                        || existing.os != beacon.os
+                        || existing.category != beacon.category
+                        || existing.public_key != beacon.public_key
                 }
                 None => true,
             };
@@ -406,19 +463,32 @@ impl DiscoveryService {
             changed
         };
 
-        if let Err(err) = self.storage.upsert_peer(
-            &beacon.peer_id,
-            &beacon.public_key,
-            &beacon.device_name,
-            beacon.os,
-            beacon.category,
-            Some(&ip_str),
-            Some(beacon.quic_port),
-        ) {
-            warn!("failed to persist discovered peer: {err}");
-        }
-
         if is_new_or_changed {
+            let storage = Arc::clone(&self.storage);
+            let peer_id = beacon.peer_id;
+            let public_key = beacon.public_key;
+            let device_name = beacon.device_name.clone();
+            let os = beacon.os;
+            let category = beacon.category;
+            let ip_persist = ip_str.clone();
+            let quic_port = beacon.quic_port;
+            match tokio::task::spawn_blocking(move || {
+                storage.upsert_peer(
+                    &peer_id,
+                    &public_key,
+                    &device_name,
+                    os,
+                    category,
+                    Some(&ip_persist),
+                    Some(quic_port),
+                )
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!("failed to persist discovered peer: {err}"),
+                Err(err) => warn!("persist discovered peer task failed: {err}"),
+            }
             let _ = self.events.send(CoreEvent::PeersChanged);
         }
 
@@ -472,34 +542,50 @@ fn bind_interface_sender_socket(local_ip: Ipv4Addr) -> Result<UdpSocket, CoreErr
     Ok(tokio_sock)
 }
 
-fn current_lan_ips() -> Vec<Ipv4Addr> {
-    let mut ips: Vec<Ipv4Addr> = enumerate_lan_interfaces().into_iter().map(|i| i.ip).collect();
+fn snapshot_lan_interfaces() -> (Vec<LanInterface>, Vec<LanInterface>, Vec<Ipv4Addr>) {
+    let all_ifaces = enumerate_all_lan_interfaces();
+    let lan_ifaces: Vec<LanInterface> = all_ifaces
+        .iter()
+        .filter(|iface| !is_ip_in_excluded_subnet(iface.ip))
+        .cloned()
+        .collect();
+    let mut ips: Vec<Ipv4Addr> = lan_ifaces.iter().map(|i| i.ip).collect();
     ips.sort();
     ips.dedup();
-    ips
+    (all_ifaces, lan_ifaces, ips)
 }
 
-fn rejoin_multicast_on_lan(socket: &UdpSocket) {
-    let all_interfaces = enumerate_all_lan_interfaces();
-    for iface in &all_interfaces {
+#[cfg(test)]
+fn current_lan_ips() -> Vec<Ipv4Addr> {
+    snapshot_lan_interfaces().2
+}
+
+fn rejoin_multicast_with_ifaces(
+    socket: &UdpSocket,
+    all_interfaces: &[LanInterface],
+    lan_interfaces: &[LanInterface],
+) {
+    for iface in all_interfaces {
         let _ = socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip);
     }
     let _ = socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED);
-    join_multicast_on_lan(socket);
+    join_multicast_with_ifaces(socket, all_interfaces, lan_interfaces);
 }
 
-fn join_multicast_on_lan(socket: &UdpSocket) {
-    let all_interfaces = enumerate_all_lan_interfaces();
-    for iface in &all_interfaces {
+fn join_multicast_with_ifaces(
+    socket: &UdpSocket,
+    all_interfaces: &[LanInterface],
+    lan_interfaces: &[LanInterface],
+) {
+    for iface in all_interfaces {
         if is_ip_in_excluded_subnet(iface.ip) {
             let _ = socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip);
         }
     }
-    let interfaces = enumerate_lan_interfaces();
-    if interfaces.is_empty() && all_interfaces.is_empty() {
+    if lan_interfaces.is_empty() && all_interfaces.is_empty() {
         let _ = socket.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED);
     } else {
-        for iface in interfaces {
+        for iface in lan_interfaces {
             let _ = socket.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip);
         }
     }

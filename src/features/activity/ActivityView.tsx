@@ -25,7 +25,8 @@ import { summarizeTransferPaths } from "./activityPaths";
 interface ActivityViewProps {
   t: TranslationDict;
   activeTransfers: TransferProgressInfo[];
-  history: TransferHistoryRecord[];
+  history?: TransferHistoryRecord[];
+  historyTick?: number;
   onPreviewPath: (pathOrUri: string) => void;
   onError: (msg: string) => void;
 }
@@ -33,15 +34,58 @@ interface ActivityViewProps {
 export function ActivityView({
   t,
   activeTransfers,
-  history,
+  history: historyProp,
+  historyTick = 0,
   onPreviewPath,
   onError,
 }: ActivityViewProps) {
+  const [loadedHistory, setLoadedHistory] = useState<TransferHistoryRecord[]>([]);
+  const history = historyProp ?? loadedHistory;
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [resolvedNames, setResolvedNames] = useState<Record<string, string>>({});
   const resolvedNamesRef = useRef<Record<string, string>>({});
   const inFlightUrisRef = useRef<Set<string>>(new Set());
   const mountedRef = useRef(true);
+
+  useEffect(() => {
+    if (historyProp !== undefined) return;
+    let cancelled = false;
+    api
+      .listHistory(100)
+      .then((items) => {
+        if (cancelled) return;
+        setLoadedHistory(items);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [historyProp, historyTick]);
+
+  useEffect(() => {
+    if (history.length === 0) {
+      setResolvedNames((prev) => (Object.keys(prev).length === 0 ? prev : {}));
+      return;
+    }
+    const activeUris = new Set<string>();
+    for (const item of history) {
+      for (const p of item.savedPaths) {
+        if (p.startsWith("content://")) activeUris.add(p);
+      }
+    }
+    setResolvedNames((prev) => {
+      let changed = false;
+      const next: Record<string, string> = {};
+      for (const [k, v] of Object.entries(prev)) {
+        if (activeUris.has(k)) {
+          next[k] = v;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [history]);
 
   const isAndroid = navigator.userAgent.toLowerCase().includes("android");
 

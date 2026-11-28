@@ -78,6 +78,25 @@ test("resolveTabSwipe switches tabs on horizontal swipe and ignores vertical scr
   assert.equal(resolveTabSwipe(tabs, "shares", -42, 5, 80), "clipboard");
 });
 
+test("GlassButton glass variant avoids backdrop-filter while top-level containers keep it", () => {
+  const css = fs.readFileSync(path.join(rootDir, "src/styles/glass.css"), "utf8");
+  const src = fs.readFileSync(
+    path.join(rootDir, "src/components/glass/GlassPrimitives.tsx"),
+    "utf8"
+  );
+
+  const btnRuleMatch = css.match(/\.liquid-glass-btn\s*\{([^}]*)\}/);
+  assert.ok(btnRuleMatch, ".liquid-glass-btn rule must exist");
+  assert.doesNotMatch(btnRuleMatch[1], /backdrop-filter/);
+  assert.match(btnRuleMatch[1], /background:\s*var\(--glass-bg\)/);
+  assert.match(btnRuleMatch[1], /border:\s*1px solid var\(--glass-border\)/);
+
+  assert.match(src, /glass:\s*\n?\s*"liquid-glass-btn\b/);
+  assert.match(css, /\.liquid-glass\s*\{[\s\S]*backdrop-filter:/);
+  assert.match(css, /\.liquid-glass-modal\s*\{[\s\S]*backdrop-filter:/);
+  assert.match(css, /\.liquid-pill\s*\{[\s\S]*backdrop-filter:/);
+});
+
 test("moving lens indicator uses CSS liquid-lens-track and respects prefers-reduced-motion", () => {
   const css = fs.readFileSync(path.join(rootDir, "src/styles/glass.css"), "utf8");
   const primitives = fs.readFileSync(

@@ -156,8 +156,11 @@ pub fn get_local_identity(state: State<'_, AppState>) -> LocalIdentityInfo {
 }
 
 #[tauri::command]
-pub fn list_peers(state: State<'_, AppState>) -> Result<Vec<PeerInfo>, String> {
-    state.engine.list_peers().map_err(|e| e.to_string())
+pub async fn list_peers(state: State<'_, AppState>) -> Result<Vec<PeerInfo>, String> {
+    let engine = Arc::clone(&state.engine);
+    tokio::task::spawn_blocking(move || engine.list_peers().map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| format!("list_peers task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -206,11 +209,13 @@ pub fn forget_peer(state: State<'_, AppState>, peer_id: String) -> Result<(), St
 }
 
 #[tauri::command]
-pub fn list_friend_requests(state: State<'_, AppState>) -> Result<Vec<FriendRequestInfo>, String> {
-    state
-        .engine
-        .list_friend_requests()
-        .map_err(|e| e.to_string())
+pub async fn list_friend_requests(
+    state: State<'_, AppState>,
+) -> Result<Vec<FriendRequestInfo>, String> {
+    let engine = Arc::clone(&state.engine);
+    tokio::task::spawn_blocking(move || engine.list_friend_requests().map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| format!("list_friend_requests task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -285,9 +290,12 @@ where
                 size_bytes,
             });
         } else {
-            let local_items =
+            let local_items = tokio::task::spawn_blocking(move || {
                 landa_core::transfer::TransferManager::collect_outgoing_items(&[PathBuf::from(raw)])
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| format!("collect_outgoing_items task failed: {e}"))??;
             items.extend(local_items);
         }
     }
@@ -395,14 +403,15 @@ pub fn cancel_transfer(state: State<'_, AppState>, transfer_id: String) -> bool 
 }
 
 #[tauri::command]
-pub fn list_history(
+pub async fn list_history(
     state: State<'_, AppState>,
     limit: Option<usize>,
 ) -> Result<Vec<TransferHistoryRecord>, String> {
-    state
-        .engine
-        .list_history(limit.unwrap_or(100))
-        .map_err(|e| e.to_string())
+    let engine = Arc::clone(&state.engine);
+    let limit = limit.unwrap_or(100);
+    tokio::task::spawn_blocking(move || engine.list_history(limit).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| format!("list_history task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -494,8 +503,13 @@ pub fn remove_manual_target(state: State<'_, AppState>, ip: String) -> Result<()
 }
 
 #[tauri::command]
-pub fn list_lan_interfaces(state: State<'_, AppState>) -> Vec<LanInterfaceStatus> {
-    state.engine.list_lan_interfaces()
+pub async fn list_lan_interfaces(
+    state: State<'_, AppState>,
+) -> Result<Vec<LanInterfaceStatus>, String> {
+    let engine = Arc::clone(&state.engine);
+    tokio::task::spawn_blocking(move || engine.list_lan_interfaces())
+        .await
+        .map_err(|e| format!("list_lan_interfaces task failed: {e}"))
 }
 
 #[tauri::command]
@@ -690,32 +704,42 @@ async fn write_text_to_system_clipboard(
 
 #[cfg(feature = "mod-shares")]
 #[tauri::command]
-pub fn shares_list_local(state: State<'_, AppState>) -> Result<Vec<LocalShareRoot>, String> {
-    state.shares.list_local_shares().map_err(|e| e.to_string())
+pub async fn shares_list_local(state: State<'_, AppState>) -> Result<Vec<LocalShareRoot>, String> {
+    let shares = Arc::clone(&state.shares);
+    tokio::task::spawn_blocking(move || shares.list_local_shares().map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| format!("shares_list_local task failed: {e}"))?
 }
 
 #[cfg(not(feature = "mod-shares"))]
 #[tauri::command]
-pub fn shares_list_local() -> Result<Vec<serde_json::Value>, String> {
+pub async fn shares_list_local() -> Result<Vec<serde_json::Value>, String> {
     Err("shares module is not compiled".into())
 }
 
 #[cfg(feature = "mod-shares")]
 #[tauri::command]
-pub fn shares_add_local(
+pub async fn shares_add_local(
     state: State<'_, AppState>,
     path: String,
     name: Option<String>,
 ) -> Result<LocalShareRoot, String> {
-    state
-        .shares
-        .add_local_share(PathBuf::from(path), name)
-        .map_err(|e| e.to_string())
+    let shares = Arc::clone(&state.shares);
+    tokio::task::spawn_blocking(move || {
+        shares
+            .add_local_share(PathBuf::from(path), name)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("shares_add_local task failed: {e}"))?
 }
 
 #[cfg(not(feature = "mod-shares"))]
 #[tauri::command]
-pub fn shares_add_local(_path: String, _name: Option<String>) -> Result<serde_json::Value, String> {
+pub async fn shares_add_local(
+    _path: String,
+    _name: Option<String>,
+) -> Result<serde_json::Value, String> {
     Err("shares module is not compiled".into())
 }
 
@@ -940,14 +964,15 @@ pub async fn shares_preview_remote_file(
 #[tauri::command]
 pub async fn shares_get_remote_thumbnail(
     state: State<'_, AppState>,
+    server: State<'_, Arc<crate::preview::PreviewServer>>,
     peer_id: String,
     root_id: String,
     rel_path: String,
     max_size: Option<u32>,
 ) -> Result<ShareThumbnail, String> {
-    state
+    let (mime_type, bytes) = state
         .shares
-        .get_remote_thumbnail(
+        .get_remote_thumbnail_bytes(
             &state.engine,
             &peer_id,
             &root_id,
@@ -955,7 +980,13 @@ pub async fn shares_get_remote_thumbnail(
             max_size.unwrap_or(160),
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let url = server.register_bytes(mime_type.clone(), bytes);
+    Ok(ShareThumbnail {
+        mime_type,
+        url: Some(url),
+        data_url: String::new(),
+    })
 }
 
 #[cfg(not(feature = "mod-shares"))]
@@ -1065,19 +1096,31 @@ pub enum ClipboardPasteResult {
 
 #[cfg(feature = "mod-clipboard")]
 #[tauri::command]
-pub fn clipboard_push_local_image_bytes(
+pub async fn clipboard_push_local_image_bytes(
     state: State<'_, AppState>,
-    bytes: Vec<u8>,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<ClipboardItem, String> {
-    state
-        .clipboard
-        .push_local_image(&bytes, None, None)
-        .map_err(|e| e.to_string())
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(data) => data.clone(),
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("Expected raw binary image payload".into());
+        }
+    };
+    let clipboard = Arc::clone(&state.clipboard);
+    tokio::task::spawn_blocking(move || {
+        clipboard
+            .push_local_image(&bytes, None, None)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("clipboard_push_local_image_bytes task failed: {e}"))?
 }
 
 #[cfg(not(feature = "mod-clipboard"))]
 #[tauri::command]
-pub fn clipboard_push_local_image_bytes(_bytes: Vec<u8>) -> Result<serde_json::Value, String> {
+pub async fn clipboard_push_local_image_bytes(
+    _request: tauri::ipc::Request<'_>,
+) -> Result<serde_json::Value, String> {
     Err("clipboard module is not compiled".into())
 }
 
@@ -1325,24 +1368,21 @@ async fn ensure_remote_clipboard_image_cached(
         return Ok(cached_path.to_string_lossy().to_string());
     }
 
-    let bytes = state
-        .clipboard
-        .fetch_remote_image(&state.engine, peer_id, item_id)
-        .await
-        .map_err(|e| e.to_string())?;
     let _reservation = state
         .engine
         .preview_quota()
         .reserve(
             &cache_dir,
-            bytes.len() as u64,
+            landa_mod_clipboard::MAX_IMAGE_BYTES as u64,
             crate::preview::MAX_PREVIEW_CACHE_BYTES,
             std::slice::from_ref(&cached_path),
         )
         .map_err(|e| format!("Preview cache quota exceeded: {e}"))?;
-    tokio::fs::write(&cached_path, &bytes)
+    state
+        .clipboard
+        .fetch_remote_image_to_file(&state.engine, peer_id, item_id, &cached_path)
         .await
-        .map_err(|e| format!("Failed to cache remote clipboard image: {e}"))?;
+        .map_err(|e| e.to_string())?;
     Ok(cached_path.to_string_lossy().to_string())
 }
 
@@ -1645,20 +1685,22 @@ pub struct QrConnectInfo {
 }
 
 #[tauri::command]
-pub fn get_qr_connect_info(state: State<'_, AppState>) -> Result<QrConnectInfo, String> {
-    let (uri, ip, port) = state
-        .engine
-        .local_qr_connect_uri()
-        .map_err(|e| e.to_string())?;
-    let code = qrcode::QrCode::new(uri.as_bytes())
-        .map_err(|e| format!("Failed to generate QR code: {e}"))?;
-    let svg = code
-        .render::<qrcode::render::svg::Color>()
-        .min_dimensions(220, 220)
-        .dark_color(qrcode::render::svg::Color("#0f172a"))
-        .light_color(qrcode::render::svg::Color("#ffffff"))
-        .build();
-    Ok(QrConnectInfo { uri, svg, ip, port })
+pub async fn get_qr_connect_info(state: State<'_, AppState>) -> Result<QrConnectInfo, String> {
+    let engine = Arc::clone(&state.engine);
+    tokio::task::spawn_blocking(move || {
+        let (uri, ip, port) = engine.local_qr_connect_uri().map_err(|e| e.to_string())?;
+        let code = qrcode::QrCode::new(uri.as_bytes())
+            .map_err(|e| format!("Failed to generate QR code: {e}"))?;
+        let svg = code
+            .render::<qrcode::render::svg::Color>()
+            .min_dimensions(220, 220)
+            .dark_color(qrcode::render::svg::Color("#0f172a"))
+            .light_color(qrcode::render::svg::Color("#ffffff"))
+            .build();
+        Ok(QrConnectInfo { uri, svg, ip, port })
+    })
+    .await
+    .map_err(|e| format!("get_qr_connect_info task failed: {e}"))?
 }
 
 #[tauri::command]

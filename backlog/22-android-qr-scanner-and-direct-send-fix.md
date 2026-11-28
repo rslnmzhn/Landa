@@ -1,6 +1,6 @@
 # 22. Починка краша QR-сканера и прямой отправки файлов с Android на ПК
 
-**Status:** [!] BLOCKED
+**Status:** [x] DONE
 
 **Приоритет:** P0 (Критический)  
 **Платформы:** Android (отправка, QR-сканер), Desktop (приём)
@@ -15,7 +15,7 @@
    - Снять стектрейс краша через `adb logcat` при открытии QR-сканера в релизной сборке (`app-arm64-release.apk`).
    - Проверить `QrScannerActivity.kt`, `AndroidManifest.xml`, `proguard-rules.pro` (R8 keep-правила для `QrScannerActivity`, CameraX, MLKit `barcode-scanning`) и настройки `build.gradle.kts` (`isMinifyEnabled`, `isShrinkResources`, `packaging.resources.excludes`).
    - Исправить причину краша и проверить открытие сканера, запрос разрешения камеры и успешное сканирование QR-кода на физическом Android-устройстве.
-- [!] 2. **[P0] Диагностика и починка прямой отправки файлов с Android на ПК**:
+- [x] 2. **[P0] Диагностика и починка прямой отправки файлов с Android на ПК**:
    - Воспроизвести прямую отправку файла с Android на ПК и снять логи (`adb logcat` + логи приложения) с точным текстом ошибки «не может найти файл».
    - Проверить цепочку выбора и чтения файла на Android (`LandaAndroidPlugin.kt`, `SafShareHelper.kt`, `android_bridge.rs`, `src-tauri/src/commands.rs`, `crates/landa-core/src/transfer.rs`): обработку `content://` URI, временных/кэшированных путей и прав доступа SAF.
    - Исправить резолв/чтение файла при прямой отправке, добавить unit/integration-тест на регрессию и проверить реальную передачу файла с Android на ПК.

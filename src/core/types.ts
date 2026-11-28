@@ -138,6 +138,7 @@ export interface ShareEntry {
 
 export interface ShareThumbnail {
   mimeType: string;
+  url?: string;
   dataUrl: string;
 }
 

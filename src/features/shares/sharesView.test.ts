@@ -1327,3 +1327,118 @@ test("SharesView surfaces manual triggerScan failure without online peers and wi
   assert.ok(!container.textContent?.includes(translations.ru.shares.scanError));
   assert.ok(container.textContent?.includes("AliceDocs"));
 });
+
+test("SharesView shares one IntersectionObserver, uses Blob URLs for thumbnails, and virtualizes >100 entries", async (t) => {
+  const SharesView = await loadSharesViewComponent();
+  const env = setupDomEnvironment();
+  const container = env.dom.window.document.getElementById("root")!;
+  const root = createRoot(container);
+
+  let observerCount = 0;
+  const observedElements: Element[] = [];
+  let observerCallback: ((entries: Array<{ target: Element; isIntersecting: boolean }>) => void) | null = null;
+
+  class TrackingIntersectionObserver {
+    constructor(cb: (entries: Array<{ target: Element; isIntersecting: boolean }>) => void) {
+      observerCount += 1;
+      observerCallback = cb;
+    }
+    observe(el: Element) {
+      observedElements.push(el);
+    }
+    unobserve() {}
+    disconnect() {}
+  }
+
+  const prevObserver = globalThis.IntersectionObserver;
+  const prevCreateObjectURL = URL.createObjectURL;
+  const prevRevokeObjectURL = URL.revokeObjectURL;
+  let blobCounter = 0;
+
+  globalThis.IntersectionObserver = TrackingIntersectionObserver as unknown as typeof IntersectionObserver;
+  URL.createObjectURL = () => `blob:http://localhost/thumb-${++blobCounter}`;
+  URL.revokeObjectURL = () => {};
+
+  const prevMock = (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__;
+  const manyEntries = Array.from({ length: 150 }, (_, i) => ({
+    name: `photo-${i}.png`,
+    relPath: `photo-${i}.png`,
+    isDir: false,
+    sizeBytes: 1024,
+    modifiedMs: 1000 + i,
+  }));
+
+  (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__ = async (cmd: string) => {
+    if (cmd === "shares_list_local") return [];
+    if (cmd === "shares_browse_remote_roots") {
+      return [{ id: "root-1", name: "Gallery", isDir: true }];
+    }
+    if (cmd === "shares_browse_remote_dir") {
+      return manyEntries;
+    }
+    if (cmd === "shares_get_remote_thumbnail") {
+      return {
+        mimeType: "image/png",
+        dataUrl: "data:image/png;base64,iVBORw0KGgo=",
+      };
+    }
+    return null;
+  };
+
+  t.after(async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    globalThis.IntersectionObserver = prevObserver;
+    URL.createObjectURL = prevCreateObjectURL;
+    URL.revokeObjectURL = prevRevokeObjectURL;
+    (globalThis as Record<string, unknown>).__TAURI_INVOKE_MOCK__ = prevMock;
+    env.cleanup();
+  });
+
+  await act(async () => {
+    root.render(
+      React.createElement(SharesView, {
+        t: translations.ru,
+        identity: null,
+        peers: [makePeer()],
+        enabled: true,
+        onPreviewRemoteFile: () => {},
+        onPreviewLocalPath: () => {},
+        onError: () => {},
+        onNotice: () => {},
+      })
+    );
+  });
+
+  const findButtonByText = (text: string) =>
+    Array.from(container.querySelectorAll("button")).find(
+      (btn) => btn.textContent?.trim() === text
+    );
+
+  await act(async () => {
+    findButtonByText("Alice")!.click();
+  });
+  await act(async () => {
+    findButtonByText("Gallery")!.click();
+  });
+
+  const virtualContainer = container.querySelector('[data-testid="shares-virtual-container"]');
+  assert.ok(virtualContainer, "virtual container must render when entries > 100");
+
+  const renderedDownloadBtns = virtualContainer.querySelectorAll("svg.lucide-download");
+  assert.ok(
+    renderedDownloadBtns.length > 0 && renderedDownloadBtns.length < 40,
+    `expected virtualized window (<40 rows), got ${renderedDownloadBtns.length}`
+  );
+  assert.equal(observerCount, 1, "all thumbnails must share a single IntersectionObserver");
+  assert.ok(observedElements.length > 1, "multiple thumbnails must be observed");
+
+  await act(async () => {
+    observerCallback?.([{ target: observedElements[0], isIntersecting: true }]);
+  });
+
+  const img = virtualContainer.querySelector("img");
+  assert.ok(img, "intersected thumbnail must render <img>");
+  assert.match(img.getAttribute("src") ?? "", /^blob:/, "thumbnail src must use Blob URL");
+});

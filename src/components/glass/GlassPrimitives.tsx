@@ -81,7 +81,7 @@ export function GlassButton({
     primary:
       "bg-gradient-to-b from-indigo-400/90 to-indigo-600/90 text-white border border-white/30 shadow-[inset_0_1px_1px_rgba(255,255,255,0.45),0_10px_25px_rgba(79,70,229,0.35)] hover:brightness-110",
     glass:
-      "liquid-glass text-slate-900/90 dark:text-white/90 hover:bg-white/25 dark:hover:bg-white/15",
+      "liquid-glass-btn text-slate-900/90 dark:text-white/90 hover:bg-white/25 dark:hover:bg-white/15",
     danger:
       "bg-rose-500/25 text-rose-900 dark:text-rose-100 border border-rose-400/35 shadow-[inset_0_1px_1px_rgba(255,255,255,0.25)] hover:bg-rose-500/35",
     ghost:

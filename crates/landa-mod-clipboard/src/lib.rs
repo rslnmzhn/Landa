@@ -18,7 +18,7 @@ const CLIPBOARD_SETTING_KEY: &str = "clipboard_history";
 const MAX_HISTORY_ITEMS: usize = 30;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
-const MAX_IMAGE_DIMENSION: u32 = 8192;
+const MAX_IMAGE_DIMENSION: u32 = 4096;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -190,6 +190,44 @@ impl ClipboardModule {
         self.store_verified_png(png_bytes, width, height, source_peer_id, source_peer_name)
     }
 
+    pub fn push_local_image_from_file(
+        &self,
+        path: &Path,
+        source_peer_id: Option<String>,
+        source_peer_name: Option<String>,
+    ) -> Result<ClipboardItem, CoreError> {
+        let (width, height, is_png) = validate_image_file(path)?;
+        if is_png {
+            let meta = std::fs::metadata(path)?;
+            let size_bytes = meta.len();
+            if size_bytes == 0 || size_bytes > MAX_IMAGE_BYTES as u64 {
+                return Err(CoreError::InvalidInput(
+                    "clipboard image exceeds 10 MB limit".into(),
+                ));
+            }
+            let hash = hash_std_file_blake3(path)?;
+            let id = Uuid::new_v4().to_string();
+            let dest_path = self.images_dir.join(format!("{id}.png"));
+            if std::fs::rename(path, &dest_path).is_err() {
+                std::fs::copy(path, &dest_path)?;
+                let _ = std::fs::remove_file(path);
+            }
+            return self.record_stored_png(
+                id,
+                dest_path,
+                size_bytes,
+                hash,
+                width,
+                height,
+                source_peer_id,
+                source_peer_name,
+            );
+        }
+        let raw_bytes = std::fs::read(path)?;
+        let (png_bytes, width, height) = normalize_to_png(&raw_bytes)?;
+        self.store_verified_png(png_bytes, width, height, source_peer_id, source_peer_name)
+    }
+
     pub fn push_local_rgba_image(
         &self,
         width: u32,
@@ -230,6 +268,31 @@ impl ClipboardModule {
         let file_path = self.images_dir.join(format!("{id}.png"));
         std::fs::write(&file_path, &png_bytes)?;
 
+        self.record_stored_png(
+            id,
+            file_path,
+            size_bytes,
+            hash,
+            width,
+            height,
+            source_peer_id,
+            source_peer_name,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_stored_png(
+        &self,
+        id: String,
+        file_path: PathBuf,
+        size_bytes: u64,
+        hash: String,
+        width: u32,
+        height: u32,
+        source_peer_id: Option<String>,
+        source_peer_name: Option<String>,
+    ) -> Result<ClipboardItem, CoreError> {
+        std::fs::create_dir_all(&self.images_dir)?;
         let item = ClipboardItem {
             id,
             kind: ClipboardContentKind::Image,
@@ -373,6 +436,9 @@ impl ClipboardModule {
         peer_id: &str,
         item_id: &str,
     ) -> Result<(), CoreError> {
+        if !self.is_enabled() {
+            return Err(CoreError::ModuleDisabled("clipboard".into()));
+        }
         let item = self
             .get_local_item(item_id)
             .ok_or_else(|| CoreError::NotFound(format!("clipboard item {item_id}")))?;
@@ -384,8 +450,41 @@ impl ClipboardModule {
         let path = item
             .image_path
             .ok_or_else(|| CoreError::NotFound("clipboard image path missing".into()))?;
-        let bytes = tokio::fs::read(&path).await?;
-        self.send_image_bytes_to_peer(engine, peer_id, &bytes).await
+        let path_buf = PathBuf::from(&path);
+        let (size_bytes, content_hash) = hash_file_blake3(&path_buf).await?;
+        if size_bytes == 0 || size_bytes > MAX_IMAGE_BYTES as u64 {
+            return Err(CoreError::InvalidInput(
+                "clipboard image exceeds 10 MB limit".into(),
+            ));
+        }
+        let width = item.image_width.unwrap_or(1).clamp(1, MAX_IMAGE_DIMENSION);
+        let height = item.image_height.unwrap_or(1).clamp(1, MAX_IMAGE_DIMENSION);
+
+        let (_, mut send, mut recv) = engine
+            .open_trusted_module_stream(peer_id, StreamKind::Clipboard)
+            .await?;
+        write_frame(
+            &mut send,
+            &ClipboardRequest::PushImage {
+                size_bytes,
+                width,
+                height,
+                content_hash,
+            },
+        )
+        .await?;
+
+        stream_file_with_digest(&mut send, &path_buf, size_bytes).await?;
+        let _ = send.finish();
+
+        let resp: ClipboardResponse = read_frame(&mut recv, MAX_CONTROL_FRAME_BYTES).await?;
+        match resp {
+            ClipboardResponse::Ack => Ok(()),
+            ClipboardResponse::Error(msg) => Err(CoreError::InvalidInput(msg)),
+            _ => Err(CoreError::InvalidInput(
+                "unexpected clipboard response".into(),
+            )),
+        }
     }
 
     pub async fn send_image_bytes_to_peer(
@@ -490,6 +589,46 @@ impl ClipboardModule {
 
         read_verified_image_stream(&mut recv, size_bytes, &content_hash).await
     }
+
+    pub async fn fetch_remote_image_to_file(
+        &self,
+        engine: &LandaEngine,
+        peer_id: &str,
+        item_id: &str,
+        dest_path: &Path,
+    ) -> Result<u64, CoreError> {
+        if !self.is_enabled() {
+            return Err(CoreError::ModuleDisabled("clipboard".into()));
+        }
+        let (_, mut send, mut recv) = engine
+            .open_trusted_module_stream(peer_id, StreamKind::Clipboard)
+            .await?;
+        write_frame(
+            &mut send,
+            &ClipboardRequest::FetchImage {
+                item_id: item_id.to_string(),
+            },
+        )
+        .await?;
+        let _ = send.finish();
+
+        let resp: ClipboardResponse = read_frame(&mut recv, MAX_CONTROL_FRAME_BYTES).await?;
+        let (size_bytes, content_hash) = match resp {
+            ClipboardResponse::ImageHeader {
+                size_bytes,
+                content_hash,
+                ..
+            } => (size_bytes, content_hash),
+            ClipboardResponse::Error(msg) => return Err(CoreError::InvalidInput(msg)),
+            _ => {
+                return Err(CoreError::InvalidInput(
+                    "unexpected clipboard response".into(),
+                ))
+            }
+        };
+
+        receive_verified_image_to_file(&mut recv, size_bytes, &content_hash, dest_path).await
+    }
 }
 
 #[async_trait]
@@ -558,16 +697,33 @@ impl LandaModule for ClipboardModule {
                 {
                     ClipboardResponse::Error("invalid image dimensions".into())
                 } else {
-                    match read_verified_image_stream(&mut recv, size_bytes, &content_hash).await {
-                        Ok(bytes) => match self.push_local_image(
-                            &bytes,
-                            Some(peer.peer_id.to_hex()),
-                            Some(peer.display_name),
-                        ) {
-                            Ok(_) => ClipboardResponse::Ack,
-                            Err(err) => ClipboardResponse::Error(err.to_string()),
-                        },
-                        Err(err) => ClipboardResponse::Error(err.to_string()),
+                    let temp_path = self
+                        .images_dir
+                        .join(format!("incoming_{}.tmp", Uuid::new_v4()));
+                    match receive_verified_image_to_file(
+                        &mut recv,
+                        size_bytes,
+                        &content_hash,
+                        &temp_path,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            let res = self.push_local_image_from_file(
+                                &temp_path,
+                                Some(peer.peer_id.to_hex()),
+                                Some(peer.display_name),
+                            );
+                            let _ = tokio::fs::remove_file(&temp_path).await;
+                            match res {
+                                Ok(_) => ClipboardResponse::Ack,
+                                Err(err) => ClipboardResponse::Error(err.to_string()),
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tokio::fs::remove_file(&temp_path).await;
+                            ClipboardResponse::Error(err.to_string())
+                        }
                     }
                 };
                 write_frame(&mut send, &resp).await?;
@@ -601,7 +757,8 @@ impl LandaModule for ClipboardModule {
                     let _ = send.finish();
                     return Ok(());
                 };
-                let Ok(bytes) = tokio::fs::read(&path).await else {
+                let path_buf = PathBuf::from(&path);
+                let Ok((size_bytes, content_hash)) = hash_file_blake3(&path_buf).await else {
                     write_frame(
                         &mut send,
                         &ClipboardResponse::Error("failed to read clipboard image".into()),
@@ -610,7 +767,7 @@ impl LandaModule for ClipboardModule {
                     let _ = send.finish();
                     return Ok(());
                 };
-                if bytes.len() > MAX_IMAGE_BYTES {
+                if size_bytes == 0 || size_bytes > MAX_IMAGE_BYTES as u64 {
                     write_frame(
                         &mut send,
                         &ClipboardResponse::Error("clipboard image exceeds limit".into()),
@@ -619,18 +776,17 @@ impl LandaModule for ClipboardModule {
                     let _ = send.finish();
                     return Ok(());
                 }
-                let content_hash = blake3::hash(&bytes).to_hex().to_string();
                 write_frame(
                     &mut send,
                     &ClipboardResponse::ImageHeader {
-                        size_bytes: bytes.len() as u64,
+                        size_bytes,
                         width: item.image_width.unwrap_or(0),
                         height: item.image_height.unwrap_or(0),
                         content_hash,
                     },
                 )
                 .await?;
-                stream_bytes_with_digest(&mut send, &bytes).await?;
+                stream_file_with_digest(&mut send, &path_buf, size_bytes).await?;
                 let _ = send.finish();
             }
         }
@@ -652,7 +808,7 @@ fn normalize_to_png(raw_bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), CoreError> 
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
     limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
-    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_alloc = Some(64 * 1024 * 1024);
 
     let mut reader = ImageReader::new(Cursor::new(raw_bytes))
         .with_guessed_format()
@@ -746,6 +902,158 @@ async fn read_verified_image_stream(
     }
 
     Ok(out)
+}
+
+fn validate_image_file(path: &Path) -> Result<(u32, u32, bool), CoreError> {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+
+    let file = std::fs::File::open(path)?;
+    let mut reader = ImageReader::new(std::io::BufReader::new(file))
+        .with_guessed_format()
+        .map_err(|e| CoreError::InvalidInput(format!("invalid image data: {e}")))?;
+    reader.limits(limits.clone());
+    let format = reader.format();
+
+    let file_dim = std::fs::File::open(path)?;
+    let mut dim_reader = ImageReader::new(std::io::BufReader::new(file_dim))
+        .with_guessed_format()
+        .map_err(|e| CoreError::InvalidInput(format!("invalid image data: {e}")))?;
+    dim_reader.limits(limits);
+    let (width, height) = dim_reader
+        .into_dimensions()
+        .map_err(|e| CoreError::InvalidInput(format!("invalid image dimensions: {e}")))?;
+
+    if width == 0 || height == 0 || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        return Err(CoreError::InvalidInput(
+            "clipboard image dimensions out of bounds".into(),
+        ));
+    }
+
+    let _ = reader
+        .decode()
+        .map_err(|e| CoreError::InvalidInput(format!("failed to decode image: {e}")))?;
+
+    Ok((width, height, format == Some(ImageFormat::Png)))
+}
+
+fn hash_std_file_blake3(path: &Path) -> Result<String, CoreError> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+async fn hash_file_blake3(path: &Path) -> Result<(u64, String), CoreError> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let size_bytes = file.metadata().await?.len();
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok((size_bytes, hasher.finalize().to_hex().to_string()))
+}
+
+async fn stream_file_with_digest(
+    send: &mut SendStream,
+    path: &Path,
+    expected_len: u64,
+) -> Result<(), CoreError> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+    let mut sent: u64 = 0;
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        send.write_all(&buf[..n]).await?;
+        sent += n as u64;
+    }
+    if sent != expected_len {
+        return Err(CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "clipboard image file size changed during send",
+        )));
+    }
+    let digest = hasher.finalize();
+    send.write_all(digest.as_bytes()).await?;
+    Ok(())
+}
+
+async fn receive_verified_image_to_file(
+    recv: &mut RecvStream,
+    size_bytes: u64,
+    expected_hash_hex: &str,
+    dest_path: &Path,
+) -> Result<u64, CoreError> {
+    use tokio::io::AsyncWriteExt;
+    if size_bytes == 0 || size_bytes > MAX_IMAGE_BYTES as u64 {
+        return Err(CoreError::InvalidInput(
+            "clipboard image size out of bounds (max 10 MB)".into(),
+        ));
+    }
+
+    let part_path = dest_path.with_extension(format!("part.{}", Uuid::new_v4()));
+    let mut file = tokio::fs::File::create(&part_path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+    let mut remaining = size_bytes as usize;
+
+    let res: Result<(), CoreError> = async {
+        while remaining > 0 {
+            let to_read = remaining.min(buf.len());
+            let n = recv.read(&mut buf[..to_read]).await?.ok_or_else(|| {
+                CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "clipboard image stream truncated",
+                ))
+            })?;
+            hasher.update(&buf[..n]);
+            file.write_all(&buf[..n]).await?;
+            remaining -= n;
+        }
+        file.flush().await?;
+        drop(file);
+
+        let mut expected_digest = [0u8; 32];
+        recv.read_exact(&mut expected_digest)
+            .await
+            .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e)))?;
+
+        let actual = hasher.finalize();
+        if actual.as_bytes() != &expected_digest || actual.to_hex().as_str() != expected_hash_hex {
+            return Err(CoreError::IntegrityMismatch("clipboard_image.png".into()));
+        }
+
+        tokio::fs::rename(&part_path, dest_path).await?;
+        Ok(())
+    }
+    .await;
+
+    if res.is_err() {
+        let _ = tokio::fs::remove_file(&part_path).await;
+    }
+    res.map(|()| size_bytes)
 }
 
 fn sweep_orphan_images(images_dir: &Path, items: &[ClipboardItem]) {
